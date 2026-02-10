@@ -147,6 +147,51 @@ class TestQueryData:
             assert query_dict["limit"] == 100
 
 
+class TestQueryDataError:
+    def test_query_server_error_returns_query_dump(self):
+        from oceanum.datamesh.exceptions import DatameshConnectError
+
+        mock_conn = MagicMock()
+        mock_conn.query.side_effect = DatameshConnectError("Datamesh server error: 500")
+
+        with patch(
+            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
+            return_value=mock_conn,
+        ):
+            from oceanum_mcp.servers.datamesh.server import query_data
+
+            result = query_data(
+                datasource_id="test-ds",
+                variables=["Hs"],
+                time_start="2024-01-01",
+                time_end="2024-01-31",
+            )
+            parsed = json.loads(result)
+            assert "error" in parsed
+            assert "query" in parsed
+            assert parsed["query"]["datasource"] == "test-ds"
+            assert parsed["query"]["variables"] == ["Hs"]
+
+    def test_load_server_error_returns_datasource_id(self):
+        from oceanum.datamesh.exceptions import DatameshConnectError
+
+        mock_conn = MagicMock()
+        mock_conn.load_datasource.side_effect = DatameshConnectError(
+            "Datamesh server error: 500"
+        )
+
+        with patch(
+            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
+            return_value=mock_conn,
+        ):
+            from oceanum_mcp.servers.datamesh.server import load_datasource
+
+            result = load_datasource(datasource_id="bad-ds")
+            parsed = json.loads(result)
+            assert "error" in parsed
+            assert parsed["datasource_id"] == "bad-ds"
+
+
 class TestUpdateMetadata:
     def test_updates_fields(self):
         mock_conn = MagicMock()

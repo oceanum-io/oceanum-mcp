@@ -35,7 +35,23 @@ sys.modules.setdefault("fastmcp", mock_fastmcp)
 
 # Mock the `oceanum` package
 mock_oceanum = MagicMock()
+
+
+# Real exception classes so they can be caught in except clauses
+class _DatameshConnectError(Exception):
+    pass
+
+
+class _DatameshQueryError(Exception):
+    pass
+
+
+mock_exceptions = MagicMock()
+mock_exceptions.DatameshConnectError = _DatameshConnectError
+mock_exceptions.DatameshQueryError = _DatameshQueryError
+
 sys.modules.setdefault("oceanum", mock_oceanum)
 sys.modules.setdefault("oceanum.datamesh", mock_oceanum.datamesh)
 sys.modules.setdefault("oceanum.datamesh.query", mock_oceanum.datamesh.query)
+sys.modules.setdefault("oceanum.datamesh.exceptions", mock_exceptions)
 sys.modules.setdefault("oceanum.storage", mock_oceanum.storage)

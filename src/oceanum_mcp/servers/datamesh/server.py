@@ -12,6 +12,7 @@ from fastmcp import FastMCP
 
 from oceanum_mcp.common.client import get_datamesh_connector
 from oceanum_mcp.common.formatting import summarize_data, format_datasource
+from oceanum.datamesh.exceptions import DatameshConnectError, DatameshQueryError
 
 mcp = FastMCP(
     "Oceanum Datamesh",
@@ -179,7 +180,17 @@ def query_data(
     if limit is not None:
         query_dict["limit"] = limit
 
-    data = conn.query(query_dict)
+    try:
+        data = conn.query(query_dict)
+    except (DatameshConnectError, DatameshQueryError) as exc:
+        return json.dumps(
+            {
+                "error": str(exc),
+                "query": {k: v for k, v in query_dict.items() if v is not None},
+            },
+            indent=2,
+            default=str,
+        )
     return summarize_data(data)
 
 
@@ -196,7 +207,17 @@ def load_datasource(datasource_id: str) -> str:
         Data summary with shape, columns/variables, and preview of values.
     """
     conn = get_datamesh_connector()
-    data = conn.load_datasource(datasource_id)
+    try:
+        data = conn.load_datasource(datasource_id)
+    except (DatameshConnectError, DatameshQueryError) as exc:
+        return json.dumps(
+            {
+                "error": str(exc),
+                "datasource_id": datasource_id,
+            },
+            indent=2,
+            default=str,
+        )
     return summarize_data(data)
 
 
