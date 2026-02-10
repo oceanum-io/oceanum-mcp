@@ -3,12 +3,12 @@
 import sys
 from unittest.mock import MagicMock
 
-# Mock the `mcp` package so server modules can be imported without it installed
-mock_mcp = MagicMock()
+# Mock the `fastmcp` package so server modules can be imported without it installed
+mock_fastmcp = MagicMock()
 
 
 class _FakeFastMCP:
-    """Minimal stand-in for mcp.server.fastmcp.FastMCP."""
+    """Minimal stand-in for fastmcp.FastMCP."""
 
     def __init__(self, name="test", **kwargs):
         self.name = name
@@ -23,17 +23,15 @@ class _FakeFastMCP:
 
         return decorator
 
-    def mount(self, prefix, other):
+    def mount(self, other, prefix=None):
         pass
 
     def run(self, **kwargs):
         pass
 
 
-mock_mcp.server.fastmcp.FastMCP = _FakeFastMCP
-sys.modules.setdefault("mcp", mock_mcp)
-sys.modules.setdefault("mcp.server", mock_mcp.server)
-sys.modules.setdefault("mcp.server.fastmcp", mock_mcp.server.fastmcp)
+mock_fastmcp.FastMCP = _FakeFastMCP
+sys.modules.setdefault("fastmcp", mock_fastmcp)
 
 # Mock the `oceanum` package
 mock_oceanum = MagicMock()

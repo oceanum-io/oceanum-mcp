@@ -5,7 +5,7 @@ Exposes the Oceanum cloud storage filesystem as MCP tools for AI assistants.
 
 from __future__ import annotations
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from oceanum_mcp.common.client import get_storage_filesystem
 

@@ -8,7 +8,7 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from mcp.server.fastmcp import FastMCP
+from fastmcp import FastMCP
 
 from oceanum_mcp.common.client import get_datamesh_connector
 from oceanum_mcp.common.formatting import summarize_data, format_datasource
