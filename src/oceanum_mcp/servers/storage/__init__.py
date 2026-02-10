@@ -1,0 +1,1 @@
+"""Oceanum Storage MCP server."""
