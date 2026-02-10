@@ -1,0 +1,27 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oceanum-mcp"
+version = "0.1.0"
+description = "MCP servers for the Oceanum platform"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = [
+    "mcp>=1.0.0",
+    "oceanum>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+]
+
+[project.scripts]
+oceanum-mcp = "oceanum_mcp.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oceanum_mcp"]
