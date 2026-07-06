@@ -9,13 +9,11 @@ never mistakes a preview for the full result.
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import pandas as pd
 import xarray as xr
-
-# Datasets under this many bytes have their values included as records.
-SMALL_DATASET_NBYTES = 1_000_000
 
 
 def to_json(obj: Any) -> str:
@@ -24,28 +22,43 @@ def to_json(obj: Any) -> str:
 
 
 def human_bytes(n: int | float) -> str:
-    """Format a byte count for display."""
+    """Format a byte count for display (decimal units)."""
     n = float(n)
     for unit in ("B", "kB", "MB", "GB", "TB"):
         if n < 1000 or unit == "TB":
             return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
         n /= 1000
-    return f"{n:.1f} TB"
+    raise AssertionError("unreachable")
+
+
+def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    return json.loads(df.to_json(orient="records", date_format="iso"))
 
 
 def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
-    is_geo = hasattr(df, "geometry") and df.__class__.__name__ == "GeoDataFrame"
+    # geopandas overrides DataFrame.to_json with a GeoJSON serializer, so geo
+    # frames must be converted to plain pandas (geometry as WKT) before
+    # serializing records. sys.modules is enough: a GeoDataFrame can only
+    # exist if geopandas is already imported.
+    gpd = sys.modules.get("geopandas")
+    is_geo = gpd is not None and isinstance(df, gpd.GeoDataFrame)
     out: dict[str, Any] = {
         "container": "geodataframe" if is_geo else "dataframe",
         "rows": int(df.shape[0]),
         "columns": [{"name": str(c), "dtype": str(t)} for c, t in df.dtypes.items()],
     }
+    if max_rows <= 0:
+        # Structure-only summary (e.g. after an export): no preview, and no
+        # truncation flags that could suggest the result itself is partial.
+        return out
     shown = df.head(max_rows)
     if is_geo:
-        shown = shown.copy()
-        shown["geometry"] = shown["geometry"].astype(str)
-    records = json.loads(shown.to_json(orient="records", date_format="iso"))
-    out["data"] = records
+        plain = pd.DataFrame(shown).copy()
+        for col in shown.columns:
+            if isinstance(shown[col].dtype, gpd.array.GeometryDtype):
+                plain[col] = shown[col].to_wkt()
+        shown = plain
+    out["data"] = _records(shown)
     out["truncated"] = df.shape[0] > max_rows
     if out["truncated"]:
         out["note"] = (
@@ -55,19 +68,23 @@ def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
     return out
 
 
+def _coord_summary(coord: xr.DataArray) -> dict[str, Any]:
+    out: dict[str, Any] = {"dtype": str(coord.dtype), "size": int(coord.size)}
+    # Chunked (dask-backed) coordinates would be downloaded in full just to
+    # show first/last — skip values for those; dimension coords are in-memory.
+    if coord.chunks is None and coord.size:
+        out["first"] = str(coord.values.flat[0])
+        out["last"] = str(coord.values.flat[-1])
+    return out
+
+
 def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
     lazy = any(ds[v].chunks is not None for v in ds.data_vars)
     out: dict[str, Any] = {
         "container": "dataset",
         "dims": {str(k): int(v) for k, v in ds.sizes.items()},
         "coords": {
-            str(name): {
-                "dtype": str(coord.dtype),
-                "size": int(coord.size),
-                "first": str(coord.values.flat[0]) if coord.size else None,
-                "last": str(coord.values.flat[-1]) if coord.size else None,
-            }
-            for name, coord in ds.coords.items()
+            str(name): _coord_summary(coord) for name, coord in ds.coords.items()
         },
         "variables": {
             str(name): {
@@ -87,30 +104,29 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
             "with narrower filters or aggregation to see values inline, or "
             "export_query to write the data to a file."
         )
-    elif ds.nbytes <= SMALL_DATASET_NBYTES:
-        # Small and eager: include coordinate-attributed values as records.
+    elif max_rows > 0:
+        # Eager data is already in memory — always include a preview of
+        # coordinate-attributed values.
         df = ds.to_dataframe().reset_index()
-        out["data"] = json.loads(
-            df.head(max_rows).to_json(orient="records", date_format="iso")
-        )
+        out["data"] = _records(df.head(max_rows))
         out["truncated"] = df.shape[0] > max_rows
         if out["truncated"]:
             out["note"] = (
                 f"Showing first {max_rows} of {df.shape[0]} records. Use "
                 "export_query for the full result."
             )
-    else:
-        out["note"] = (
-            "Values omitted (dataset larger than inline limit). Narrow the "
-            "query or use export_query."
-        )
     return out
 
 
 def summarize_data(
     data: Any, max_rows: int = 20, warnings: list[str] | None = None
 ) -> dict[str, Any]:
-    """Summarize a query result as a structured dict for MCP output."""
+    """Summarize a query result as a structured dict for MCP output.
+
+    max_rows <= 0 produces a structure-only summary with no value preview and
+    no truncation flags (used after exports, where the written file is
+    complete regardless of preview size).
+    """
     if data is None:
         summary: dict[str, Any] = {
             "status": "no_data",

@@ -110,8 +110,9 @@ Use stdio transport with the same command:
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
-| `OCEANUM_MCP_READ_ONLY`       | No       | Set to `1`/`true` to disable write tools (`update_metadata`)                    |
+| `OCEANUM_MCP_READ_ONLY`       | No       | Set to `1`/`true` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`) |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
+| `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |
 
 ## Datamesh Tools
 

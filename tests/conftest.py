@@ -4,6 +4,7 @@ Tests run against the real fastmcp and oceanum packages; only the network
 boundary (Connector / FileSystem / staging) is mocked.
 """
 
+from typing import Iterator
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -31,7 +32,7 @@ def make_stage(
 
 
 @pytest.fixture
-def mock_conn():
+def mock_conn() -> Iterator[MagicMock]:
     """Mock Connector patched into the datamesh server module."""
     conn = MagicMock()
     with patch.object(datamesh_server, "get_datamesh_connector", return_value=conn):
@@ -39,7 +40,7 @@ def mock_conn():
 
 
 @pytest.fixture
-def mock_stage():
+def mock_stage() -> Iterator[MagicMock]:
     """Patch the datamesh server's staging helper; defaults to a small dataset."""
     with patch.object(datamesh_server, "_stage") as stager:
         stager.return_value = make_stage()

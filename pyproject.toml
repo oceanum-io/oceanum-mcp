@@ -16,6 +16,7 @@ dependencies = [
     "oceanum>=1.1,<2",
     # oceanum requires zarr<3, and zarr 2.x breaks at runtime with
     # numcodecs>=0.16 (blosc.cbuffer_sizes removed); oceanum does not pin this.
+    # Remove once oceanum pins numcodecs itself or moves to zarr>=3.
     "numcodecs<0.16",
 ]
 

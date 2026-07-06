@@ -11,7 +11,11 @@ import pytest
 import xarray as xr
 from fastmcp.exceptions import ToolError
 
-from oceanum.datamesh.exceptions import DatameshConnectError, DatameshQueryError
+from oceanum.datamesh.exceptions import (
+    DatameshConnectError,
+    DatameshQueryError,
+    DatameshSessionError,
+)
 from oceanum.datamesh.query import Container, CoordSelector, GeoFilter
 
 import oceanum_mcp.servers.datamesh.server as server
@@ -97,6 +101,11 @@ class TestSearchCatalog:
         geofilter = mock_conn.get_catalog.call_args.kwargs["geofilter"]
         assert isinstance(geofilter, GeoFilter)
 
+    def test_rejects_nonpositive_limit(self, mock_conn):
+        with pytest.raises(ToolError, match="at least 1"):
+            server.search_catalog(search="wave", limit=0)
+        mock_conn.get_catalog.assert_not_called()
+
 
 class TestGetDatasourceInfo:
     def test_returns_metadata(self, mock_conn):
@@ -136,8 +145,12 @@ class TestBuildQuery:
         assert q.timefilter.resample.value == "mean"
 
     def test_time_resolution_requires_range(self):
-        with pytest.raises(ToolError, match="require"):
+        with pytest.raises(ToolError, match="range"):
             server._build_query("test-ds", time_resolution="1D")
+
+    def test_time_resolution_rejected_with_series_times(self):
+        with pytest.raises(ToolError, match="range"):
+            server._build_query("test-ds", times=["2024-01-01"], time_resolution="1D")
 
     def test_bbox_and_feature_conflict(self):
         feature = {
@@ -301,6 +314,25 @@ class TestQueryData:
         assert parsed["query"]["datasource"] == "test-ds"
         assert parsed["query"]["variables"] == ["Hs"]
 
+    def test_session_error_returns_structured_error(self, mock_conn, mock_stage):
+        mock_stage.side_effect = DatameshSessionError("bad token")
+
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert "bad token" in parsed["error"]
+        assert parsed["query"]["datasource"] == "test-ds"
+
+    def test_midsize_eager_dataset_shows_values(self, mock_conn, mock_stage):
+        # Eager datasets between 1 MB and the inline limit must include
+        # values, not a false "larger than inline limit" note.
+        mock_stage.return_value = make_stage(Container.Dataset, size=2_000_000)
+        big = xr.Dataset({"v": (("x",), np.zeros(300_000))})
+        mock_conn.query.return_value = big
+
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert parsed["lazy"] is False
+        assert len(parsed["data"]) == 20
+        assert parsed["truncated"] is True
+
 
 class TestExportQuery:
     def test_frame_to_parquet(self, mock_conn, mock_stage, tmp_path):
@@ -315,6 +347,9 @@ class TestExportQuery:
         assert parsed["format"] == "parquet"
         assert parsed["bytes_written"] == dest.stat().st_size
         assert "data" not in parsed["summary"]
+        # A successful full export must not claim truncation.
+        assert "truncated" not in parsed["summary"]
+        assert "note" not in parsed["summary"]
 
     def test_frame_to_csv(self, mock_conn, mock_stage, tmp_path):
         mock_stage.return_value = make_stage(Container.DataFrame, size=100)
@@ -367,6 +402,37 @@ class TestExportQuery:
         assert parsed["refused"] is True
         mock_conn.query.assert_not_called()
 
+    def test_none_result_writes_nothing(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = None
+        dest = tmp_path / "out.nc"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        )
+        assert parsed["status"] == "no_data"
+        assert not dest.exists()
+
+    def test_write_failure_cleans_partial_file(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        broken = MagicMock()
+        broken.to_netcdf.side_effect = DatameshConnectError("chunk fetch failed")
+        mock_conn.query.return_value = broken
+        dest = tmp_path / "out.nc"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        )
+        assert "chunk fetch failed" in parsed["error"]
+        assert not dest.exists()
+
+    def test_export_dir_confinement(self, mock_conn, mock_stage, tmp_path, monkeypatch):
+        monkeypatch.setenv("OCEANUM_MCP_EXPORT_DIR", str(tmp_path / "allowed"))
+        with pytest.raises(ToolError, match="OCEANUM_MCP_EXPORT_DIR"):
+            server.export_query(
+                datasource_id="test-ds", path=str(tmp_path / "escape.nc")
+            )
+
 
 class TestLoadDatasource:
     def test_dataset_loaded(self, mock_conn, mock_stage):
@@ -391,13 +457,19 @@ class TestLoadDatasource:
         assert "error" in parsed
         assert parsed["datasource_id"] == "bad-ds"
 
+    def test_invalid_id_raises_tool_error(self, mock_conn, mock_stage):
+        # Query validates datasource ids (min_length=3); the failure must be
+        # a ToolError, not a raw pydantic ValidationError.
+        with pytest.raises(ToolError, match="Invalid datasource_id"):
+            server.load_datasource(datasource_id="ds")
+
 
 class TestUpdateMetadata:
     def test_updates_fields_with_typed_info(self, mock_conn):
         ds = _mock_datasource(id="my-ds", name="Updated Name", tags=["new-tag"])
         mock_conn.update_metadata.return_value = ds
 
-        result = server._update_metadata(
+        result = server.update_metadata(
             datasource_id="my-ds",
             name="Updated Name",
             tags=["new-tag"],

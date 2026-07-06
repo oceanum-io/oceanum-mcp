@@ -2,6 +2,7 @@
 
 import numpy as np
 import pandas as pd
+import pytest
 import xarray as xr
 
 from oceanum_mcp.common.formatting import human_bytes, summarize_data
@@ -51,6 +52,47 @@ def test_lazy_dataset_flagged_without_values():
     assert out["lazy"] is True
     assert "data" not in out
     assert "note" in out
+
+
+def test_lazy_dataset_chunked_coords_not_computed():
+    # Chunked (remote) coordinates must not be downloaded for first/last.
+    ds = xr.Dataset(
+        {"v": (("x",), np.zeros(10))},
+        coords={"lon2d": (("x",), np.arange(10.0))},
+    ).chunk({"x": 2})
+    out = summarize_data(ds)
+    assert "first" not in out["coords"]["lon2d"]
+    assert out["coords"]["lon2d"]["size"] == 10
+
+
+def test_midsize_eager_dataset_includes_values():
+    # Eager datasets over 1 MB must still show a preview (they are already
+    # downloaded); only lazy datasets omit values.
+    big = xr.Dataset({"v": (("x",), np.zeros(300_000))})
+    assert big.nbytes > 1_000_000
+    out = summarize_data(big)
+    assert out["lazy"] is False
+    assert len(out["data"]) == 20
+    assert out["truncated"] is True
+
+
+def test_structure_only_mode_has_no_truncation_flags():
+    out = summarize_data(pd.DataFrame({"x": range(100)}), max_rows=0)
+    assert "data" not in out
+    assert "truncated" not in out
+    assert "note" not in out
+    assert out["rows"] == 100
+
+
+def test_geodataframe_records_use_wkt():
+    gpd = pytest.importorskip("geopandas")
+    from shapely.geometry import Point
+
+    gdf = gpd.GeoDataFrame({"name": ["a"]}, geometry=[Point(1.0, 2.0)])
+    out = summarize_data(gdf)
+    assert out["container"] == "geodataframe"
+    assert out["data"][0]["geometry"].startswith("POINT")
+    assert out["data"][0]["name"] == "a"
 
 
 def test_warnings_attached():

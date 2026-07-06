@@ -13,27 +13,36 @@ Error conventions:
 
 from __future__ import annotations
 
-import json
+import threading
 import warnings as _warnings
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
-from oceanum.datamesh.exceptions import DatameshConnectError, DatameshQueryError
-from oceanum.datamesh.query import Container, CoordSelector, GeoFilter, Query
+from oceanum.datamesh import Connector
+from oceanum.datamesh.exceptions import (
+    DatameshConnectError,
+    DatameshQueryError,
+    DatameshSessionError,
+)
+from oceanum.datamesh.query import Container, CoordSelector, GeoFilter, Query, Stage
 from oceanum.datamesh.session import Session
 
 from oceanum_mcp.common.client import get_datamesh_connector
-from oceanum_mcp.common.config import is_read_only, max_inline_bytes
+from oceanum_mcp.common.config import export_dir, is_read_only, max_inline_bytes
 from oceanum_mcp.common.formatting import (
     format_datasource,
     human_bytes,
     summarize_data,
     to_json,
 )
+
+# Everything the oceanum library can raise on a gateway interaction.
+# Session.acquire wraps all its failures (auth, network) in DatameshSessionError.
+_DATAMESH_ERRORS = (DatameshConnectError, DatameshQueryError, DatameshSessionError)
 
 # Server caps tabular (dataframe/geodataframe) query results at this many rows.
 DATAMESH_ROW_CAP = 2_000_000
@@ -62,40 +71,84 @@ mcp = FastMCP(
 # Helpers
 # ---------------------------------------------------------------------------
 
+_WARNINGS_LOCK = threading.Lock()
+
 
 @contextmanager
-def _captured_warnings(collected: list[str]):
+def _captured_warnings(collected: list[str]) -> Iterator[None]:
     """Capture Python warnings raised by the oceanum library.
 
     The library signals silent degradation (row caps, lazy dask fallback)
     via warnings.warn, which would otherwise be lost to stderr.
+    catch_warnings mutates process-global state and FastMCP runs sync tools
+    in worker threads, so captures are serialized with a lock.
     """
-    with _warnings.catch_warnings(record=True) as caught:
-        _warnings.simplefilter("always")
-        yield
-    collected.extend(str(w.message) for w in caught)
+    with _WARNINGS_LOCK:
+        with _warnings.catch_warnings(record=True) as caught:
+            _warnings.simplefilter("always")
+            yield
+        collected.extend(str(w.message) for w in caught)
 
 
-def _stage(conn, query: Query):
+def _stage(conn: Connector, query: Query) -> Stage | None:
     """Stage a query on the Datamesh gateway without downloading data.
 
     Uses the connector's private staging request — oceanum<2 has no public
-    staging API; the dependency pin in pyproject.toml guards this.
+    staging API; the dependency pin in pyproject.toml guards this. Once
+    oceanum grows a public Connector.stage() (and a way to execute a query
+    from an existing stage), switch to it: that also removes the second
+    staging round-trip conn.query() currently performs internally.
     """
     session = Session.acquire(conn)
     try:
         return conn._stage_request(query, session)
+    except AttributeError as exc:  # private API drift within the 1.x pin
+        raise ToolError(
+            "The installed oceanum version no longer exposes the staging "
+            "internals this server relies on; install a version matching "
+            "the pyproject.toml pin."
+        ) from exc
     finally:
         session.close()
 
 
 def _query_echo(query: Query) -> dict[str, Any]:
     """Canonical JSON form of a query, for echoing in responses."""
-    return json.loads(query.model_dump_json(exclude_none=True, warnings=False))
+    return query.model_dump(mode="json", exclude_none=True, warnings=False)
+
+
+def _stage_summary(stage: Stage) -> dict[str, Any]:
+    return {
+        "container": stage.container.value,
+        "size_bytes": stage.size,
+        "size_human": human_bytes(stage.size),
+        "domain_length": stage.dlen,
+    }
+
+
+def _refusal(stage: Stage, message: str, **extra: Any) -> str:
+    return to_json(
+        {"refused": True, **_stage_summary(stage), "message": message, **extra}
+    )
+
+
+def _resolve_export_path(path: str) -> Path:
+    """Resolve an export destination, confined to OCEANUM_MCP_EXPORT_DIR if set."""
+    dest = Path(path).expanduser()
+    root = export_dir()
+    if root is None:
+        return dest
+    dest = (dest if dest.is_absolute() else root / dest).resolve()
+    if not dest.is_relative_to(root):
+        raise ToolError(
+            f"path must be inside OCEANUM_MCP_EXPORT_DIR ({root}) on this server."
+        )
+    return dest
 
 
 def _build_query(
     datasource_id: str,
+    *,
     variables: list[str] | None = None,
     time_start: str | None = None,
     time_end: str | None = None,
@@ -129,6 +182,11 @@ def _build_query(
             "Provide either times (series selection) or time_start/time_end "
             "(range selection), not both."
         )
+    if (time_resolution or time_resample) and (times or not (time_start or time_end)):
+        raise ToolError(
+            "time_resolution/time_resample apply only to a time_start/time_end "
+            "range."
+        )
     if times:
         q["timefilter"] = {"type": "series", "times": times}
     elif time_start or time_end:
@@ -141,10 +199,6 @@ def _build_query(
         if time_resample:
             timefilter["resample"] = time_resample
         q["timefilter"] = timefilter
-    elif time_resolution or time_resample:
-        raise ToolError(
-            "time_resolution/time_resample require a time_start/time_end range."
-        )
 
     if bbox and geofilter_feature:
         raise ToolError("Provide either bbox or geofilter_feature, not both.")
@@ -194,13 +248,31 @@ def _build_query(
         raise ToolError(f"Invalid query parameters: {exc}") from exc
 
 
-def _stage_summary(stage) -> dict[str, Any]:
-    return {
-        "container": stage.container.value,
-        "size_bytes": stage.size,
-        "size_human": human_bytes(stage.size),
-        "domain_length": stage.dlen,
-    }
+# Shared Args documentation for the three query-shaped tools. Assembled into
+# each tool's __doc__ before registration so the MCP parameter descriptions
+# stay byte-identical across tools (FastMCP parses the docstring Args section).
+_QUERY_PARAM_DOCS = """\
+        datasource_id: The datasource to query.
+        variables: List of variable names to select (e.g. ["temperature", "salinity"]).
+        time_start: ISO 8601 start of a time range (e.g. "2023-01-01T00:00:00Z"). Open-ended if omitted.
+        time_end: ISO 8601 end of a time range. Open-ended if omitted.
+        times: Discrete times to select (series selection). Mutually exclusive with time_start/time_end.
+        time_resolution: Downsample a time range server-side to this resolution (pandas frequency string, e.g. "1D", "1MS"). Drastically shrinks long time series.
+        time_resample: Resampling method when time_resolution is set: mean, nearest, or linear.
+        bbox: Bounding box [xmin, ymin, xmax, ymax] in WGS84 (or crs units if crs is set).
+        geofilter_feature: GeoJSON Feature object (Point, MultiPoint, or Polygon geometry) for spatial selection/interpolation. Mutually exclusive with bbox.
+        geofilter_interp: Interpolation for feature selection: nearest or linear (default linear).
+        geofilter_resolution: Maximum spatial resolution for downsampling, in CRS units.
+        level_min: Minimum vertical level of a range.
+        level_max: Maximum vertical level of a range.
+        levels: Discrete vertical levels to select (series selection). Mutually exclusive with level_min/level_max.
+        level_interp: Interpolation for level series selection: nearest or linear.
+        coord_filters: Additional coordinate selections, e.g. [{"coord": "station", "values": ["A1", "B2"]}].
+        crs: CRS for filter coordinates and returned data (EPSG code or CRS string).
+        aggregate_operations: Aggregations to apply after filtering: mean, min, max, std, sum.
+        aggregate_spatial: Aggregate over spatial dimensions (default true).
+        aggregate_temporal: Aggregate over the temporal dimension (default true).
+        limit: Maximum number of rows/records to return."""
 
 
 # ---------------------------------------------------------------------------
@@ -223,12 +295,15 @@ def search_catalog(
         time_start: ISO 8601 datetime for start of time range filter (e.g. "2023-01-01").
         time_end: ISO 8601 datetime for end of time range filter (e.g. "2023-12-31").
         bbox: Bounding box as [xmin, ymin, xmax, ymax] in WGS84 coordinates.
-        limit: Maximum number of datasources to return (default 20).
+        limit: Maximum number of datasources to return (default 20, minimum 1).
 
     Returns:
         JSON with count and matching datasources (id, name, description, time
         range, bounds). If count equals limit, more results may exist.
     """
+    if limit < 1:
+        raise ToolError("limit must be at least 1.")
+
     conn = get_datamesh_connector()
 
     timefilter = None
@@ -281,7 +356,6 @@ def get_datasource_info(datasource_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-@mcp.tool(annotations=READ_TOOL)
 def stage_query(
     datasource_id: str,
     variables: list[str] | None = None,
@@ -311,61 +385,34 @@ def stage_query(
     Always stage before retrieving data you have not sized. The response says
     whether the result is small enough for query_data to return inline, and
     echoes the canonical query.
-
-    Args:
-        datasource_id: The datasource to query.
-        variables: List of variable names to select (e.g. ["temperature", "salinity"]).
-        time_start: ISO 8601 start of a time range (e.g. "2023-01-01T00:00:00Z"). Open-ended if omitted.
-        time_end: ISO 8601 end of a time range. Open-ended if omitted.
-        times: Discrete times to select (series selection). Mutually exclusive with time_start/time_end.
-        time_resolution: Downsample a time range server-side to this resolution (pandas frequency string, e.g. "1D", "1MS"). Drastically shrinks long time series.
-        time_resample: Resampling method when time_resolution is set: mean, nearest, or linear.
-        bbox: Bounding box [xmin, ymin, xmax, ymax] in WGS84 (or crs units if crs is set).
-        geofilter_feature: GeoJSON Feature object (Point, MultiPoint, or Polygon geometry) for spatial selection/interpolation. Mutually exclusive with bbox.
-        geofilter_interp: Interpolation for feature selection: nearest or linear (default linear).
-        geofilter_resolution: Maximum spatial resolution for downsampling, in CRS units.
-        level_min: Minimum vertical level of a range.
-        level_max: Maximum vertical level of a range.
-        levels: Discrete vertical levels to select (series selection). Mutually exclusive with level_min/level_max.
-        level_interp: Interpolation for level series selection: nearest or linear.
-        coord_filters: Additional coordinate selections, e.g. [{"coord": "station", "values": ["A1", "B2"]}].
-        crs: CRS for filter coordinates and returned data (EPSG code or CRS string).
-        aggregate_operations: Aggregations to apply after filtering: mean, min, max, std, sum.
-        aggregate_spatial: Aggregate over spatial dimensions (default true).
-        aggregate_temporal: Aggregate over the temporal dimension (default true).
-        limit: Maximum number of rows/records to return.
-
-    Returns:
-        JSON with staged flag, container type, size_bytes, domain_length,
-        the canonical query, and a recommendation for the next step.
     """
     conn = get_datamesh_connector()
     query = _build_query(
         datasource_id,
-        variables,
-        time_start,
-        time_end,
-        times,
-        time_resolution,
-        time_resample,
-        bbox,
-        geofilter_feature,
-        geofilter_interp,
-        geofilter_resolution,
-        level_min,
-        level_max,
-        levels,
-        level_interp,
-        coord_filters,
-        crs,
-        aggregate_operations,
-        aggregate_spatial,
-        aggregate_temporal,
-        limit,
+        variables=variables,
+        time_start=time_start,
+        time_end=time_end,
+        times=times,
+        time_resolution=time_resolution,
+        time_resample=time_resample,
+        bbox=bbox,
+        geofilter_feature=geofilter_feature,
+        geofilter_interp=geofilter_interp,
+        geofilter_resolution=geofilter_resolution,
+        level_min=level_min,
+        level_max=level_max,
+        levels=levels,
+        level_interp=level_interp,
+        coord_filters=coord_filters,
+        crs=crs,
+        aggregate_operations=aggregate_operations,
+        aggregate_spatial=aggregate_spatial,
+        aggregate_temporal=aggregate_temporal,
+        limit=limit,
     )
     try:
         stage = _stage(conn, query)
-    except (DatameshConnectError, DatameshQueryError) as exc:
+    except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
     if stage is None:
@@ -383,18 +430,16 @@ def stage_query(
         out["recommendation"] = (
             "Small enough to return inline: call query_data with these parameters."
         )
-    elif stage.container == Container.Dataset:
-        out["recommendation"] = (
-            f"Larger than the inline limit ({human_bytes(inline_limit)}): "
-            "query_data will return only a lazy structure summary. Shrink the "
-            "result with filters, aggregation, or time_resolution, or use "
-            "export_query to write it to a file."
-        )
     else:
+        detail = (
+            "query_data will return only a lazy structure summary; shrink the "
+            "result with filters, aggregation, or time_resolution"
+            if stage.container == Container.Dataset
+            else "narrow the query with filters or aggregation"
+        )
         out["recommendation"] = (
             f"Larger than the inline limit ({human_bytes(inline_limit)}): "
-            "narrow the query with filters or aggregation, or use export_query "
-            "to write it to a file."
+            f"{detail}, or use export_query to write it to a file."
         )
     if (
         stage.container in (Container.DataFrame, Container.GeoDataFrame)
@@ -408,7 +453,6 @@ def stage_query(
     return to_json(out)
 
 
-@mcp.tool(annotations=READ_TOOL)
 def query_data(
     datasource_id: str,
     variables: list[str] | None = None,
@@ -438,58 +482,30 @@ def query_data(
     The query is staged first; results larger than the inline limit are not
     downloaded (datasets are summarized lazily, tabular queries are refused
     with alternatives). Use stage_query to size a query before calling this.
-
-    Args:
-        datasource_id: The datasource to query.
-        variables: List of variable names to select (e.g. ["temperature", "salinity"]).
-        time_start: ISO 8601 start of a time range (e.g. "2023-01-01T00:00:00Z"). Open-ended if omitted.
-        time_end: ISO 8601 end of a time range. Open-ended if omitted.
-        times: Discrete times to select (series selection). Mutually exclusive with time_start/time_end.
-        time_resolution: Downsample a time range server-side to this resolution (pandas frequency string, e.g. "1D", "1MS"). Drastically shrinks long time series.
-        time_resample: Resampling method when time_resolution is set: mean, nearest, or linear.
-        bbox: Bounding box [xmin, ymin, xmax, ymax] in WGS84 (or crs units if crs is set).
-        geofilter_feature: GeoJSON Feature object (Point, MultiPoint, or Polygon geometry) for spatial selection/interpolation. Mutually exclusive with bbox.
-        geofilter_interp: Interpolation for feature selection: nearest or linear (default linear).
-        geofilter_resolution: Maximum spatial resolution for downsampling, in CRS units.
-        level_min: Minimum vertical level of a range.
-        level_max: Maximum vertical level of a range.
-        levels: Discrete vertical levels to select (series selection). Mutually exclusive with level_min/level_max.
-        level_interp: Interpolation for level series selection: nearest or linear.
-        coord_filters: Additional coordinate selections, e.g. [{"coord": "station", "values": ["A1", "B2"]}].
-        crs: CRS for filter coordinates and returned data (EPSG code or CRS string).
-        aggregate_operations: Aggregations to apply after filtering: mean, min, max, std, sum.
-        aggregate_spatial: Aggregate over spatial dimensions (default true).
-        aggregate_temporal: Aggregate over the temporal dimension (default true).
-        limit: Maximum number of rows/records to return.
-
-    Returns:
-        JSON with the result data (coordinate-attributed records) or a
-        structure summary, explicit truncated/lazy flags, staged size, and any
-        server warnings.
     """
     conn = get_datamesh_connector()
     query = _build_query(
         datasource_id,
-        variables,
-        time_start,
-        time_end,
-        times,
-        time_resolution,
-        time_resample,
-        bbox,
-        geofilter_feature,
-        geofilter_interp,
-        geofilter_resolution,
-        level_min,
-        level_max,
-        levels,
-        level_interp,
-        coord_filters,
-        crs,
-        aggregate_operations,
-        aggregate_spatial,
-        aggregate_temporal,
-        limit,
+        variables=variables,
+        time_start=time_start,
+        time_end=time_end,
+        times=times,
+        time_resolution=time_resolution,
+        time_resample=time_resample,
+        bbox=bbox,
+        geofilter_feature=geofilter_feature,
+        geofilter_interp=geofilter_interp,
+        geofilter_resolution=geofilter_resolution,
+        level_min=level_min,
+        level_max=level_max,
+        levels=levels,
+        level_interp=level_interp,
+        coord_filters=coord_filters,
+        crs=crs,
+        aggregate_operations=aggregate_operations,
+        aggregate_spatial=aggregate_spatial,
+        aggregate_temporal=aggregate_temporal,
+        limit=limit,
     )
     warnings: list[str] = []
     try:
@@ -509,22 +525,17 @@ def query_data(
                 # Lazy zarr access: structure only, no data download.
                 use_dask = True
             else:
-                return to_json(
-                    {
-                        "refused": True,
-                        **_stage_summary(stage),
-                        "message": (
-                            f"Result is {human_bytes(stage.size)}, above the "
-                            f"inline limit of {human_bytes(inline_limit)}. "
-                            "Narrow the query with filters or aggregation, or "
-                            "use export_query to write it to a file."
-                        ),
-                        "query": _query_echo(query),
-                    }
+                return _refusal(
+                    stage,
+                    f"Result is {human_bytes(stage.size)}, above the inline "
+                    f"limit of {human_bytes(inline_limit)}. Narrow the query "
+                    "with filters or aggregation, or use export_query to "
+                    "write it to a file.",
+                    query=_query_echo(query),
                 )
         with _captured_warnings(warnings):
             data = conn.query(query, use_dask=use_dask)
-    except (DatameshConnectError, DatameshQueryError) as exc:
+    except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
     out = summarize_data(data, warnings=warnings)
@@ -532,14 +543,6 @@ def query_data(
     return to_json(out)
 
 
-@mcp.tool(
-    annotations={
-        "readOnlyHint": False,
-        "destructiveHint": False,
-        "idempotentHint": True,
-        "openWorldHint": True,
-    }
-)
 def export_query(
     datasource_id: str,
     path: str,
@@ -573,63 +576,33 @@ def export_query(
     data never enters the conversation — analysis code reads the file instead.
     Gridded datasets stream lazily to NetCDF; tabular results write Parquet or
     CSV.
-
-    Args:
-        datasource_id: The datasource to query.
-        path: Destination file path (parent directories are created).
-        format: Output format: netcdf (datasets), parquet or csv (tabular). Defaults by container: dataset -> netcdf, tabular -> parquet.
-        overwrite: Overwrite an existing file (default false).
-        variables: List of variable names to select (e.g. ["temperature", "salinity"]).
-        time_start: ISO 8601 start of a time range (e.g. "2023-01-01T00:00:00Z"). Open-ended if omitted.
-        time_end: ISO 8601 end of a time range. Open-ended if omitted.
-        times: Discrete times to select (series selection). Mutually exclusive with time_start/time_end.
-        time_resolution: Downsample a time range server-side to this resolution (pandas frequency string, e.g. "1D", "1MS").
-        time_resample: Resampling method when time_resolution is set: mean, nearest, or linear.
-        bbox: Bounding box [xmin, ymin, xmax, ymax] in WGS84 (or crs units if crs is set).
-        geofilter_feature: GeoJSON Feature object (Point, MultiPoint, or Polygon geometry) for spatial selection/interpolation. Mutually exclusive with bbox.
-        geofilter_interp: Interpolation for feature selection: nearest or linear (default linear).
-        geofilter_resolution: Maximum spatial resolution for downsampling, in CRS units.
-        level_min: Minimum vertical level of a range.
-        level_max: Maximum vertical level of a range.
-        levels: Discrete vertical levels to select (series selection). Mutually exclusive with level_min/level_max.
-        level_interp: Interpolation for level series selection: nearest or linear.
-        coord_filters: Additional coordinate selections, e.g. [{"coord": "station", "values": ["A1", "B2"]}].
-        crs: CRS for filter coordinates and returned data (EPSG code or CRS string).
-        aggregate_operations: Aggregations to apply after filtering: mean, min, max, std, sum.
-        aggregate_spatial: Aggregate over spatial dimensions (default true).
-        aggregate_temporal: Aggregate over the temporal dimension (default true).
-        limit: Maximum number of rows/records to return.
-
-    Returns:
-        JSON with the written path, format, bytes_written, and a structure
-        summary of the exported data (no inline values).
     """
     conn = get_datamesh_connector()
     query = _build_query(
         datasource_id,
-        variables,
-        time_start,
-        time_end,
-        times,
-        time_resolution,
-        time_resample,
-        bbox,
-        geofilter_feature,
-        geofilter_interp,
-        geofilter_resolution,
-        level_min,
-        level_max,
-        levels,
-        level_interp,
-        coord_filters,
-        crs,
-        aggregate_operations,
-        aggregate_spatial,
-        aggregate_temporal,
-        limit,
+        variables=variables,
+        time_start=time_start,
+        time_end=time_end,
+        times=times,
+        time_resolution=time_resolution,
+        time_resample=time_resample,
+        bbox=bbox,
+        geofilter_feature=geofilter_feature,
+        geofilter_interp=geofilter_interp,
+        geofilter_resolution=geofilter_resolution,
+        level_min=level_min,
+        level_max=level_max,
+        levels=levels,
+        level_interp=level_interp,
+        coord_filters=coord_filters,
+        crs=crs,
+        aggregate_operations=aggregate_operations,
+        aggregate_spatial=aggregate_spatial,
+        aggregate_temporal=aggregate_temporal,
+        limit=limit,
     )
 
-    dest = Path(path).expanduser()
+    dest = _resolve_export_path(path)
     if dest.exists():
         if dest.is_dir():
             raise ToolError(f"path is an existing directory: {dest}")
@@ -662,36 +635,50 @@ def export_query(
                     "This query returns tabular data; use format='parquet' or 'csv'."
                 )
             if stage.size > MAX_EXPORT_FRAME_BYTES:
-                return to_json(
-                    {
-                        "refused": True,
-                        **_stage_summary(stage),
-                        "message": (
-                            f"Tabular result is {human_bytes(stage.size)}, above "
-                            "the export limit of "
-                            f"{human_bytes(MAX_EXPORT_FRAME_BYTES)}. Narrow the "
-                            "query."
-                        ),
-                        "query": _query_echo(query),
-                    }
+                return _refusal(
+                    stage,
+                    f"Tabular result is {human_bytes(stage.size)}, above the "
+                    f"export limit of {human_bytes(MAX_EXPORT_FRAME_BYTES)}. "
+                    "Narrow the query.",
+                    query=_query_echo(query),
                 )
 
         with _captured_warnings(warnings):
             # Datasets stream chunk-wise from lazy zarr; frames download fully.
             data = conn.query(query, use_dask=stage.container == Container.Dataset)
-    except (DatameshConnectError, DatameshQueryError) as exc:
+    except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
+    if data is None:
+        # The gateway can report no data on the download staging even after a
+        # successful dry-run stage (data changed in between).
+        return to_json(
+            {
+                "status": "no_data",
+                "message": "No data matches this query; nothing written.",
+                "query": _query_echo(query),
+            }
+        )
+
     dest.parent.mkdir(parents=True, exist_ok=True)
-    if fmt == "netcdf":
-        data.to_netcdf(dest)
-    elif fmt == "parquet":
-        data.to_parquet(dest)
-    else:
-        data.to_csv(dest, index=False)
+    try:
+        if fmt == "netcdf":
+            data.to_netcdf(dest)
+        elif fmt == "parquet":
+            data.to_parquet(dest)
+        else:
+            data.to_csv(dest, index=False)
+    except (*_DATAMESH_ERRORS, OSError) as exc:
+        # A mid-stream failure (zarr chunk fetch, disk) leaves a partial file.
+        dest.unlink(missing_ok=True)
+        return to_json(
+            {
+                "error": f"Export failed while writing {dest}: {exc}",
+                "query": _query_echo(query),
+            }
+        )
 
     summary = summarize_data(data, max_rows=0, warnings=warnings)
-    summary.pop("data", None)
     return to_json(
         {
             "path": str(dest),
@@ -700,6 +687,49 @@ def export_query(
             "summary": summary,
         }
     )
+
+
+# Assemble the shared Args docs into each query tool's docstring BEFORE
+# registration — FastMCP parses __doc__ at registration time.
+stage_query.__doc__ = f"""{stage_query.__doc__}
+    Args:
+{_QUERY_PARAM_DOCS}
+
+    Returns:
+        JSON with staged flag, container type, size_bytes, domain_length,
+        the canonical query, and a recommendation for the next step.
+    """
+query_data.__doc__ = f"""{query_data.__doc__}
+    Args:
+{_QUERY_PARAM_DOCS}
+
+    Returns:
+        JSON with the result data (coordinate-attributed records) or a
+        structure summary, explicit truncated/lazy flags, staged size, and any
+        server warnings.
+    """
+export_query.__doc__ = f"""{export_query.__doc__}
+    Args:
+        path: Destination file path (parent directories are created; confined to OCEANUM_MCP_EXPORT_DIR when set).
+        format: Output format: netcdf (datasets), parquet or csv (tabular). Defaults by container: dataset -> netcdf, tabular -> parquet.
+        overwrite: Overwrite an existing file (default false).
+{_QUERY_PARAM_DOCS}
+
+    Returns:
+        JSON with the written path, format, bytes_written, and a structure
+        summary of the exported data (no inline values).
+    """
+
+stage_query = mcp.tool(annotations=READ_TOOL)(stage_query)
+query_data = mcp.tool(annotations=READ_TOOL)(query_data)
+export_query = mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": False,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)(export_query)
 
 
 @mcp.tool(annotations=READ_TOOL)
@@ -718,9 +748,13 @@ def load_datasource(datasource_id: str) -> str:
         small datasources.
     """
     conn = get_datamesh_connector()
+    try:
+        query = Query(datasource=datasource_id)
+    except (ValueError, TypeError) as exc:
+        raise ToolError(f"Invalid datasource_id: {exc}") from exc
     warnings: list[str] = []
     try:
-        stage = _stage(conn, Query(datasource=datasource_id))
+        stage = _stage(conn, query)
         if stage is None:
             return to_json(
                 {
@@ -734,22 +768,16 @@ def load_datasource(datasource_id: str) -> str:
             stage.container in (Container.DataFrame, Container.GeoDataFrame)
             and stage.size > inline_limit
         ):
-            return to_json(
-                {
-                    "refused": True,
-                    **_stage_summary(stage),
-                    "message": (
-                        f"Datasource is {human_bytes(stage.size)}, above the "
-                        f"inline limit of {human_bytes(inline_limit)}. Use "
-                        "query_data with filters, or export_query to write it "
-                        "to a file."
-                    ),
-                    "datasource_id": datasource_id,
-                }
+            return _refusal(
+                stage,
+                f"Datasource is {human_bytes(stage.size)}, above the inline "
+                f"limit of {human_bytes(inline_limit)}. Use query_data with "
+                "filters, or export_query to write it to a file.",
+                datasource_id=datasource_id,
             )
         with _captured_warnings(warnings):
             data = conn.load_datasource(datasource_id)
-    except (DatameshConnectError, DatameshQueryError) as exc:
+    except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "datasource_id": datasource_id})
     return to_json(summarize_data(data, warnings=warnings))
 
@@ -759,7 +787,15 @@ def load_datasource(datasource_id: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _update_metadata(
+@mcp.tool(
+    annotations={
+        "readOnlyHint": False,
+        "destructiveHint": True,
+        "idempotentHint": True,
+        "openWorldHint": True,
+    }
+)
+def update_metadata(
     datasource_id: str,
     name: str | None = None,
     description: str | None = None,
@@ -805,13 +841,7 @@ def _update_metadata(
     return to_json(format_datasource(ds))
 
 
-if not is_read_only():
-    update_metadata = mcp.tool(
-        annotations={
-            "readOnlyHint": False,
-            "destructiveHint": True,
-            "idempotentHint": True,
-            "openWorldHint": True,
-        },
-        name="update_metadata",
-    )(_update_metadata)
+if is_read_only():
+    # Native visibility transform: composes through combined-server mounts
+    # and keeps the tool registered (re-enable is possible at runtime).
+    mcp.disable(names={"update_metadata"})
