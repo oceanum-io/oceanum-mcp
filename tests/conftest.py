@@ -1,57 +1,47 @@
-"""Test configuration — mock external dependencies that may not be installed."""
+"""Shared test fixtures.
 
-import sys
-from unittest.mock import MagicMock
+Tests run against the real fastmcp and oceanum packages; only the network
+boundary (Connector / FileSystem / staging) is mocked.
+"""
 
-# Mock the `fastmcp` package so server modules can be imported without it installed
-mock_fastmcp = MagicMock()
+from typing import Iterator
+from unittest.mock import MagicMock, patch
 
+import pytest
 
-class _FakeFastMCP:
-    """Minimal stand-in for fastmcp.FastMCP."""
+from oceanum.datamesh.query import Container, Query, Stage
 
-    def __init__(self, name="test", **kwargs):
-        self.name = name
-        self._tools = {}
-
-    def tool(self):
-        """Decorator that registers a tool function and returns it unchanged."""
-
-        def decorator(fn):
-            self._tools[fn.__name__] = fn
-            return fn
-
-        return decorator
-
-    def mount(self, other, prefix=None):
-        pass
-
-    def run(self, **kwargs):
-        pass
+import oceanum_mcp.servers.datamesh.server as datamesh_server
 
 
-mock_fastmcp.FastMCP = _FakeFastMCP
-sys.modules.setdefault("fastmcp", mock_fastmcp)
+def make_stage(
+    container: Container = Container.Dataset, size: int = 1000, dlen: int = 10
+) -> Stage:
+    """Build a real Stage object as returned by the Datamesh staging endpoint."""
+    return Stage(
+        query=Query(datasource="test-ds"),
+        qhash="qhash",
+        formats=["nc"],
+        size=size,
+        dlen=dlen,
+        coordmap={},
+        coordkeys={},
+        container=container,
+        sig="sig",
+    )
 
-# Mock the `oceanum` package
-mock_oceanum = MagicMock()
+
+@pytest.fixture
+def mock_conn() -> Iterator[MagicMock]:
+    """Mock Connector patched into the datamesh server module."""
+    conn = MagicMock()
+    with patch.object(datamesh_server, "get_datamesh_connector", return_value=conn):
+        yield conn
 
 
-# Real exception classes so they can be caught in except clauses
-class _DatameshConnectError(Exception):
-    pass
-
-
-class _DatameshQueryError(Exception):
-    pass
-
-
-mock_exceptions = MagicMock()
-mock_exceptions.DatameshConnectError = _DatameshConnectError
-mock_exceptions.DatameshQueryError = _DatameshQueryError
-
-sys.modules.setdefault("oceanum", mock_oceanum)
-sys.modules.setdefault("oceanum.datamesh", mock_oceanum.datamesh)
-sys.modules.setdefault("oceanum.datamesh.query", mock_oceanum.datamesh.query)
-sys.modules.setdefault("oceanum.datamesh.exceptions", mock_exceptions)
-sys.modules.setdefault("oceanum.storage", mock_oceanum.storage)
+@pytest.fixture
+def mock_stage() -> Iterator[MagicMock]:
+    """Patch the datamesh server's staging helper; defaults to a small dataset."""
+    with patch.object(datamesh_server, "_stage") as stager:
+        stager.return_value = make_stage()
+        yield stager

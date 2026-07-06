@@ -17,5 +17,5 @@ mcp = FastMCP(
     ),
 )
 
-mcp.mount(datamesh, prefix="datamesh")
-mcp.mount(storage, prefix="storage")
+mcp.mount(datamesh, namespace="datamesh")
+mcp.mount(storage, namespace="storage")

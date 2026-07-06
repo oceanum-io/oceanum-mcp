@@ -147,7 +147,7 @@ class TestDeleteFile:
         ):
             from oceanum_mcp.servers.storage.server import delete_file
 
-            result = delete_file("/data/dir", recursive=True)
+            delete_file("/data/dir", recursive=True)
             mock_fs.rm.assert_called_once_with("/data/dir", recursive=True)
 
 
@@ -170,3 +170,21 @@ class TestFileInfo:
             assert "/data/file.nc" in result
             assert "file" in result
             assert "4096" in result
+
+
+class TestReadOnlyMode:
+    async def test_read_only_disables_write_tools(self, monkeypatch):
+        import importlib
+
+        import oceanum_mcp.servers.storage.server as storage_server
+
+        monkeypatch.setenv("OCEANUM_MCP_READ_ONLY", "1")
+        try:
+            reloaded = importlib.reload(storage_server)
+            tools = {t.name for t in await reloaded.mcp.list_tools()}
+            assert "write_file" not in tools
+            assert "delete_file" not in tools
+            assert "read_file" in tools
+        finally:
+            monkeypatch.delenv("OCEANUM_MCP_READ_ONLY")
+            importlib.reload(storage_server)

@@ -8,6 +8,7 @@ from __future__ import annotations
 from fastmcp import FastMCP
 
 from oceanum_mcp.common.client import get_storage_filesystem
+from oceanum_mcp.common.config import is_read_only
 
 mcp = FastMCP(
     "Oceanum Storage",
@@ -137,3 +138,8 @@ def file_info(path: str) -> str:
         f"Size: {info.get('size', 0)} bytes",
     ]
     return "\n".join(lines)
+
+
+if is_read_only():
+    # OCEANUM_MCP_READ_ONLY disables every write tool across servers.
+    mcp.disable(names={"write_file", "delete_file"})

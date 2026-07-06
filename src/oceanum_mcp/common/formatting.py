@@ -1,56 +1,150 @@
-"""Shared data formatting and summarization for Oceanum MCP servers."""
+"""Shared data formatting and summarization for Oceanum MCP servers.
+
+All summaries are plain dicts so tools can return one consistent JSON shape.
+Values shown inline are always coordinate-attributed (records, not bare
+arrays), and truncation or lazy loading is flagged explicitly so the model
+never mistakes a preview for the full result.
+"""
 
 from __future__ import annotations
 
 import json
+import sys
 from typing import Any
 
 import pandas as pd
 import xarray as xr
 
 
-def summarize_data(data: Any, max_rows: int = 20) -> str:
-    """Summarize a data result for MCP output."""
+def to_json(obj: Any) -> str:
+    """Serialize a tool result dict to the JSON string returned to the client."""
+    return json.dumps(obj, indent=2, default=str)
+
+
+def human_bytes(n: int | float) -> str:
+    """Format a byte count for display (decimal units)."""
+    n = float(n)
+    for unit in ("B", "kB", "MB", "GB", "TB"):
+        if n < 1000 or unit == "TB":
+            return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+        n /= 1000
+    raise AssertionError("unreachable")
+
+
+def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
+    return json.loads(df.to_json(orient="records", date_format="iso"))
+
+
+def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
+    # geopandas overrides DataFrame.to_json with a GeoJSON serializer, so geo
+    # frames must be converted to plain pandas (geometry as WKT) before
+    # serializing records. sys.modules is enough: a GeoDataFrame can only
+    # exist if geopandas is already imported.
+    gpd = sys.modules.get("geopandas")
+    is_geo = gpd is not None and isinstance(df, gpd.GeoDataFrame)
+    out: dict[str, Any] = {
+        "container": "geodataframe" if is_geo else "dataframe",
+        "rows": int(df.shape[0]),
+        "columns": [{"name": str(c), "dtype": str(t)} for c, t in df.dtypes.items()],
+    }
+    if max_rows <= 0:
+        # Structure-only summary (e.g. after an export): no preview, and no
+        # truncation flags that could suggest the result itself is partial.
+        return out
+    shown = df.head(max_rows)
+    if is_geo:
+        plain = pd.DataFrame(shown).copy()
+        for col in shown.columns:
+            if isinstance(shown[col].dtype, gpd.array.GeometryDtype):
+                plain[col] = shown[col].to_wkt()
+        shown = plain
+    out["data"] = _records(shown)
+    out["truncated"] = df.shape[0] > max_rows
+    if out["truncated"]:
+        out["note"] = (
+            f"Showing first {max_rows} of {df.shape[0]} rows. Narrow the query "
+            "with filters or aggregation, or use export_query for the full result."
+        )
+    return out
+
+
+def _coord_summary(coord: xr.DataArray) -> dict[str, Any]:
+    out: dict[str, Any] = {"dtype": str(coord.dtype), "size": int(coord.size)}
+    # Chunked (dask-backed) coordinates would be downloaded in full just to
+    # show first/last — skip values for those; dimension coords are in-memory.
+    if coord.chunks is None and coord.size:
+        out["first"] = str(coord.values.flat[0])
+        out["last"] = str(coord.values.flat[-1])
+    return out
+
+
+def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
+    lazy = any(ds[v].chunks is not None for v in ds.data_vars)
+    out: dict[str, Any] = {
+        "container": "dataset",
+        "dims": {str(k): int(v) for k, v in ds.sizes.items()},
+        "coords": {
+            str(name): _coord_summary(coord) for name, coord in ds.coords.items()
+        },
+        "variables": {
+            str(name): {
+                "dims": [str(d) for d in var.dims],
+                "shape": [int(s) for s in var.shape],
+                "dtype": str(var.dtype),
+            }
+            for name, var in ds.data_vars.items()
+        },
+        "nbytes": int(ds.nbytes),
+        "size_human": human_bytes(ds.nbytes),
+        "lazy": lazy,
+    }
+    if lazy:
+        out["note"] = (
+            "Dataset is lazily loaded (values not downloaded). Use query_data "
+            "with narrower filters or aggregation to see values inline, or "
+            "export_query to write the data to a file."
+        )
+    elif max_rows > 0:
+        # Eager data is already in memory — always include a preview of
+        # coordinate-attributed values.
+        df = ds.to_dataframe().reset_index()
+        out["data"] = _records(df.head(max_rows))
+        out["truncated"] = df.shape[0] > max_rows
+        if out["truncated"]:
+            out["note"] = (
+                f"Showing first {max_rows} of {df.shape[0]} records. Use "
+                "export_query for the full result."
+            )
+    return out
+
+
+def summarize_data(
+    data: Any, max_rows: int = 20, warnings: list[str] | None = None
+) -> dict[str, Any]:
+    """Summarize a query result as a structured dict for MCP output.
+
+    max_rows <= 0 produces a structure-only summary with no value preview and
+    no truncation flags (used after exports, where the written file is
+    complete regardless of preview size).
+    """
     if data is None:
-        return "No data returned."
-
-    if isinstance(data, pd.DataFrame):
-        lines = [
-            f"DataFrame: {data.shape[0]} rows x {data.shape[1]} columns",
-            f"Columns: {list(data.columns)}",
-            f"Dtypes:\n{data.dtypes.to_string()}",
-        ]
-        if data.shape[0] <= max_rows:
-            lines.append(f"\nData:\n{data.to_string()}")
-        else:
-            lines.append(
-                f"\nFirst {max_rows} rows:\n{data.head(max_rows).to_string()}"
-            )
-            lines.append(
-                f"\n... ({data.shape[0] - max_rows} more rows. "
-                "Narrow your query with time/geo/variable filters to get smaller results.)"
-            )
-        return "\n".join(lines)
-
-    if isinstance(data, xr.Dataset):
-        lines = [f"xarray Dataset:\n{data}"]
-        if data.nbytes < 1_000_000:
-            # Small enough to show values
-            for var in list(data.data_vars)[:5]:
-                arr = data[var]
-                lines.append(f"\n{var} sample values:\n{arr.values.flat[:20]}")
-        else:
-            lines.append(
-                f"\nDataset size: {data.nbytes / 1e6:.1f} MB. "
-                "Use query_data with filters to retrieve a subset."
-            )
-        return "\n".join(lines)
-
-    return str(data)
+        summary: dict[str, Any] = {
+            "status": "no_data",
+            "message": "No data returned for this query.",
+        }
+    elif isinstance(data, pd.DataFrame):
+        summary = _frame_summary(data, max_rows)
+    elif isinstance(data, xr.Dataset):
+        summary = _dataset_summary(data, max_rows)
+    else:
+        summary = {"container": type(data).__name__, "repr": str(data)}
+    if warnings:
+        summary["warnings"] = warnings
+    return summary
 
 
-def format_datasource(ds: Any) -> str:
-    """Format a Datasource object into a JSON string for MCP output."""
+def format_datasource(ds: Any) -> dict[str, Any]:
+    """Format a Datasource object into a dict for MCP output."""
     result: dict[str, Any] = {
         "id": ds.id,
         "name": ds.name,
@@ -86,4 +180,4 @@ def format_datasource(ds: Any) -> str:
         result["modified"] = ds.modified.isoformat()
     if ds.created:
         result["created"] = ds.created.isoformat()
-    return json.dumps(result, indent=2, default=str)
+    return result
