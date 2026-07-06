@@ -1,9 +1,21 @@
 """Tests for the Datamesh MCP server."""
 
+import importlib
 import json
-from unittest.mock import patch, MagicMock
+import warnings
+from unittest.mock import MagicMock
 
+import numpy as np
+import pandas as pd
 import pytest
+import xarray as xr
+from fastmcp.exceptions import ToolError
+
+from oceanum.datamesh.exceptions import DatameshConnectError, DatameshQueryError
+from oceanum.datamesh.query import Container, CoordSelector, GeoFilter
+
+import oceanum_mcp.servers.datamesh.server as server
+from tests.conftest import make_stage
 
 
 def _mock_datasource(**kwargs):
@@ -38,179 +50,394 @@ def _mock_catalog(datasources):
     return catalog
 
 
+def _small_dataset() -> xr.Dataset:
+    return xr.Dataset(
+        {"hs": (("time",), np.array([1.0, 2.0, 3.0]))},
+        coords={"time": pd.date_range("2024-01-01", periods=3, freq="h")},
+    )
+
+
 class TestSearchCatalog:
-    def test_returns_results(self):
-        mock_conn = MagicMock()
+    def test_returns_results_with_count(self, mock_conn):
         ds = _mock_datasource(id="era5-waves", name="ERA5 Waves", tags=["wave"])
         mock_conn.get_catalog.return_value = _mock_catalog([ds])
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import search_catalog
+        parsed = json.loads(server.search_catalog(search="wave"))
+        assert parsed["count"] == 1
+        assert parsed["results"][0]["id"] == "era5-waves"
+        assert mock_conn.get_catalog.call_args.kwargs["limit"] == 20
 
-            result = search_catalog(search="wave")
-            assert "era5-waves" in result
-            assert "ERA5 Waves" in result
-            parsed = json.loads(result)
-            assert len(parsed) == 1
-            assert parsed[0]["id"] == "era5-waves"
-
-    def test_empty_catalog(self):
-        mock_conn = MagicMock()
+    def test_no_sentinel_times(self, mock_conn):
         mock_conn.get_catalog.return_value = _mock_catalog([])
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import search_catalog
+        server.search_catalog(time_start="2023-01-01")
+        assert mock_conn.get_catalog.call_args.kwargs["timefilter"] == [
+            "2023-01-01",
+            None,
+        ]
 
-            result = search_catalog(search="nonexistent")
-            assert "No datasources found" in result
-
-    def test_with_bbox(self):
-        mock_conn = MagicMock()
+    def test_empty_catalog(self, mock_conn):
         mock_conn.get_catalog.return_value = _mock_catalog([])
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import search_catalog
+        parsed = json.loads(server.search_catalog(search="nonexistent"))
+        assert parsed["count"] == 0
+        assert "No datasources found" in parsed["message"]
 
-            search_catalog(bbox=[120, -50, 180, 10])
-            call_kwargs = mock_conn.get_catalog.call_args
-            assert call_kwargs.kwargs.get("geofilter") is not None
+    def test_note_when_limit_reached(self, mock_conn):
+        ds = _mock_datasource()
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        parsed = json.loads(server.search_catalog(search="wave", limit=1))
+        assert "more matches may exist" in parsed["note"]
+
+    def test_with_bbox(self, mock_conn):
+        mock_conn.get_catalog.return_value = _mock_catalog([])
+
+        server.search_catalog(bbox=[120, -50, 180, 10])
+        geofilter = mock_conn.get_catalog.call_args.kwargs["geofilter"]
+        assert isinstance(geofilter, GeoFilter)
 
 
 class TestGetDatasourceInfo:
-    def test_returns_metadata(self):
-        mock_conn = MagicMock()
+    def test_returns_metadata(self, mock_conn):
         ds = _mock_datasource(id="my-ds", name="My Dataset", driver="onzarr")
         mock_conn.get_datasource.return_value = ds
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import get_datasource_info
+        parsed = json.loads(server.get_datasource_info("my-ds"))
+        assert parsed["id"] == "my-ds"
+        assert parsed["name"] == "My Dataset"
+        assert parsed["driver"] == "onzarr"
 
-            result = get_datasource_info("my-ds")
-            parsed = json.loads(result)
-            assert parsed["id"] == "my-ds"
-            assert parsed["name"] == "My Dataset"
-            assert parsed["driver"] == "onzarr"
+
+class TestBuildQuery:
+    def test_range_times_without_sentinels(self):
+        q = server._build_query("test-ds", time_start="2024-01-01")
+        assert q.timefilter.times[1] is None
+
+    def test_series_times(self):
+        q = server._build_query("test-ds", times=["2024-01-01", "2024-02-01"])
+        assert q.timefilter.type.value == "series"
+
+    def test_times_and_range_conflict(self):
+        with pytest.raises(ToolError, match="not both"):
+            server._build_query(
+                "test-ds", time_start="2024-01-01", times=["2024-01-02"]
+            )
+
+    def test_time_resolution_and_resample(self):
+        q = server._build_query(
+            "test-ds",
+            time_start="2024-01-01",
+            time_end="2024-12-31",
+            time_resolution="1D",
+            time_resample="mean",
+        )
+        assert q.timefilter.resolution == "1D"
+        assert q.timefilter.resample.value == "mean"
+
+    def test_time_resolution_requires_range(self):
+        with pytest.raises(ToolError, match="require"):
+            server._build_query("test-ds", time_resolution="1D")
+
+    def test_bbox_and_feature_conflict(self):
+        feature = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [174.0, -41.0]},
+            "properties": {},
+        }
+        with pytest.raises(ToolError, match="not both"):
+            server._build_query("test-ds", bbox=[0, 0, 1, 1], geofilter_feature=feature)
+
+    def test_feature_geofilter_with_interp(self):
+        feature = {
+            "type": "Feature",
+            "geometry": {"type": "Point", "coordinates": [174.0, -41.0]},
+            "properties": {},
+        }
+        q = server._build_query(
+            "test-ds", geofilter_feature=feature, geofilter_interp="nearest"
+        )
+        assert q.geofilter.type.value == "feature"
+        assert q.geofilter.interp.value == "nearest"
+
+    def test_level_series(self):
+        q = server._build_query("test-ds", levels=[0.0, 10.0], level_interp="nearest")
+        assert q.levelfilter.type.value == "series"
+        assert q.levelfilter.interp.value == "nearest"
+
+    def test_levels_and_range_conflict(self):
+        with pytest.raises(ToolError, match="not both"):
+            server._build_query("test-ds", levels=[0.0], level_min=0.0)
+
+    def test_coord_filters_typed(self):
+        q = server._build_query(
+            "test-ds",
+            coord_filters=[CoordSelector(coord="station", values=["A1", "B2"])],
+        )
+        assert q.coordfilter[0].coord == "station"
+
+    def test_crs_and_aggregate(self):
+        q = server._build_query(
+            "test-ds",
+            crs=4326,
+            aggregate_operations=["mean", "max"],
+            aggregate_temporal=False,
+        )
+        assert q.crs == 4326
+        assert q.aggregate.temporal is False
+
+    def test_invalid_bbox_raises_tool_error(self):
+        with pytest.raises(ToolError, match="Invalid query parameters"):
+            server._build_query("test-ds", bbox=[0, 0, 1])
+
+
+class TestStageQuery:
+    def test_small_dataset_recommends_inline(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=1000, dlen=10)
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert parsed["staged"] is True
+        assert parsed["container"] == "dataset"
+        assert parsed["size_bytes"] == 1000
+        assert "query_data" in parsed["recommendation"]
+        assert parsed["query"]["datasource"] == "test-ds"
+
+    def test_large_dataset_recommends_export(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=10**9)
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert "export_query" in parsed["recommendation"]
+
+    def test_row_cap_warning(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(
+            Container.DataFrame, size=10**9, dlen=3_000_000
+        )
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert any("caps tabular" in w for w in parsed["warnings"])
+
+    def test_no_data(self, mock_conn, mock_stage):
+        mock_stage.return_value = None
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert parsed["staged"] is False
+
+    def test_stage_error_echoes_query(self, mock_conn, mock_stage):
+        mock_stage.side_effect = DatameshQueryError("bad datasource")
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert "bad datasource" in parsed["error"]
+        assert parsed["query"]["datasource"] == "test-ds"
 
 
 class TestQueryData:
-    def test_basic_query(self):
-        import pandas as pd
-
-        mock_conn = MagicMock()
+    def test_small_dataframe_inline(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
         mock_conn.query.return_value = pd.DataFrame({"temp": [15.0, 16.0]})
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import query_data
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert parsed["container"] == "dataframe"
+        assert parsed["rows"] == 2
+        assert parsed["truncated"] is False
+        assert parsed["data"][0]["temp"] == 15.0
+        assert parsed["staged_size_bytes"] == 100
+        assert mock_conn.query.call_args.kwargs["use_dask"] is False
 
-            result = query_data(datasource_id="test-ds")
-            assert "DataFrame" in result
-            assert "2 rows" in result
+    def test_truncation_flagged(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"x": range(25)})
 
-    def test_query_builds_filters(self):
-        mock_conn = MagicMock()
-        mock_conn.query.return_value = None
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert parsed["truncated"] is True
+        assert len(parsed["data"]) == 20
+        assert "note" in parsed
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import query_data
+    def test_large_frame_refused_without_download(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=10**9)
 
-            query_data(
-                datasource_id="test-ds",
-                variables=["Hs", "Tp"],
-                time_start="2024-01-01",
-                time_end="2024-01-31",
-                bbox=[120, -50, 180, 10],
-                limit=100,
-            )
-            query_dict = mock_conn.query.call_args[0][0]
-            assert query_dict["datasource"] == "test-ds"
-            assert query_dict["variables"] == ["Hs", "Tp"]
-            assert "timefilter" in query_dict
-            assert "geofilter" in query_dict
-            assert query_dict["limit"] == 100
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert parsed["refused"] is True
+        assert "export_query" in parsed["message"]
+        mock_conn.query.assert_not_called()
 
+    def test_large_dataset_goes_lazy(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=10**9)
+        mock_conn.query.return_value = _small_dataset().chunk({"time": 1})
 
-class TestQueryDataError:
-    def test_query_server_error_returns_query_dump(self):
-        from oceanum.datamesh.exceptions import DatameshConnectError
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert mock_conn.query.call_args.kwargs["use_dask"] is True
+        assert parsed["lazy"] is True
+        assert "data" not in parsed
 
-        mock_conn = MagicMock()
-        mock_conn.query.side_effect = DatameshConnectError("Datamesh server error: 500")
+    def test_small_dataset_values_have_coordinates(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = _small_dataset()
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import query_data
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert parsed["container"] == "dataset"
+        assert parsed["data"][0]["hs"] == 1.0
+        assert "time" in parsed["data"][0]
 
-            result = query_data(
-                datasource_id="test-ds",
-                variables=["Hs"],
-                time_start="2024-01-01",
-                time_end="2024-01-31",
-            )
-            parsed = json.loads(result)
-            assert "error" in parsed
-            assert "query" in parsed
-            assert parsed["query"]["datasource"] == "test-ds"
-            assert parsed["query"]["variables"] == ["Hs"]
+    def test_library_warnings_surfaced(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
 
-    def test_load_server_error_returns_datasource_id(self):
-        from oceanum.datamesh.exceptions import DatameshConnectError
+        def _query_with_warning(*args, **kwargs):
+            warnings.warn("Query limited to 2000000 rows")
+            return pd.DataFrame({"x": [1]})
 
-        mock_conn = MagicMock()
-        mock_conn.load_datasource.side_effect = DatameshConnectError(
-            "Datamesh server error: 500"
+        mock_conn.query.side_effect = _query_with_warning
+
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert any("2000000 rows" in w for w in parsed["warnings"])
+
+    def test_query_error_echoes_query(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.side_effect = DatameshConnectError("server error: 500")
+
+        parsed = json.loads(
+            server.query_data(datasource_id="test-ds", variables=["Hs"])
         )
+        assert "error" in parsed
+        assert parsed["query"]["datasource"] == "test-ds"
+        assert parsed["query"]["variables"] == ["Hs"]
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import load_datasource
 
-            result = load_datasource(datasource_id="bad-ds")
-            parsed = json.loads(result)
-            assert "error" in parsed
-            assert parsed["datasource_id"] == "bad-ds"
+class TestExportQuery:
+    def test_frame_to_parquet(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"temp": [15.0, 16.0]})
+        dest = tmp_path / "out.parquet"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        )
+        assert dest.exists()
+        assert parsed["format"] == "parquet"
+        assert parsed["bytes_written"] == dest.stat().st_size
+        assert "data" not in parsed["summary"]
+
+    def test_frame_to_csv(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"temp": [15.0]})
+        dest = tmp_path / "out.csv"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest), format="csv")
+        )
+        assert parsed["format"] == "csv"
+        assert "temp" in dest.read_text()
+
+    def test_dataset_to_netcdf_streams_lazily(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = _small_dataset()
+        dest = tmp_path / "out.nc"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        )
+        assert dest.exists()
+        assert parsed["format"] == "netcdf"
+        assert mock_conn.query.call_args.kwargs["use_dask"] is True
+
+    def test_dataset_rejects_csv(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+
+        with pytest.raises(ToolError, match="netcdf"):
+            server.export_query(
+                datasource_id="test-ds",
+                path=str(tmp_path / "out.csv"),
+                format="csv",
+            )
+
+    def test_refuses_overwrite(self, mock_conn, mock_stage, tmp_path):
+        dest = tmp_path / "exists.nc"
+        dest.write_text("data")
+
+        with pytest.raises(ToolError, match="overwrite"):
+            server.export_query(datasource_id="test-ds", path=str(dest))
+
+    def test_oversized_frame_refused(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=3 * 10**9)
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds", path=str(tmp_path / "out.parquet")
+            )
+        )
+        assert parsed["refused"] is True
+        mock_conn.query.assert_not_called()
+
+
+class TestLoadDatasource:
+    def test_dataset_loaded(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=10**12)
+        mock_conn.load_datasource.return_value = _small_dataset().chunk({"time": 1})
+
+        parsed = json.loads(server.load_datasource(datasource_id="test-ds"))
+        assert parsed["container"] == "dataset"
+        assert parsed["lazy"] is True
+
+    def test_large_frame_refused(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=10**9)
+
+        parsed = json.loads(server.load_datasource(datasource_id="test-ds"))
+        assert parsed["refused"] is True
+        mock_conn.load_datasource.assert_not_called()
+
+    def test_load_error_returns_datasource_id(self, mock_conn, mock_stage):
+        mock_stage.side_effect = DatameshConnectError("server error: 500")
+
+        parsed = json.loads(server.load_datasource(datasource_id="bad-ds"))
+        assert "error" in parsed
+        assert parsed["datasource_id"] == "bad-ds"
 
 
 class TestUpdateMetadata:
-    def test_updates_fields(self):
-        mock_conn = MagicMock()
+    def test_updates_fields_with_typed_info(self, mock_conn):
         ds = _mock_datasource(id="my-ds", name="Updated Name", tags=["new-tag"])
         mock_conn.update_metadata.return_value = ds
 
-        with patch(
-            "oceanum_mcp.servers.datamesh.server.get_datamesh_connector",
-            return_value=mock_conn,
-        ):
-            from oceanum_mcp.servers.datamesh.server import update_metadata
+        result = server._update_metadata(
+            datasource_id="my-ds",
+            name="Updated Name",
+            tags=["new-tag"],
+            info={"source": "buoy"},
+        )
+        mock_conn.update_metadata.assert_called_once_with(
+            "my-ds", name="Updated Name", tags=["new-tag"], info={"source": "buoy"}
+        )
+        parsed = json.loads(result)
+        assert parsed["id"] == "my-ds"
 
-            result = update_metadata(
-                datasource_id="my-ds",
-                name="Updated Name",
-                tags=["new-tag"],
-            )
-            mock_conn.update_metadata.assert_called_once_with(
-                "my-ds", name="Updated Name", tags=["new-tag"]
-            )
-            parsed = json.loads(result)
-            assert parsed["id"] == "my-ds"
+
+class TestRegistration:
+    async def test_tools_registered_with_annotations(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        assert set(tools) >= {
+            "search_catalog",
+            "get_datasource_info",
+            "stage_query",
+            "query_data",
+            "export_query",
+            "load_datasource",
+            "update_metadata",
+        }
+        assert tools["search_catalog"].annotations.readOnlyHint is True
+        assert tools["query_data"].annotations.readOnlyHint is True
+        assert tools["update_metadata"].annotations.destructiveHint is True
+        assert tools["update_metadata"].annotations.readOnlyHint is False
+
+    async def test_docstrings_present(self):
+        for tool in await server.mcp.list_tools():
+            assert tool.description, f"tool {tool.name} has no description"
+
+    async def test_read_only_mode_hides_update_metadata(self, monkeypatch):
+        monkeypatch.setenv("OCEANUM_MCP_READ_ONLY", "1")
+        try:
+            reloaded = importlib.reload(server)
+            tools = {t.name for t in await reloaded.mcp.list_tools()}
+            assert "update_metadata" not in tools
+            assert "query_data" in tools
+        finally:
+            monkeypatch.delenv("OCEANUM_MCP_READ_ONLY")
+            importlib.reload(server)

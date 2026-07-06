@@ -104,18 +104,26 @@ Use stdio transport with the same command:
 
 ## Environment Variables
 
-| Variable           | Required | Description                                                          |
-| ------------------ | -------- | -------------------------------------------------------------------- |
-| `DATAMESH_TOKEN`   | Yes      | Oceanum API token (shared by all servers)                            |
-| `DATAMESH_SERVICE` | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`) |
-| `STORAGE_SERVICE`  | No       | Custom storage service URL (default: `https://storage.oceanum.io`)   |
-| `OCEANUM_DOMAIN`   | No       | Override the base domain for all services (default: `oceanum.io`)    |
+| Variable                      | Required | Description                                                                     |
+| ----------------------------- | -------- | ------------------------------------------------------------------------------- |
+| `DATAMESH_TOKEN`              | Yes      | Oceanum API token (shared by all servers)                                       |
+| `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
+| `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
+| `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
+| `OCEANUM_MCP_READ_ONLY`       | No       | Set to `1`/`true` to disable write tools (`update_metadata`)                    |
+| `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 
 ## Datamesh Tools
+
+The intended workflow is: `search_catalog` → `get_datasource_info` → `stage_query`
+(dry run: learn the result size without downloading) → `query_data` for small
+results inline, or `export_query` to write large results to a file that analysis
+code reads directly.
 
 ### `search_catalog`
 
 Search the Datamesh catalog with optional text search, time range, and bounding box filters.
+Returns a JSON object with `count` and `results`; if `count` equals `limit`, more matches may exist.
 
 | Parameter    | Type        | Description                                      |
 | ------------ | ----------- | ------------------------------------------------ |
@@ -123,7 +131,7 @@ Search the Datamesh catalog with optional text search, time range, and bounding 
 | `time_start` | string      | ISO 8601 start time                              |
 | `time_end`   | string      | ISO 8601 end time                                |
 | `bbox`       | list[float] | Bounding box `[xmin, ymin, xmax, ymax]` in WGS84 |
-| `limit`      | int         | Max results to return                            |
+| `limit`      | int         | Max results to return (default 20)               |
 
 ### `get_datasource_info`
 
@@ -133,29 +141,63 @@ Get full metadata for a datasource including schema, variables, coordinates, and
 | --------------- | ------ | ------------- |
 | `datasource_id` | string | Datasource ID |
 
+### `stage_query`
+
+Dry-run a query on the Datamesh gateway: reports the result size, container
+type, and domain length **without downloading any data**, echoes the canonical
+query, and recommends the next step (inline query vs export vs narrowing).
+Accepts the same query parameters as `query_data`.
+
 ### `query_data`
 
-Query a datasource with filters. Returns data summary for large results, full data for small ones.
+Query a datasource with filters and return small results inline as
+coordinate-attributed JSON records with explicit `truncated`/`lazy` flags.
+The query is staged first: gridded results above the inline limit are
+summarized lazily (structure only); tabular results above the limit are
+refused with the staged size and alternatives. Library warnings (e.g. the
+2,000,000-row cap on tabular queries) are included in the response.
 
-| Parameter              | Type         | Description                                        |
-| ---------------------- | ------------ | -------------------------------------------------- |
-| `datasource_id`        | string       | Datasource to query                                |
-| `variables`            | list[string] | Variables to select                                |
-| `time_start`           | string       | ISO 8601 start time                                |
-| `time_end`             | string       | ISO 8601 end time                                  |
-| `bbox`                 | list[float]  | Bounding box `[xmin, ymin, xmax, ymax]`            |
-| `geofilter_geojson`    | string       | GeoJSON Feature for spatial filtering              |
-| `level_min`            | float        | Minimum vertical level                             |
-| `level_max`            | float        | Maximum vertical level                             |
-| `coord_filters`        | string       | JSON array of `{"coord": "name", "values": [...]}` |
-| `aggregate_operations` | list[string] | Aggregation ops: mean, min, max, std, sum          |
-| `aggregate_spatial`    | bool         | Aggregate over spatial dims (default true)         |
-| `aggregate_temporal`   | bool         | Aggregate over temporal dims (default true)        |
-| `limit`                | int          | Max rows to return                                 |
+| Parameter              | Type         | Description                                                        |
+| ---------------------- | ------------ | ------------------------------------------------------------------ |
+| `datasource_id`        | string       | Datasource to query                                                |
+| `variables`            | list[string] | Variables to select                                                |
+| `time_start`           | string       | ISO 8601 start of a time range (open-ended if omitted)             |
+| `time_end`             | string       | ISO 8601 end of a time range (open-ended if omitted)               |
+| `times`                | list[string] | Discrete times (series selection); excludes `time_start`/`time_end`|
+| `time_resolution`      | string       | Server-side temporal downsampling (pandas frequency, e.g. `1D`)    |
+| `time_resample`        | string       | Resampling method for `time_resolution`: mean, nearest, linear     |
+| `bbox`                 | list[float]  | Bounding box `[xmin, ymin, xmax, ymax]`                            |
+| `geofilter_feature`    | object       | GeoJSON Feature (Point, MultiPoint, or Polygon) for selection      |
+| `geofilter_interp`     | string       | Interpolation for feature selection: nearest or linear             |
+| `geofilter_resolution` | float        | Max spatial resolution for downsampling, in CRS units              |
+| `level_min`            | float        | Minimum vertical level                                             |
+| `level_max`            | float        | Maximum vertical level                                             |
+| `levels`               | list[float]  | Discrete vertical levels (series selection)                        |
+| `level_interp`         | string       | Interpolation for level series: nearest or linear                  |
+| `coord_filters`        | list[object] | Coordinate selections: `[{"coord": "name", "values": [...]}]`      |
+| `crs`                  | string/int   | CRS for filter coordinates and returned data                       |
+| `aggregate_operations` | list[string] | Aggregation ops: mean, min, max, std, sum                          |
+| `aggregate_spatial`    | bool         | Aggregate over spatial dims (default true)                         |
+| `aggregate_temporal`   | bool         | Aggregate over temporal dims (default true)                        |
+| `limit`                | int          | Max rows to return                                                 |
+
+### `export_query`
+
+Run a query and write the **full** result to a local file — the data-handle
+path for results too large to return inline. Gridded datasets stream lazily to
+NetCDF; tabular results write Parquet or CSV. Accepts the same query
+parameters as `query_data` plus:
+
+| Parameter   | Type   | Description                                                              |
+| ----------- | ------ | ------------------------------------------------------------------------ |
+| `path`      | string | Destination file path (parent directories are created)                   |
+| `format`    | string | `netcdf` (datasets), `parquet` or `csv` (tabular); sensible default      |
+| `overwrite` | bool   | Overwrite an existing file (default false)                               |
 
 ### `load_datasource`
 
-Load an entire datasource. Best for small datasets.
+Summarize an entire datasource. Gridded datasources are opened lazily (no data
+download); tabular datasources are downloaded only if under the inline size limit.
 
 | Parameter       | Type   | Description        |
 | --------------- | ------ | ------------------ |
@@ -164,6 +206,7 @@ Load an entire datasource. Best for small datasets.
 ### `update_metadata`
 
 Update metadata on an existing datasource. Only provided fields are changed.
+Disabled when the server runs with `OCEANUM_MCP_READ_ONLY` set.
 
 | Parameter       | Type         | Description                  |
 | --------------- | ------------ | ---------------------------- |
@@ -172,7 +215,7 @@ Update metadata on an existing datasource. Only provided fields are changed.
 | `description`   | string       | New description              |
 | `tags`          | list[string] | New tags                     |
 | `labels`        | list[string] | New labels                   |
-| `info`          | string       | JSON string of metadata dict |
+| `info`          | object       | Additional metadata object   |
 | `details`       | string       | URL for datasource details   |
 
 ## Storage Tools
@@ -234,7 +277,13 @@ Get metadata about a file or directory.
 
 1. `search_catalog(search="wave", bbox=[120, -50, 180, 10])`
 2. `get_datasource_info(datasource_id="some-wave-dataset")`
-3. `query_data(datasource_id="some-wave-dataset", variables=["Hs", "Tp"], time_start="2024-01-01", time_end="2024-01-31")`
+3. `stage_query(datasource_id="some-wave-dataset", variables=["Hs", "Tp"], time_start="2024-01-01", time_end="2024-01-31")` to check the result size
+4. `query_data(...)` with the same parameters if small, or `export_query(..., path="waves.nc")` if large
+
+**Shrink a 40-year hourly time series to something inline-sized:**
+
+1. `stage_query(datasource_id="hindcast", variables=["Hs"], time_start="1984-01-01", time_end="2024-01-01")` — too large
+2. `query_data(..., time_resolution="1MS", time_resample="mean")` — monthly means, small enough to return inline
 
 **Browse and read files in cloud storage:**
 

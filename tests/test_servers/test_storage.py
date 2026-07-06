@@ -147,7 +147,7 @@ class TestDeleteFile:
         ):
             from oceanum_mcp.servers.storage.server import delete_file
 
-            result = delete_file("/data/dir", recursive=True)
+            delete_file("/data/dir", recursive=True)
             mock_fs.rm.assert_called_once_with("/data/dir", recursive=True)
 
 

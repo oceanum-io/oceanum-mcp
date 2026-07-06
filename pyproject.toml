@@ -4,14 +4,19 @@ build-backend = "hatchling.build"
 
 [project]
 name = "oceanum-mcp"
-version = "0.1.2"
+version = "0.2.0"
 description = "MCP servers for the Oceanum platform"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=2.0.0",
-    "oceanum>=1.0.0",
+    "fastmcp>=3.0,<4",
+    # <2 pin guards the private Connector._stage_request/Session usage in the
+    # datamesh server's staging helper (no public staging API in oceanum 1.x).
+    "oceanum>=1.1,<2",
+    # oceanum requires zarr<3, and zarr 2.x breaks at runtime with
+    # numcodecs>=0.16 (blosc.cbuffer_sizes removed); oceanum does not pin this.
+    "numcodecs<0.16",
 ]
 
 [project.optional-dependencies]
@@ -25,3 +30,6 @@ oceanum-mcp = "oceanum_mcp.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/oceanum_mcp"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
