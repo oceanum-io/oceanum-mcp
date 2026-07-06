@@ -203,6 +203,10 @@ class TestBuildQuery:
         with pytest.raises(ToolError, match="Invalid query parameters"):
             server._build_query("test-ds", bbox=[0, 0, 1])
 
+    def test_nonpositive_limit_raises_tool_error(self):
+        with pytest.raises(ToolError, match="at least 1"):
+            server._build_query("test-ds", limit=0)
+
 
 class TestStageQuery:
     def test_small_dataset_recommends_inline(self, mock_conn, mock_stage):

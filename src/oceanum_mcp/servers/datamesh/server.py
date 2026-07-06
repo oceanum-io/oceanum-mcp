@@ -240,6 +240,8 @@ def _build_query(
             "temporal": aggregate_temporal,
         }
     if limit is not None:
+        if limit < 1:
+            raise ToolError("limit must be at least 1.")
         q["limit"] = limit
 
     try:
