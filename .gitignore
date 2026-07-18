@@ -2,3 +2,6 @@ __pycache__
 .pytest_cache
 uv.lock
 .venv/
+
+# Local-only deployment scripts
+deploy_cloudrun*.sh
