@@ -64,6 +64,22 @@ def test_public_url():
         assert public_url() == "https://mcp.oceanum.io"
 
 
+def test_max_inline_rows_default_and_validation():
+    from oceanum_mcp.common.config import max_inline_rows
+
+    with patch.dict(os.environ, {}, clear=True):
+        assert max_inline_rows() == 100
+    with patch.dict(os.environ, {"OCEANUM_MCP_MAX_INLINE_ROWS": "250"}, clear=True):
+        assert max_inline_rows() == 250
+    for bad in ("0", "-5"):
+        with patch.dict(os.environ, {"OCEANUM_MCP_MAX_INLINE_ROWS": bad}, clear=True):
+            with pytest.raises(ValueError, match="at least 1"):
+                max_inline_rows()
+    with patch.dict(os.environ, {"OCEANUM_MCP_MAX_INLINE_ROWS": "x"}, clear=True):
+        with pytest.raises(ValueError, match="integer row count"):
+            max_inline_rows()
+
+
 def test_transport_flag():
     assert not is_network_transport()
     try:

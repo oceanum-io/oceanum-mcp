@@ -39,6 +39,7 @@ from oceanum_mcp.common.config import (
     max_inline_bytes,
 )
 from oceanum_mcp.common.formatting import (
+    export_clause,
     format_datasource,
     human_bytes,
     summarize_data,
@@ -57,14 +58,19 @@ MAX_EXPORT_FRAME_BYTES = 2_000_000_000
 
 READ_TOOL = {"readOnlyHint": True, "openWorldHint": True}
 
+# Instructions are transport-neutral: they describe the stage -> narrow
+# workflow without naming export_query, which is disabled on network
+# transports. The runtime "result too large" messages (via export_clause())
+# and the export_query tool's own docstring carry the export path where it is
+# available, so nothing here freezes a transport-specific string at import.
 mcp = FastMCP(
     "Oceanum Datamesh",
     instructions=(
         "Access the Oceanum Datamesh platform for ocean and environmental data.\n"
         "Workflow: search_catalog to discover datasets -> get_datasource_info for "
         "schema and coverage -> stage_query to learn the result size WITHOUT "
-        "downloading -> query_data for small results inline, or export_query to "
-        "write large results to a file for code to consume.\n"
+        "downloading -> query_data for small results inline, narrowing large "
+        "results with filters, aggregation, or time_resolution downsampling.\n"
         "Never pull large data inline: stage first, then shrink results with "
         "time/geo/level filters, aggregation, or time_resolution downsampling. "
         "Times are ISO 8601 (UTC assumed if naive); sizes are bytes."
@@ -446,7 +452,7 @@ def stage_query(
         )
         out["recommendation"] = (
             f"Larger than the inline limit ({human_bytes(inline_limit)}): "
-            f"{detail}, or use export_query to write it to a file."
+            f"{detail}{export_clause()}."
         )
     if (
         stage.container in (Container.DataFrame, Container.GeoDataFrame)
@@ -536,8 +542,7 @@ def query_data(
                     stage,
                     f"Result is {human_bytes(stage.size)}, above the inline "
                     f"limit of {human_bytes(inline_limit)}. Narrow the query "
-                    "with filters or aggregation, or use export_query to "
-                    "write it to a file.",
+                    f"with filters or aggregation{export_clause()}.",
                     query=_query_echo(query),
                 )
         with _captured_warnings(warnings):
@@ -745,7 +750,7 @@ def load_datasource(datasource_id: str) -> str:
 
     Gridded datasources are opened lazily (no data download). Tabular
     datasources are downloaded only if under the inline size limit; use
-    query_data with filters or export_query otherwise.
+    query_data with filters to retrieve larger ones.
 
     Args:
         datasource_id: The datasource to load.
@@ -779,7 +784,7 @@ def load_datasource(datasource_id: str) -> str:
                 stage,
                 f"Datasource is {human_bytes(stage.size)}, above the inline "
                 f"limit of {human_bytes(inline_limit)}. Use query_data with "
-                "filters, or export_query to write it to a file.",
+                f"filters{export_clause()}.",
                 datasource_id=datasource_id,
             )
         with _captured_warnings(warnings):

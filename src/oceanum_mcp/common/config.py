@@ -8,6 +8,11 @@ from pathlib import Path
 # export_query or be narrowed with filters.
 DEFAULT_MAX_INLINE_BYTES = 50_000_000
 
+# Default number of rows/records previewed inline before a result is
+# truncated. The byte ceiling above bounds total volume; this bounds how much
+# of a within-budget tabular result is shown at once.
+DEFAULT_MAX_INLINE_ROWS = 100
+
 # Transport the current process was started with. Set by the CLI before the
 # server modules are imported (they are imported lazily), so import-time
 # decisions like disabling local-filesystem tools in http mode can key off it.
@@ -58,6 +63,27 @@ def max_inline_bytes() -> int:
             f"OCEANUM_MCP_MAX_INLINE_BYTES must be an integer byte count, "
             f"got {raw!r}"
         ) from exc
+
+
+def max_inline_rows() -> int:
+    """Row/record count previewed inline before truncation.
+
+    Must be a positive integer: max_rows <= 0 is the internal structure-only
+    signal (used after exports), so a 0 or negative env value would silently
+    suppress every preview. Fails fast rather than misbehave quietly.
+    """
+    raw = os.environ.get("OCEANUM_MCP_MAX_INLINE_ROWS")
+    if not raw:
+        return DEFAULT_MAX_INLINE_ROWS
+    try:
+        rows = int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"OCEANUM_MCP_MAX_INLINE_ROWS must be an integer row count, got {raw!r}"
+        ) from exc
+    if rows < 1:
+        raise ValueError(f"OCEANUM_MCP_MAX_INLINE_ROWS must be at least 1, got {rows}")
+    return rows
 
 
 def export_dir() -> Path | None:

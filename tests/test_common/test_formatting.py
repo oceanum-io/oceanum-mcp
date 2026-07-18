@@ -1,10 +1,14 @@
 """Tests for shared formatting and summarization helpers."""
 
+import os
+from unittest.mock import patch
+
 import numpy as np
 import pandas as pd
 import pytest
 import xarray as xr
 
+from oceanum_mcp.common.config import set_transport
 from oceanum_mcp.common.formatting import human_bytes, summarize_data
 
 
@@ -72,16 +76,39 @@ def test_midsize_eager_dataset_includes_values():
     assert big.nbytes > 1_000_000
     out = summarize_data(big)
     assert out["lazy"] is False
-    assert len(out["data"]) == 20
+    assert len(out["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
     assert out["truncated"] is True
 
 
 def test_structure_only_mode_has_no_truncation_flags():
-    out = summarize_data(pd.DataFrame({"x": range(100)}), max_rows=0)
+    out = summarize_data(pd.DataFrame({"x": range(200)}), max_rows=0)
     assert "data" not in out
     assert "truncated" not in out
+    # A completed export must never look partial: no truncation note, full count.
     assert "note" not in out
-    assert out["rows"] == 100
+    assert out["rows"] == 200
+
+
+def test_default_inline_cap_is_configurable():
+    df = pd.DataFrame({"x": range(500)})
+    with patch.dict(os.environ, {"OCEANUM_MCP_MAX_INLINE_ROWS": "250"}, clear=False):
+        out = summarize_data(df)
+    assert len(out["data"]) == 250
+    assert out["truncated"] is True
+
+
+def test_truncation_hint_omits_export_query_on_network_transport():
+    df = pd.DataFrame({"x": range(500)})
+    try:
+        set_transport("http")
+        out = summarize_data(df)
+    finally:
+        set_transport("stdio")
+    assert "export_query" not in out["note"]
+    assert "time_resolution" in out["note"]
+    # stdio keeps the export_query escape hatch
+    stdio_out = summarize_data(df)
+    assert "export_query" in stdio_out["note"]
 
 
 def test_geodataframe_records_use_wkt():

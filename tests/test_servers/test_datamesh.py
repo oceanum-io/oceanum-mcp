@@ -262,11 +262,11 @@ class TestQueryData:
 
     def test_truncation_flagged(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(Container.DataFrame, size=100)
-        mock_conn.query.return_value = pd.DataFrame({"x": range(25)})
+        mock_conn.query.return_value = pd.DataFrame({"x": range(150)})
 
         parsed = json.loads(server.query_data(datasource_id="test-ds"))
         assert parsed["truncated"] is True
-        assert len(parsed["data"]) == 20
+        assert len(parsed["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
         assert "note" in parsed
 
     def test_large_frame_refused_without_download(self, mock_conn, mock_stage):
@@ -276,6 +276,22 @@ class TestQueryData:
         assert parsed["refused"] is True
         assert "export_query" in parsed["message"]
         mock_conn.query.assert_not_called()
+
+    def test_refusal_omits_export_query_on_network_transport(
+        self, mock_conn, mock_stage
+    ):
+        # The server's runtime "too large" message must not name export_query
+        # on a hosted transport, where that tool is disabled.
+        from oceanum_mcp.common.config import set_transport
+
+        mock_stage.return_value = make_stage(Container.DataFrame, size=10**9)
+        try:
+            set_transport("http")
+            parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        finally:
+            set_transport("stdio")
+        assert parsed["refused"] is True
+        assert "export_query" not in parsed["message"]
 
     def test_large_dataset_goes_lazy(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(Container.Dataset, size=10**9)
@@ -334,7 +350,7 @@ class TestQueryData:
 
         parsed = json.loads(server.query_data(datasource_id="test-ds"))
         assert parsed["lazy"] is False
-        assert len(parsed["data"]) == 20
+        assert len(parsed["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
         assert parsed["truncated"] is True
 
 

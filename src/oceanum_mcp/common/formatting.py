@@ -15,10 +15,34 @@ from typing import Any
 import pandas as pd
 import xarray as xr
 
+from oceanum_mcp.common.config import is_network_transport, max_inline_rows
+
 
 def to_json(obj: Any) -> str:
     """Serialize a tool result dict to the JSON string returned to the client."""
     return json.dumps(obj, indent=2, default=str)
+
+
+def export_clause() -> str:
+    """Trailing clause pointing at export_query, only where it is available.
+
+    export_query writes to the server's local disk and is disabled on network
+    transports, so a hosted deployment must never name it. This is the single
+    source of truth for that fact; all result-size guidance (here and in the
+    datamesh server's messages) derives its export wording from this function,
+    evaluated at call time so it always matches the running transport.
+    """
+    if is_network_transport():
+        return ""
+    return ", or use export_query to write the full result to a file"
+
+
+def _narrow_hint() -> str:
+    """How to get more than the inline preview, appropriate to the transport."""
+    return (
+        "Narrow the query with filters, aggregation, or time_resolution "
+        "downsampling" + export_clause() + "."
+    )
 
 
 def human_bytes(n: int | float) -> str:
@@ -62,8 +86,7 @@ def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
     out["truncated"] = df.shape[0] > max_rows
     if out["truncated"]:
         out["note"] = (
-            f"Showing first {max_rows} of {df.shape[0]} rows. Narrow the query "
-            "with filters or aggregation, or use export_query for the full result."
+            f"Showing first {max_rows} of {df.shape[0]} rows. " + _narrow_hint()
         )
     return out
 
@@ -100,9 +123,9 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
     }
     if lazy:
         out["note"] = (
-            "Dataset is lazily loaded (values not downloaded). Use query_data "
-            "with narrower filters or aggregation to see values inline, or "
-            "export_query to write the data to a file."
+            "Dataset is lazily loaded (values not downloaded). Narrow the query "
+            "with filters, aggregation, or time_resolution downsampling to see "
+            "values inline" + export_clause() + "."
         )
     elif max_rows > 0:
         # Eager data is already in memory — always include a preview of
@@ -112,21 +135,23 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
         out["truncated"] = df.shape[0] > max_rows
         if out["truncated"]:
             out["note"] = (
-                f"Showing first {max_rows} of {df.shape[0]} records. Use "
-                "export_query for the full result."
-            )
+                f"Showing first {max_rows} of {df.shape[0]} records. "
+            ) + _narrow_hint()
     return out
 
 
 def summarize_data(
-    data: Any, max_rows: int = 20, warnings: list[str] | None = None
+    data: Any, max_rows: int | None = None, warnings: list[str] | None = None
 ) -> dict[str, Any]:
     """Summarize a query result as a structured dict for MCP output.
 
+    max_rows defaults to the configured inline row cap (OCEANUM_MCP_MAX_INLINE_ROWS).
     max_rows <= 0 produces a structure-only summary with no value preview and
     no truncation flags (used after exports, where the written file is
     complete regardless of preview size).
     """
+    if max_rows is None:
+        max_rows = max_inline_rows()
     if data is None:
         summary: dict[str, Any] = {
             "status": "no_data",
