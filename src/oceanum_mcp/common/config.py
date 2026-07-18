@@ -8,6 +8,11 @@ from pathlib import Path
 # export_query or be narrowed with filters.
 DEFAULT_MAX_INLINE_BYTES = 50_000_000
 
+# Default number of rows/records previewed inline before a result is
+# truncated. The byte ceiling above bounds total volume; this bounds how much
+# of a within-budget tabular result is shown at once.
+DEFAULT_MAX_INLINE_ROWS = 100
+
 # Transport the current process was started with. Set by the CLI before the
 # server modules are imported (they are imported lazily), so import-time
 # decisions like disabling local-filesystem tools in http mode can key off it.
@@ -60,6 +65,22 @@ def max_inline_bytes() -> int:
         ) from exc
 
 
+def max_inline_rows() -> int:
+    """Row/record count previewed inline before truncation.
+
+    Fails fast on an unparsable value, like max_inline_bytes.
+    """
+    raw = os.environ.get("OCEANUM_MCP_MAX_INLINE_ROWS")
+    if not raw:
+        return DEFAULT_MAX_INLINE_ROWS
+    try:
+        return int(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"OCEANUM_MCP_MAX_INLINE_ROWS must be an integer row count, " f"got {raw!r}"
+        ) from exc
+
+
 def export_dir() -> Path | None:
     """Optional directory that export_query writes are confined to.
 
@@ -108,7 +129,9 @@ def auth0_domain() -> str:
 
 
 def auth0_audience() -> str:
-    return os.environ.get("OCEANUM_MCP_AUTH0_AUDIENCE", "https://api.oceanum.io")
+    return os.environ.get(
+        "OCEANUM_MCP_AUTH0_AUDIENCE", "https://mcp.oceanum.io/datamesh"
+    )
 
 
 def public_url() -> str | None:

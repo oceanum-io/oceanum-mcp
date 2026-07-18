@@ -262,11 +262,11 @@ class TestQueryData:
 
     def test_truncation_flagged(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(Container.DataFrame, size=100)
-        mock_conn.query.return_value = pd.DataFrame({"x": range(25)})
+        mock_conn.query.return_value = pd.DataFrame({"x": range(150)})
 
         parsed = json.loads(server.query_data(datasource_id="test-ds"))
         assert parsed["truncated"] is True
-        assert len(parsed["data"]) == 20
+        assert len(parsed["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
         assert "note" in parsed
 
     def test_large_frame_refused_without_download(self, mock_conn, mock_stage):
@@ -334,7 +334,7 @@ class TestQueryData:
 
         parsed = json.loads(server.query_data(datasource_id="test-ds"))
         assert parsed["lazy"] is False
-        assert len(parsed["data"]) == 20
+        assert len(parsed["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
         assert parsed["truncated"] is True
 
 

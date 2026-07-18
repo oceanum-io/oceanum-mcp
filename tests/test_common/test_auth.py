@@ -131,7 +131,7 @@ def test_auth0_verifier_default_tenant():
     verifier = Auth0JWTVerifier()
     assert verifier.jwks_uri == "https://auth.oceanum.io/.well-known/jwks.json"
     assert verifier.issuer == "https://auth.oceanum.io/"
-    assert verifier.audience == "https://api.oceanum.io"
+    assert verifier.audience == "https://mcp.oceanum.io/datamesh"
 
 
 def test_build_auth_provider_modes():

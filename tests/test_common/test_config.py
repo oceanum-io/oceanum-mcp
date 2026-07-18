@@ -52,7 +52,7 @@ def test_auth_mode_default_and_validation():
 def test_auth0_defaults():
     with patch.dict(os.environ, {}, clear=True):
         assert auth0_domain() == "auth.oceanum.io"
-        assert auth0_audience() == "https://api.oceanum.io"
+        assert auth0_audience() == "https://mcp.oceanum.io/datamesh"
 
 
 def test_public_url():
