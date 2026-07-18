@@ -134,6 +134,19 @@ async def test_export_query_disabled_in_http_mode(http_transport_datamesh):
     assert "query_data" in tools, "only the local-filesystem tool is disabled"
 
 
+async def test_no_hosted_tool_advertises_export_query(http_transport_datamesh):
+    # No enabled tool's DESCRIPTION may name export_query on a hosted server —
+    # the tool is disabled, so advertising it in a docstring would steer the
+    # model at a tool it cannot call.
+    async with Client(http_transport_datamesh.mcp) as client:
+        offenders = [
+            t.name
+            for t in await client.list_tools()
+            if "export_query" in (t.description or "")
+        ]
+    assert not offenders, f"hosted tool descriptions name export_query: {offenders}"
+
+
 async def test_export_query_enabled_in_stdio_mode():
     async with Client(datamesh_server.mcp) as client:
         tools = {t.name for t in await client.list_tools()}

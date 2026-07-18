@@ -750,7 +750,7 @@ def load_datasource(datasource_id: str) -> str:
 
     Gridded datasources are opened lazily (no data download). Tabular
     datasources are downloaded only if under the inline size limit; use
-    query_data with filters or export_query otherwise.
+    query_data with filters to retrieve larger ones.
 
     Args:
         datasource_id: The datasource to load.
