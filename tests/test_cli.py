@@ -50,3 +50,4 @@ def test_cli_help_lists_transports():
     assert "http" in result.stdout
     assert "--host" in result.stdout
     assert "--port" in result.stdout
+    assert "--stateless" in result.stdout

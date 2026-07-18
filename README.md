@@ -156,6 +156,9 @@ Notes:
   filesystem, which is meaningless for remote clients. Use `query_data` with
   filters, or Oceanum Storage.
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
+- Pass `--stateless` when running behind a load balancer or on autoscaled
+  platforms (Cloud Run, etc.): sessions are otherwise held in instance
+  memory, and consecutive requests routed to different instances would fail.
 
 ## Datamesh Tools
 

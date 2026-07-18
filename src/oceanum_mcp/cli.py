@@ -48,6 +48,16 @@ def main():
         default=8000,
         help="Bind port for http/sse transports (default: 8000).",
     )
+    parser.add_argument(
+        "--stateless",
+        action="store_true",
+        help=(
+            "Run the http transport without server-side sessions, so any "
+            "instance can serve any request. Required behind load balancers "
+            "and autoscaled platforms (e.g. Cloud Run) where consecutive "
+            "requests may hit different instances."
+        ),
+    )
 
     args = parser.parse_args()
 
@@ -81,6 +91,9 @@ def main():
             )
         else:
             mcp_server.auth = provider
-        mcp_server.run(transport=args.transport, host=args.host, port=args.port)
+        run_kwargs = {"host": args.host, "port": args.port}
+        if args.stateless:
+            run_kwargs["stateless_http"] = True
+        mcp_server.run(transport=args.transport, **run_kwargs)
     else:
         mcp_server.run(transport=args.transport)
