@@ -5,43 +5,62 @@ from unittest.mock import patch
 
 import pytest
 
-from oceanum_mcp.common.config import load_config, OceanumConfig
+from oceanum_mcp.common.config import (
+    auth0_audience,
+    auth0_domain,
+    auth_mode,
+    datamesh_service,
+    is_network_transport,
+    set_transport,
+    storage_service,
+)
 
 
-def test_load_config_with_token():
-    """Test config loads correctly with DATAMESH_TOKEN set."""
-    with patch.dict(os.environ, {"DATAMESH_TOKEN": "test-token"}, clear=False):
-        config = load_config()
-        assert isinstance(config, OceanumConfig)
-        assert config.token == "test-token"
-        assert "datamesh" in config.datamesh_service
-        assert "storage" in config.storage_service
-
-
-def test_load_config_missing_token():
-    """Test config raises ValueError when DATAMESH_TOKEN is missing."""
+def test_default_service_urls():
     with patch.dict(os.environ, {}, clear=True):
-        with pytest.raises(ValueError, match="DATAMESH_TOKEN"):
-            load_config()
+        assert datamesh_service() == "https://datamesh.oceanum.io"
+        assert storage_service() == "https://storage.oceanum.io"
 
 
-def test_load_config_custom_domain():
-    """Test config respects OCEANUM_DOMAIN override."""
-    env = {"DATAMESH_TOKEN": "test-token", "OCEANUM_DOMAIN": "staging.oceanum.io"}
-    with patch.dict(os.environ, env, clear=True):
-        config = load_config()
-        assert config.datamesh_service == "https://datamesh.staging.oceanum.io"
-        assert config.storage_service == "https://storage.staging.oceanum.io"
+def test_custom_domain():
+    with patch.dict(os.environ, {"OCEANUM_DOMAIN": "staging.oceanum.io"}, clear=True):
+        assert datamesh_service() == "https://datamesh.staging.oceanum.io"
+        assert storage_service() == "https://storage.staging.oceanum.io"
 
 
-def test_load_config_custom_service_urls():
-    """Test config respects explicit service URL overrides."""
+def test_custom_service_urls():
     env = {
-        "DATAMESH_TOKEN": "test-token",
         "DATAMESH_SERVICE": "https://custom-datamesh.example.com",
         "STORAGE_SERVICE": "https://custom-storage.example.com",
     }
     with patch.dict(os.environ, env, clear=True):
-        config = load_config()
-        assert config.datamesh_service == "https://custom-datamesh.example.com"
-        assert config.storage_service == "https://custom-storage.example.com"
+        assert datamesh_service() == "https://custom-datamesh.example.com"
+        assert storage_service() == "https://custom-storage.example.com"
+
+
+def test_auth_mode_default_and_validation():
+    with patch.dict(os.environ, {}, clear=True):
+        assert auth_mode() == "datamesh"
+    with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "AUTH0"}, clear=True):
+        assert auth_mode() == "auth0"
+    with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "bogus"}, clear=True):
+        with pytest.raises(ValueError, match="OCEANUM_MCP_AUTH"):
+            auth_mode()
+
+
+def test_auth0_defaults():
+    with patch.dict(os.environ, {}, clear=True):
+        assert auth0_domain() == "auth.oceanum.io"
+        assert auth0_audience() == "https://api.oceanum.io"
+
+
+def test_transport_flag():
+    assert not is_network_transport()
+    try:
+        set_transport("http")
+        assert is_network_transport()
+        set_transport("sse")
+        assert is_network_transport()
+    finally:
+        set_transport("stdio")
+    assert not is_network_transport()

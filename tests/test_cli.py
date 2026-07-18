@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from pathlib import Path
 
 
 def test_cli_list():
@@ -36,3 +37,19 @@ def test_server_registry_keys():
     assert "datamesh" in SERVER_REGISTRY
     assert "storage" in SERVER_REGISTRY
     assert "combined" in SERVER_REGISTRY
+
+
+def test_cli_help_lists_transports():
+    """The http transport and its bind options are exposed."""
+    result = subprocess.run(
+        [sys.executable, "-m", "oceanum_mcp", "--help"],
+        capture_output=True,
+        text=True,
+        cwd=Path(__file__).resolve().parent.parent / "src",
+    )
+    assert result.returncode == 0
+    assert "http" in result.stdout
+    assert "--host" in result.stdout
+    assert "--port" in result.stdout
+    assert "--stateless" in result.stdout
+    assert "--path" in result.stdout

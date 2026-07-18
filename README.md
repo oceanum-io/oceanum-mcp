@@ -113,6 +113,73 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_READ_ONLY`       | No       | Set to `1`/`true` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`) |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |
+| `OCEANUM_MCP_AUTH`            | No       | Auth scheme for `--transport http`: `datamesh` (default), `auth0`, or `none`    |
+| `OCEANUM_MCP_AUTH0_DOMAIN`    | No       | Auth0 tenant domain for `auth0` mode (default: `auth.oceanum.io`)               |
+| `OCEANUM_MCP_AUTH0_AUDIENCE`  | No       | Auth0 API audience for `auth0` mode (default: `https://api.oceanum.io`)         |
+
+`DATAMESH_TOKEN` is required for the stdio transport (and for `--transport http`
+with `OCEANUM_MCP_AUTH=none`); in authenticated http mode each request carries
+its own credential and no server-side token is needed.
+
+## Hosted mode (HTTP transport)
+
+Run any server as a shared, multi-tenant HTTP service:
+
+```bash
+oceanum-mcp datamesh --transport http --host 0.0.0.0 --port 8000
+```
+
+This serves the MCP streamable-HTTP endpoint at `http://<host>:<port>/<server>`
+(`/datamesh` here; override with `--path`). Each server owning its own path
+lets several MCP servers share one domain behind an ingress — e.g.
+`https://mcp.oceanum.io/datamesh` and `https://mcp.oceanum.io/storage`.
+Every request must present a bearer credential, and all Datamesh/Storage calls
+are made **as that request's user** — connections are cached per credential and
+never shared between tokens.
+
+Auth schemes (`OCEANUM_MCP_AUTH`):
+
+- `datamesh` (default) — clients send their Datamesh token as the bearer:
+  `Authorization: Bearer <datamesh-token>`. The server validates it against
+  the gateway. Add to Claude Code with:
+
+  ```bash
+  claude mcp add --transport http oceanum-datamesh https://mcp.oceanum.io/datamesh \
+    --header "Authorization: Bearer <datamesh-token>"
+  ```
+
+- `auth0` — clients send an Auth0-issued JWT, validated against the tenant
+  JWKS and forwarded to the Datamesh gateway as-is.
+- `none` — no authentication; every request uses the server's own
+  `DATAMESH_TOKEN`. Only for trusted-network deployments.
+
+Notes:
+
+- `export_query` is disabled over HTTP — it writes to the server's local
+  filesystem, which is meaningless for remote clients. Use `query_data` with
+  filters, or Oceanum Storage.
+- Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
+- Pass `--stateless` when running behind a load balancer or on autoscaled
+  platforms (Cloud Run, etc.): sessions are otherwise held in instance
+  memory, and consecutive requests routed to different instances would fail.
+- **Breaking change for `--transport sse`** (deprecated): sse is a network
+  transport and now behaves like http — authenticated by default and no
+  `export_query`. Set `OCEANUM_MCP_AUTH=none` to restore the old
+  unauthenticated behavior.
+
+### Serving under an external ASGI server
+
+To run under uvicorn/gunicorn (multiple workers, serverless platforms), use
+the packaged app factory — it applies the same auth and tool policy as the
+CLI; serving `mcp.http_app()` directly would bypass both:
+
+```bash
+uvicorn --factory oceanum_mcp.app:create_http_app --host 0.0.0.0 --port 8000
+```
+
+Requests on a network transport never fall back to the server's
+`DATAMESH_TOKEN`: an unauthenticated request fails unless
+`OCEANUM_MCP_AUTH=none` was set explicitly.
 
 ## Datamesh Tools
 
