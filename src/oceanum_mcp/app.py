@@ -18,7 +18,7 @@ from typing import Any
 from starlette.applications import Starlette
 
 from oceanum_mcp.cli import SERVER_REGISTRY
-from oceanum_mcp.common.auth import build_auth_provider
+from oceanum_mcp.common.auth import DatameshHeaderMiddleware, build_auth_provider
 from oceanum_mcp.common.config import set_transport
 
 
@@ -54,6 +54,11 @@ def create_http_app(
     provider = build_auth_provider()
     if provider is not None:
         mcp.auth = provider
-    return mcp.http_app(
+    app = mcp.http_app(
         stateless_http=stateless, path=path or f"/{server}", **http_app_kwargs
     )
+    # add_middleware inserts OUTERMOST — required: fastmcp places middleware
+    # passed to http_app() inside its auth middleware, where the header
+    # promotion would run only after authentication already failed.
+    app.add_middleware(DatameshHeaderMiddleware)
+    return app

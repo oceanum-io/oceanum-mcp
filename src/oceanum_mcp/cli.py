@@ -89,24 +89,41 @@ def main():
     mcp_server = module.mcp
 
     if args.transport in ("http", "sse"):
-        from oceanum_mcp.common.auth import build_auth_provider
+        from oceanum_mcp.common.config import auth_mode
 
-        provider = build_auth_provider()
-        if provider is None:
+        if auth_mode() == "none":
             print(
                 "WARNING: OCEANUM_MCP_AUTH=none — the server is UNAUTHENTICATED "
                 "and every request uses the server's DATAMESH_TOKEN.",
                 file=sys.stderr,
             )
-        else:
+
+    if args.transport == "http":
+        # One app-construction path for hosted mode: the factory owns auth
+        # attachment, tool policy, and the X-DATAMESH-TOKEN header promotion.
+        import uvicorn
+
+        from oceanum_mcp.app import create_http_app
+
+        app = create_http_app(
+            args.server,
+            stateless=args.stateless,
+            path=args.path or f"/{args.server}",
+        )
+        uvicorn.run(app, host=args.host, port=args.port)
+    elif args.transport == "sse":
+        # Deprecated legacy transport: bearer auth only (no X-DATAMESH-TOKEN
+        # header support).
+        from oceanum_mcp.common.auth import build_auth_provider
+
+        provider = build_auth_provider()
+        if provider is not None:
             mcp_server.auth = provider
-        run_kwargs = {
-            "host": args.host,
-            "port": args.port,
-            "path": args.path or f"/{args.server}",
-        }
-        if args.stateless:
-            run_kwargs["stateless_http"] = True
-        mcp_server.run(transport=args.transport, **run_kwargs)
+        mcp_server.run(
+            transport="sse",
+            host=args.host,
+            port=args.port,
+            path=args.path or f"/{args.server}",
+        )
     else:
         mcp_server.run(transport=args.transport)

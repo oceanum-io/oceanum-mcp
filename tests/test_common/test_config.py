@@ -40,7 +40,7 @@ def test_custom_service_urls():
 
 def test_auth_mode_default_and_validation():
     with patch.dict(os.environ, {}, clear=True):
-        assert auth_mode() == "datamesh"
+        assert auth_mode() == "auto"
     with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "AUTH0"}, clear=True):
         assert auth_mode() == "auth0"
     with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "bogus"}, clear=True):

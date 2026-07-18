@@ -113,7 +113,7 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_READ_ONLY`       | No       | Set to `1`/`true` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`) |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |
-| `OCEANUM_MCP_AUTH`            | No       | Auth scheme for `--transport http`: `datamesh` (default), `auth0`, or `none`    |
+| `OCEANUM_MCP_AUTH`            | No       | Auth scheme for `--transport http`: `auto` (default), `datamesh`, `auth0`, or `none` |
 | `OCEANUM_MCP_AUTH0_DOMAIN`    | No       | Auth0 tenant domain for `auth0` mode (default: `auth.oceanum.io`)               |
 | `OCEANUM_MCP_AUTH0_AUDIENCE`  | No       | Auth0 API audience for `auth0` mode (default: `https://api.oceanum.io`)         |
 
@@ -139,13 +139,18 @@ never shared between tokens.
 
 Auth schemes (`OCEANUM_MCP_AUTH`):
 
-- `datamesh` (default) — clients send their Datamesh token as the bearer:
-  `Authorization: Bearer <datamesh-token>`. The server validates it against
-  the gateway. Add to Claude Code with:
+- `auto` (default) — accepts **either** credential, detected per request:
+  Datamesh tokens arrive in the `X-DATAMESH-TOKEN` header (the same header
+  the gateway itself uses), Auth0 JWTs in `Authorization: Bearer`. A Datamesh
+  token sent as the bearer also works (JWT-shape detection routes it), but
+  the dedicated header is the canonical form. Each request runs as the
+  identity its own credential resolves to.
+- `datamesh` — only Datamesh tokens are accepted. The server validates them
+  against the gateway. Add to Claude Code with:
 
   ```bash
   claude mcp add --transport http oceanum-datamesh https://mcp.oceanum.io/datamesh \
-    --header "Authorization: Bearer <datamesh-token>"
+    --header "X-DATAMESH-TOKEN: <datamesh-token>"
   ```
 
 - `auth0` — clients send an Auth0-issued JWT, validated against the tenant
