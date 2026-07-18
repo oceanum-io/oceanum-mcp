@@ -2,6 +2,7 @@
 
 import subprocess
 import sys
+from pathlib import Path
 
 
 def test_cli_list():
@@ -44,7 +45,7 @@ def test_cli_help_lists_transports():
         [sys.executable, "-m", "oceanum_mcp", "--help"],
         capture_output=True,
         text=True,
-        cwd="src",
+        cwd=Path(__file__).resolve().parent.parent / "src",
     )
     assert result.returncode == 0
     assert "http" in result.stdout

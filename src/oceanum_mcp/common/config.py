@@ -1,7 +1,6 @@
 """Shared configuration for Oceanum MCP servers."""
 
 import os
-from dataclasses import dataclass
 from pathlib import Path
 
 # Default ceiling on bytes downloaded into the server process for inline
@@ -21,7 +20,7 @@ def set_transport(transport: str) -> None:
     _transport = transport
 
 
-def is_http_transport() -> bool:
+def is_network_transport() -> bool:
     """Whether the server runs over a network transport (http/sse).
 
     Network transports imply a shared, multi-tenant server: credentials come
@@ -106,25 +105,3 @@ def auth0_domain() -> str:
 
 def auth0_audience() -> str:
     return os.environ.get("OCEANUM_MCP_AUTH0_AUDIENCE", "https://api.oceanum.io")
-
-
-@dataclass
-class OceanumConfig:
-    token: str
-    datamesh_service: str
-    storage_service: str
-
-
-def load_config() -> OceanumConfig:
-    """Load Oceanum config from environment variables."""
-    token = os.environ.get("DATAMESH_TOKEN")
-    if not token:
-        raise ValueError(
-            "DATAMESH_TOKEN environment variable is required. "
-            "Get a token from https://oceanum.io"
-        )
-    return OceanumConfig(
-        token=token,
-        datamesh_service=datamesh_service(),
-        storage_service=storage_service(),
-    )

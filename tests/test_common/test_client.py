@@ -60,6 +60,38 @@ def test_resolve_credential_missing_raises():
                 resolve_credential()
 
 
+def test_resolve_credential_rejects_missing_claim():
+    """An authenticated request whose provider set no credential claim fails
+    loudly instead of degrading to the raw bearer."""
+    access = AccessToken(token="raw-jwt", client_id="c", scopes=[], claims={})
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=access):
+        with pytest.raises(ValueError, match=CREDENTIAL_CLAIM):
+            resolve_credential()
+
+
+def test_resolve_credential_refuses_env_fallback_on_network_request():
+    """An unauthenticated network request must not run as the server's own
+    identity, even with DATAMESH_TOKEN set (bypassed-auth launch paths)."""
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=None):
+        with patch(
+            "fastmcp.server.dependencies.get_http_request", return_value=object()
+        ):
+            with patch.dict(os.environ, {"DATAMESH_TOKEN": "env-token"}, clear=False):
+                with pytest.raises(ValueError, match="[Uu]nauthenticated"):
+                    resolve_credential()
+
+
+def test_resolve_credential_env_fallback_allowed_with_auth_none():
+    """OCEANUM_MCP_AUTH=none is the explicit opt-in for env-token serving."""
+    env = {"DATAMESH_TOKEN": "env-token", "OCEANUM_MCP_AUTH": "none"}
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=None):
+        with patch(
+            "fastmcp.server.dependencies.get_http_request", return_value=object()
+        ):
+            with patch.dict(os.environ, env, clear=False):
+                assert resolve_credential() == "env-token"
+
+
 def test_multi_tenant_connector_isolation():
     """Different request credentials must never share a Connector."""
     connector_cls = MagicMock(side_effect=lambda **kw: MagicMock(name=kw["token"]))

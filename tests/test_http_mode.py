@@ -16,7 +16,7 @@ from fastmcp import Client, FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
 import oceanum_mcp.servers.datamesh.server as datamesh_server
-from oceanum_mcp.common.client import resolve_credential
+from oceanum_mcp.common.client import CREDENTIAL_CLAIM, resolve_credential
 from oceanum_mcp.common.config import set_transport
 
 INIT = {
@@ -49,8 +49,13 @@ async def http_client():
     anyio cancel scope, which must enter and exit in the same task —
     pytest-asyncio runs async fixtures and tests in different tasks.
     """
+    # StaticTokenVerifier exposes each token's config dict as the AccessToken
+    # claims, so the credential claim is set the same way a real verifier does.
     verifier = StaticTokenVerifier(
-        tokens={"tok-a": {"client_id": "a"}, "tok-b": {"client_id": "b"}}
+        tokens={
+            "tok-a": {"client_id": "a", CREDENTIAL_CLAIM: "tok-a"},
+            "tok-b": {"client_id": "b", CREDENTIAL_CLAIM: "tok-b"},
+        }
     )
     mcp = FastMCP("test-http", auth=verifier)
 
@@ -128,3 +133,31 @@ async def test_export_query_enabled_in_stdio_mode():
     async with Client(datamesh_server.mcp) as client:
         tools = {t.name for t in await client.list_tools()}
     assert "export_query" in tools
+
+
+@pytest.fixture
+def restore_datamesh_policy():
+    """Undo create_http_app's mutations of the shared datamesh server."""
+    yield
+    set_transport("stdio")
+    datamesh_server.mcp.enable(names={"export_query"})
+
+
+async def test_create_http_app_applies_tool_policy(restore_datamesh_policy):
+    """The ASGI factory disables export_query even when the server module was
+    already imported (in stdio mode) before the factory ran."""
+    from oceanum_mcp.app import create_http_app
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("OCEANUM_MCP_AUTH", "none")
+        create_http_app("datamesh")
+    async with Client(datamesh_server.mcp) as client:
+        tools = {t.name for t in await client.list_tools()}
+    assert "export_query" not in tools
+
+
+def test_create_http_app_rejects_unknown_server():
+    from oceanum_mcp.app import create_http_app
+
+    with pytest.raises(ValueError, match="Unknown server"):
+        create_http_app("nonexistent")

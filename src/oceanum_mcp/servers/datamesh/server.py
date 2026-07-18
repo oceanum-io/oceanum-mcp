@@ -34,7 +34,7 @@ from oceanum.datamesh.session import Session
 from oceanum_mcp.common.client import get_datamesh_connector
 from oceanum_mcp.common.config import (
     export_dir,
-    is_http_transport,
+    is_network_transport,
     is_read_only,
     max_inline_bytes,
 )
@@ -853,7 +853,7 @@ if is_read_only():
     # and keeps the tool registered (re-enable is possible at runtime).
     mcp.disable(names={"update_metadata"})
 
-if is_http_transport():
+if is_network_transport():
     # A hosted server has no meaningful local filesystem for clients:
     # export_query writes to the server's disk, not the caller's.
     mcp.disable(names={"export_query"})

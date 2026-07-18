@@ -1,6 +1,7 @@
 """Tests for the network-transport auth providers."""
 
 import os
+from typing import Any
 from unittest.mock import AsyncMock, patch
 
 import httpx
@@ -21,57 +22,65 @@ class _FakeAsyncClient:
     """Stands in for httpx.AsyncClient; records calls, returns a canned response."""
 
     calls = 0
-    response: httpx.Response | None = None
+    status = 200
+    payload: Any = None
     error: Exception | None = None
 
-    def __init__(self, **kwargs):
+    def __init__(self, **kwargs: Any) -> None:
         pass
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, *exc):
-        return False
-
-    async def get(self, url, headers=None):
-        type(self).calls += 1
-        if type(self).error is not None:
-            raise type(self).error
-        return type(self).response
+    async def get(self, url: str, headers: dict | None = None) -> httpx.Response:
+        cls = type(self)
+        cls.calls += 1
+        if cls.error is not None:
+            raise cls.error
+        return httpx.Response(
+            cls.status, json=cls.payload, request=httpx.Request("GET", url)
+        )
 
 
 @pytest.fixture
 def fake_gateway():
     _FakeAsyncClient.calls = 0
-    _FakeAsyncClient.response = None
+    _FakeAsyncClient.status = 200
+    _FakeAsyncClient.payload = None
     _FakeAsyncClient.error = None
     with patch("oceanum_mcp.common.auth.httpx.AsyncClient", _FakeAsyncClient):
         yield _FakeAsyncClient
 
 
 async def test_datamesh_verifier_valid_token(fake_gateway):
-    fake_gateway.response = httpx.Response(
-        200, json=[{"username": "alice", "is_active": True}]
-    )
+    fake_gateway.payload = [{"username": "alice", "is_active": True}]
     verifier = DatameshTokenVerifier(service="https://datamesh.test")
     result = await verifier.verify_token("good-token")
     assert result is not None
     assert result.claims[CREDENTIAL_CLAIM] == "good-token"
     assert result.subject == "alice"
+    assert result.expires_at is not None, "revocation window must be bounded"
 
 
 async def test_datamesh_verifier_invalid_token(fake_gateway):
-    fake_gateway.response = httpx.Response(401, json={"detail": "Invalid token."})
+    fake_gateway.status = 401
+    fake_gateway.payload = {"detail": "Invalid token."}
     verifier = DatameshTokenVerifier(service="https://datamesh.test")
     assert await verifier.verify_token("bad-token") is None
 
 
 async def test_datamesh_verifier_caches_results(fake_gateway):
-    fake_gateway.response = httpx.Response(200, json=[{"username": "alice"}])
+    fake_gateway.payload = [{"username": "alice"}]
     verifier = DatameshTokenVerifier(service="https://datamesh.test")
     await verifier.verify_token("good-token")
     await verifier.verify_token("good-token")
     assert fake_gateway.calls == 1, "second verification must be served from cache"
+
+
+async def test_datamesh_verifier_caches_confirmed_rejections(fake_gateway):
+    fake_gateway.status = 401
+    fake_gateway.payload = {"detail": "Invalid token."}
+    verifier = DatameshTokenVerifier(service="https://datamesh.test")
+    assert await verifier.verify_token("bad-token") is None
+    assert await verifier.verify_token("bad-token") is None
+    assert fake_gateway.calls == 1, "confirmed rejection must be served from cache"
 
 
 async def test_datamesh_verifier_gateway_error_fails_closed_uncached(fake_gateway):
@@ -79,9 +88,24 @@ async def test_datamesh_verifier_gateway_error_fails_closed_uncached(fake_gatewa
     verifier = DatameshTokenVerifier(service="https://datamesh.test")
     assert await verifier.verify_token("good-token") is None
     fake_gateway.error = None
-    fake_gateway.response = httpx.Response(200, json=[{"username": "alice"}])
+    fake_gateway.payload = [{"username": "alice"}]
     result = await verifier.verify_token("good-token")
     assert result is not None, "gateway outages must not be cached as invalid"
+
+
+@pytest.mark.parametrize("status", [429, 500, 502, 503, 301])
+async def test_datamesh_verifier_non_auth_status_fails_closed_uncached(
+    fake_gateway, status
+):
+    """Only 401/403 mean 'invalid token'; anything else is an outage and must
+    not lock a valid token out past the blip itself."""
+    fake_gateway.status = status
+    verifier = DatameshTokenVerifier(service="https://datamesh.test")
+    assert await verifier.verify_token("good-token") is None
+    fake_gateway.status = 200
+    fake_gateway.payload = [{"username": "alice"}]
+    result = await verifier.verify_token("good-token")
+    assert result is not None, f"status {status} must not be cached as invalid"
 
 
 async def test_auth0_verifier_forwards_bearer_credential():

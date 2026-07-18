@@ -159,6 +159,24 @@ Notes:
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance
   memory, and consecutive requests routed to different instances would fail.
+- **Breaking change for `--transport sse`** (deprecated): sse is a network
+  transport and now behaves like http — authenticated by default and no
+  `export_query`. Set `OCEANUM_MCP_AUTH=none` to restore the old
+  unauthenticated behavior.
+
+### Serving under an external ASGI server
+
+To run under uvicorn/gunicorn (multiple workers, serverless platforms), use
+the packaged app factory — it applies the same auth and tool policy as the
+CLI; serving `mcp.http_app()` directly would bypass both:
+
+```bash
+uvicorn --factory oceanum_mcp.app:create_http_app --host 0.0.0.0 --port 8000
+```
+
+Requests on a network transport never fall back to the server's
+`DATAMESH_TOKEN`: an unauthenticated request fails unless
+`OCEANUM_MCP_AUTH=none` was set explicitly.
 
 ## Datamesh Tools
 
