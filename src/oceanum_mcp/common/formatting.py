@@ -23,18 +23,26 @@ def to_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, default=str)
 
 
-def _narrow_hint() -> str:
-    """How to get more than the inline preview, appropriate to the transport.
+def export_clause() -> str:
+    """Trailing clause pointing at export_query, only where it is available.
 
     export_query writes to the server's local disk and is disabled on network
-    transports, so a hosted deployment must not point the model at it.
+    transports, so a hosted deployment must never name it. This is the single
+    source of truth for that fact; all result-size guidance (here and in the
+    datamesh server's messages) derives its export wording from this function,
+    evaluated at call time so it always matches the running transport.
     """
-    base = (
-        "Narrow the query with filters, aggregation, or time_resolution " "downsampling"
-    )
     if is_network_transport():
-        return base + "."
-    return base + ", or use export_query to write the full result to a file."
+        return ""
+    return ", or use export_query to write the full result to a file"
+
+
+def _narrow_hint() -> str:
+    """How to get more than the inline preview, appropriate to the transport."""
+    return (
+        "Narrow the query with filters, aggregation, or time_resolution "
+        "downsampling" + export_clause() + "."
+    )
 
 
 def human_bytes(n: int | float) -> str:
@@ -115,9 +123,10 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
     }
     if lazy:
         out["note"] = (
-            "Dataset is lazily loaded (values not downloaded). Use query_data "
-            "with narrower filters or aggregation to see values inline. "
-        ) + _narrow_hint()
+            "Dataset is lazily loaded (values not downloaded). Narrow the query "
+            "with filters, aggregation, or time_resolution downsampling to see "
+            "values inline" + export_clause() + "."
+        )
     elif max_rows > 0:
         # Eager data is already in memory — always include a preview of
         # coordinate-attributed values.

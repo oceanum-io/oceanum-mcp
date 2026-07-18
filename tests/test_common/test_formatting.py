@@ -84,6 +84,9 @@ def test_structure_only_mode_has_no_truncation_flags():
     out = summarize_data(pd.DataFrame({"x": range(200)}), max_rows=0)
     assert "data" not in out
     assert "truncated" not in out
+    # A completed export must never look partial: no truncation note, full count.
+    assert "note" not in out
+    assert out["rows"] == 200
 
 
 def test_default_inline_cap_is_configurable():

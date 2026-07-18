@@ -277,6 +277,22 @@ class TestQueryData:
         assert "export_query" in parsed["message"]
         mock_conn.query.assert_not_called()
 
+    def test_refusal_omits_export_query_on_network_transport(
+        self, mock_conn, mock_stage
+    ):
+        # The server's runtime "too large" message must not name export_query
+        # on a hosted transport, where that tool is disabled.
+        from oceanum_mcp.common.config import set_transport
+
+        mock_stage.return_value = make_stage(Container.DataFrame, size=10**9)
+        try:
+            set_transport("http")
+            parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        finally:
+            set_transport("stdio")
+        assert parsed["refused"] is True
+        assert "export_query" not in parsed["message"]
+
     def test_large_dataset_goes_lazy(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(Container.Dataset, size=10**9)
         mock_conn.query.return_value = _small_dataset().chunk({"time": 1})

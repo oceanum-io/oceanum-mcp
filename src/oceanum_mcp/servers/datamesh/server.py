@@ -39,6 +39,7 @@ from oceanum_mcp.common.config import (
     max_inline_bytes,
 )
 from oceanum_mcp.common.formatting import (
+    export_clause,
     format_datasource,
     human_bytes,
     summarize_data,
@@ -57,30 +58,19 @@ MAX_EXPORT_FRAME_BYTES = 2_000_000_000
 
 READ_TOOL = {"readOnlyHint": True, "openWorldHint": True}
 
-# export_query writes to the server's local disk, so it is only available on
-# stdio; the hosted (network) workflow ends at a narrowed query_data instead.
-# is_network_transport() is valid here because the CLI/app factory records the
-# transport before this module is imported.
-_LARGE_RESULT_STEP = (
-    "narrow the query with filters, aggregation, or time_resolution downsampling"
-    if is_network_transport()
-    else "export_query to write large results to a file for code to consume"
-)
-
-# Trailing clause for "result too large" messages: on stdio point at
-# export_query; on a hosted server that tool is disabled, so stop at the query.
-_EXPORT_HINT = (
-    "" if is_network_transport() else ", or use export_query to write it to a file"
-)
-
+# Instructions are transport-neutral: they describe the stage -> narrow
+# workflow without naming export_query, which is disabled on network
+# transports. The runtime "result too large" messages (via export_clause())
+# and the export_query tool's own docstring carry the export path where it is
+# available, so nothing here freezes a transport-specific string at import.
 mcp = FastMCP(
     "Oceanum Datamesh",
     instructions=(
         "Access the Oceanum Datamesh platform for ocean and environmental data.\n"
         "Workflow: search_catalog to discover datasets -> get_datasource_info for "
         "schema and coverage -> stage_query to learn the result size WITHOUT "
-        "downloading -> query_data for small results inline, or "
-        f"{_LARGE_RESULT_STEP}.\n"
+        "downloading -> query_data for small results inline, narrowing large "
+        "results with filters, aggregation, or time_resolution downsampling.\n"
         "Never pull large data inline: stage first, then shrink results with "
         "time/geo/level filters, aggregation, or time_resolution downsampling. "
         "Times are ISO 8601 (UTC assumed if naive); sizes are bytes."
@@ -462,7 +452,7 @@ def stage_query(
         )
         out["recommendation"] = (
             f"Larger than the inline limit ({human_bytes(inline_limit)}): "
-            f"{detail}{_EXPORT_HINT}."
+            f"{detail}{export_clause()}."
         )
     if (
         stage.container in (Container.DataFrame, Container.GeoDataFrame)
@@ -552,7 +542,7 @@ def query_data(
                     stage,
                     f"Result is {human_bytes(stage.size)}, above the inline "
                     f"limit of {human_bytes(inline_limit)}. Narrow the query "
-                    f"with filters or aggregation{_EXPORT_HINT}.",
+                    f"with filters or aggregation{export_clause()}.",
                     query=_query_echo(query),
                 )
         with _captured_warnings(warnings):
@@ -794,7 +784,7 @@ def load_datasource(datasource_id: str) -> str:
                 stage,
                 f"Datasource is {human_bytes(stage.size)}, above the inline "
                 f"limit of {human_bytes(inline_limit)}. Use query_data with "
-                f"filters{_EXPORT_HINT}.",
+                f"filters{export_clause()}.",
                 datasource_id=datasource_id,
             )
         with _captured_warnings(warnings):

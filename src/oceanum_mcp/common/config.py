@@ -68,17 +68,22 @@ def max_inline_bytes() -> int:
 def max_inline_rows() -> int:
     """Row/record count previewed inline before truncation.
 
-    Fails fast on an unparsable value, like max_inline_bytes.
+    Must be a positive integer: max_rows <= 0 is the internal structure-only
+    signal (used after exports), so a 0 or negative env value would silently
+    suppress every preview. Fails fast rather than misbehave quietly.
     """
     raw = os.environ.get("OCEANUM_MCP_MAX_INLINE_ROWS")
     if not raw:
         return DEFAULT_MAX_INLINE_ROWS
     try:
-        return int(raw)
+        rows = int(raw)
     except ValueError as exc:
         raise ValueError(
-            f"OCEANUM_MCP_MAX_INLINE_ROWS must be an integer row count, " f"got {raw!r}"
+            f"OCEANUM_MCP_MAX_INLINE_ROWS must be an integer row count, got {raw!r}"
         ) from exc
+    if rows < 1:
+        raise ValueError(f"OCEANUM_MCP_MAX_INLINE_ROWS must be at least 1, got {rows}")
+    return rows
 
 
 def export_dir() -> Path | None:
@@ -129,9 +134,7 @@ def auth0_domain() -> str:
 
 
 def auth0_audience() -> str:
-    return os.environ.get(
-        "OCEANUM_MCP_AUTH0_AUDIENCE", "https://mcp.oceanum.io/datamesh"
-    )
+    return os.environ.get("OCEANUM_MCP_AUTH0_AUDIENCE", "https://api.oceanum.io")
 
 
 def public_url() -> str | None:
