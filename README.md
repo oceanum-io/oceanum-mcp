@@ -116,6 +116,7 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_AUTH`            | No       | Auth scheme for `--transport http`: `auto` (default), `datamesh`, `auth0`, or `none` |
 | `OCEANUM_MCP_AUTH0_DOMAIN`    | No       | Auth0 tenant domain for `auth0` mode (default: `auth.oceanum.io`)               |
 | `OCEANUM_MCP_AUTH0_AUDIENCE`  | No       | Auth0 API audience for `auth0` mode (default: `https://api.oceanum.io`)         |
+| `OCEANUM_MCP_PUBLIC_URL`      | No       | Externally visible base URL (e.g. `https://mcp.oceanum.io`); enables OAuth discovery metadata for claude.ai connectors |
 
 `DATAMESH_TOKEN` is required for the stdio transport (and for `--transport http`
 with `OCEANUM_MCP_AUTH=none`); in authenticated http mode each request carries
@@ -185,6 +186,16 @@ uvicorn --factory oceanum_mcp.app:create_http_app --host 0.0.0.0 --port 8000
 Requests on a network transport never fall back to the server's
 `DATAMESH_TOKEN`: an unauthenticated request fails unless
 `OCEANUM_MCP_AUTH=none` was set explicitly.
+
+### claude.ai custom connectors
+
+Set `OCEANUM_MCP_PUBLIC_URL` to the server's public base URL and the `auto`
+and `auth0` modes additionally serve OAuth 2.0 Protected Resource Metadata
+(RFC 9728) naming the Auth0 tenant, plus a `WWW-Authenticate` challenge on
+401s — which is how claude.ai discovers where to send users to authorize.
+The Auth0 tenant must allow client registration for Claude (Dynamic Client
+Registration, or a pre-registered application) and issue JWT access tokens
+for the configured audience. Header/bearer clients are unaffected either way.
 
 ## Datamesh Tools
 

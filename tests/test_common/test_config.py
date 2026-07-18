@@ -11,6 +11,7 @@ from oceanum_mcp.common.config import (
     auth_mode,
     datamesh_service,
     is_network_transport,
+    public_url,
     set_transport,
     storage_service,
 )
@@ -52,6 +53,15 @@ def test_auth0_defaults():
     with patch.dict(os.environ, {}, clear=True):
         assert auth0_domain() == "auth.oceanum.io"
         assert auth0_audience() == "https://api.oceanum.io"
+
+
+def test_public_url():
+    with patch.dict(os.environ, {}, clear=True):
+        assert public_url() is None
+    with patch.dict(
+        os.environ, {"OCEANUM_MCP_PUBLIC_URL": "https://mcp.oceanum.io/"}, clear=True
+    ):
+        assert public_url() == "https://mcp.oceanum.io"
 
 
 def test_transport_flag():

@@ -10,7 +10,7 @@ import pytest
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 
-from fastmcp.server.auth import MultiAuth
+from fastmcp.server.auth import MultiAuth, RemoteAuthProvider
 
 from oceanum_mcp.common.auth import (
     Auth0JWTVerifier,
@@ -146,6 +146,18 @@ def test_build_auth_provider_modes():
     with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "bogus"}, clear=False):
         with pytest.raises(ValueError, match="OCEANUM_MCP_AUTH"):
             build_auth_provider()
+
+
+def test_build_auth_provider_discovery_with_public_url():
+    """A public URL upgrades the JWT side to a RemoteAuthProvider serving
+    RFC 9728 discovery metadata (how claude.ai connectors find Auth0)."""
+    env = {"OCEANUM_MCP_PUBLIC_URL": "https://mcp.oceanum.io"}
+    with patch.dict(os.environ, {**env, "OCEANUM_MCP_AUTH": "auth0"}, clear=False):
+        provider = build_auth_provider()
+        assert isinstance(provider, RemoteAuthProvider)
+        assert "auth.oceanum.io" in str(provider.authorization_servers[0])
+    with patch.dict(os.environ, {**env, "OCEANUM_MCP_AUTH": "auto"}, clear=False):
+        assert isinstance(build_auth_provider(), MultiAuth)
 
 
 async def test_datamesh_verifier_declines_jwt_shaped_tokens(fake_gateway):
