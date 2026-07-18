@@ -29,9 +29,24 @@ def main():
     )
     parser.add_argument(
         "--transport",
-        choices=["stdio", "sse"],
+        choices=["stdio", "http", "sse"],
         default="stdio",
-        help="MCP transport to use (default: stdio).",
+        help=(
+            "MCP transport to use (default: stdio). http runs a hosted "
+            "streamable-HTTP server; auth is configured via OCEANUM_MCP_AUTH "
+            "(datamesh, auth0, or none)."
+        ),
+    )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind address for http/sse transports (default: 127.0.0.1).",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=8000,
+        help="Bind port for http/sse transports (default: 8000).",
     )
 
     args = parser.parse_args()
@@ -42,10 +57,30 @@ def main():
             print(f"  - {name}")
         sys.exit(0)
 
+    # Record the transport BEFORE the lazy server import: server modules make
+    # import-time decisions (e.g. disabling local-filesystem tools) off it.
+    from oceanum_mcp.common.config import set_transport
+
+    set_transport(args.transport)
+
     # Lazy import to only load the selected server's dependencies
     import importlib
 
     module = importlib.import_module(SERVER_REGISTRY[args.server])
     mcp_server = module.mcp
 
-    mcp_server.run(transport=args.transport)
+    if args.transport in ("http", "sse"):
+        from oceanum_mcp.common.auth import build_auth_provider
+
+        provider = build_auth_provider()
+        if provider is None:
+            print(
+                "WARNING: OCEANUM_MCP_AUTH=none — the server is UNAUTHENTICATED "
+                "and every request uses the server's DATAMESH_TOKEN.",
+                file=sys.stderr,
+            )
+        else:
+            mcp_server.auth = provider
+        mcp_server.run(transport=args.transport, host=args.host, port=args.port)
+    else:
+        mcp_server.run(transport=args.transport)
