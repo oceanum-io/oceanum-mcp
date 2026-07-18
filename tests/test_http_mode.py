@@ -15,6 +15,8 @@ import pytest
 from fastmcp import Client, FastMCP
 from fastmcp.server.auth.providers.jwt import StaticTokenVerifier
 
+from oceanum_mcp.common.auth import DatameshHeaderMiddleware
+
 import oceanum_mcp.servers.datamesh.server as datamesh_server
 from oceanum_mcp.common.client import CREDENTIAL_CLAIM, resolve_credential
 from oceanum_mcp.common.config import set_transport
@@ -63,7 +65,10 @@ async def http_client():
     def whoami() -> str:
         return resolve_credential()
 
+    # add_middleware (outermost) mirrors create_http_app: fastmcp's own
+    # middleware kwarg would place the promotion inside auth, too late.
     app = mcp.http_app(stateless_http=True)
+    app.add_middleware(DatameshHeaderMiddleware)
     async with app.router.lifespan_context(app):
         transport = httpx.ASGITransport(app=app)
         async with httpx.AsyncClient(
@@ -133,6 +138,44 @@ async def test_export_query_enabled_in_stdio_mode():
     async with Client(datamesh_server.mcp) as client:
         tools = {t.name for t in await client.list_tools()}
     assert "export_query" in tools
+
+
+async def test_http_accepts_x_datamesh_token_header():
+    """A Datamesh token in its conventional X-DATAMESH-TOKEN header
+    authenticates without an Authorization header."""
+    async with http_client() as client:
+        resp = await client.post(
+            "/mcp",
+            json=CALL_WHOAMI,
+            headers={**HDRS, "X-DATAMESH-TOKEN": "tok-a"},
+        )
+        assert resp.status_code == 200
+        assert '"result":"tok-a"' in resp.text.replace(" ", "")
+
+
+async def test_http_authorization_wins_over_datamesh_header():
+    """When both headers are sent, the Authorization bearer is authoritative
+    and the X-DATAMESH-TOKEN header is not promoted."""
+    async with http_client() as client:
+        resp = await client.post(
+            "/mcp",
+            json=CALL_WHOAMI,
+            headers={
+                **HDRS,
+                "Authorization": "Bearer tok-a",
+                "X-DATAMESH-TOKEN": "tok-b",
+            },
+        )
+        assert resp.status_code == 200
+        assert '"result":"tok-a"' in resp.text.replace(" ", "")
+
+
+async def test_http_invalid_x_datamesh_token_rejected():
+    async with http_client() as client:
+        resp = await client.post(
+            "/mcp", json=INIT, headers={**HDRS, "X-DATAMESH-TOKEN": "nope"}
+        )
+    assert resp.status_code == 401
 
 
 @pytest.fixture

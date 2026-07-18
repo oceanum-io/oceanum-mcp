@@ -15,6 +15,7 @@ import httpx
 from fastmcp.server.auth import AccessToken, AuthProvider, MultiAuth, TokenVerifier
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.utilities.token_cache import TokenCache
+from starlette.types import ASGIApp, Receive, Scope, Send
 
 from oceanum_mcp.common.client import CREDENTIAL_CLAIM
 from oceanum_mcp.common.config import (
@@ -40,6 +41,33 @@ def _is_jwt_shaped(token: str) -> bool:
     credential type to its verifier.
     """
     return token.count(".") == 2
+
+
+class DatameshHeaderMiddleware:
+    """Promotes X-DATAMESH-TOKEN to the Authorization bearer FastMCP reads.
+
+    Datamesh clients conventionally send their token in the X-DATAMESH-TOKEN
+    header (as the gateway itself expects), while JWTs arrive as
+    Authorization bearers — so the header itself distinguishes the two
+    credential types. Promotion only happens when no Authorization header is
+    present, keeping the channels unambiguous when both are sent.
+    """
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            headers: list[tuple[bytes, bytes]] = scope["headers"]
+            if not any(k == b"authorization" for k, _ in headers):
+                token = next((v for k, v in headers if k == b"x-datamesh-token"), None)
+                if token:
+                    scope = dict(scope)
+                    scope["headers"] = [
+                        *headers,
+                        (b"authorization", b"Bearer " + token),
+                    ]
+        await self.app(scope, receive, send)
 
 
 class DatameshTokenVerifier(TokenVerifier):

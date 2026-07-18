@@ -139,17 +139,18 @@ never shared between tokens.
 
 Auth schemes (`OCEANUM_MCP_AUTH`):
 
-- `auto` (default) — accepts **either** credential, detected per request: a
-  JWT-shaped bearer (three dot-separated segments) is validated against the
-  Auth0 tenant, an opaque bearer against the Datamesh gateway. Each request
-  runs as the identity its own credential resolves to.
-- `datamesh` — clients send their Datamesh token as the bearer:
-  `Authorization: Bearer <datamesh-token>`. The server validates it against
-  the gateway. Add to Claude Code with:
+- `auto` (default) — accepts **either** credential, detected per request:
+  Datamesh tokens arrive in the `X-DATAMESH-TOKEN` header (the same header
+  the gateway itself uses), Auth0 JWTs in `Authorization: Bearer`. A Datamesh
+  token sent as the bearer also works (JWT-shape detection routes it), but
+  the dedicated header is the canonical form. Each request runs as the
+  identity its own credential resolves to.
+- `datamesh` — only Datamesh tokens are accepted. The server validates them
+  against the gateway. Add to Claude Code with:
 
   ```bash
   claude mcp add --transport http oceanum-datamesh https://mcp.oceanum.io/datamesh \
-    --header "Authorization: Bearer <datamesh-token>"
+    --header "X-DATAMESH-TOKEN: <datamesh-token>"
   ```
 
 - `auth0` — clients send an Auth0-issued JWT, validated against the tenant
