@@ -223,18 +223,13 @@ async def test_oauth_discovery_metadata_served(restore_datamesh_policy):
         async with httpx.AsyncClient(
             transport=transport, base_url="http://test"
         ) as client:
-            # claude.ai probes the path-suffixed form first, then the root.
-            resp = None
-            for well_known in (
-                "/.well-known/oauth-protected-resource/datamesh",
-                "/.well-known/oauth-protected-resource",
-            ):
-                candidate = await client.get(well_known)
-                if candidate.status_code == 200:
-                    resp = candidate
-                    break
-            assert resp is not None, "no protected-resource metadata route served"
+            # The path-suffixed form is what fastmcp serves and what the 401
+            # WWW-Authenticate challenge points at (claude.ai probes it
+            # first per RFC 9728) — pin it so a route move fails the test.
+            resp = await client.get("/.well-known/oauth-protected-resource/datamesh")
+            assert resp.status_code == 200
             assert "auth.oceanum.io" in resp.text
+            assert '"resource"' in resp.text
             unauth = await client.post("/datamesh", json=INIT, headers=HDRS)
             assert unauth.status_code == 401
             assert "www-authenticate" in unauth.headers
