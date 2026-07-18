@@ -84,17 +84,21 @@ def storage_service() -> str:
 def auth_mode() -> str:
     """Auth scheme for network transports, from OCEANUM_MCP_AUTH.
 
-    - "datamesh" (default): the presented bearer is a Datamesh token,
-      validated against the gateway.
-    - "auth0": the presented bearer is an Auth0-issued JWT, validated against
-      the tenant's JWKS and forwarded to the gateway as-is.
+    - "auto" (default): accept either credential, detected per request — a
+      JWT-shaped bearer is validated against the Auth0 tenant's JWKS, an
+      opaque bearer against the Datamesh gateway.
+    - "datamesh": the presented bearer must be a Datamesh token, validated
+      against the gateway.
+    - "auth0": the presented bearer must be an Auth0-issued JWT, validated
+      against the tenant's JWKS and forwarded to the gateway as-is.
     - "none": no authentication — every request uses DATAMESH_TOKEN from the
       server's environment. Only for trusted-network deployments.
     """
-    mode = os.environ.get("OCEANUM_MCP_AUTH", "datamesh").strip().lower()
-    if mode not in ("datamesh", "auth0", "none"):
+    mode = os.environ.get("OCEANUM_MCP_AUTH", "auto").strip().lower()
+    if mode not in ("auto", "datamesh", "auth0", "none"):
         raise ValueError(
-            f"OCEANUM_MCP_AUTH must be one of datamesh, auth0, none; got {mode!r}"
+            f"OCEANUM_MCP_AUTH must be one of auto, datamesh, auth0, none; "
+            f"got {mode!r}"
         )
     return mode
 

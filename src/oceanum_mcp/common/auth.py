@@ -12,7 +12,7 @@ import time
 from typing import Any
 
 import httpx
-from fastmcp.server.auth import AccessToken, AuthProvider, TokenVerifier
+from fastmcp.server.auth import AccessToken, AuthProvider, MultiAuth, TokenVerifier
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.utilities.token_cache import TokenCache
 
@@ -31,6 +31,15 @@ from oceanum_mcp.common.config import (
 _VALID_TTL_S = 300
 _INVALID_TTL_S = 60.0
 _CACHE_MAX = 256
+
+
+def _is_jwt_shaped(token: str) -> bool:
+    """Whether the bearer has JWT structure (three dot-separated segments).
+
+    Opaque Datamesh tokens never contain dots, so this cleanly routes each
+    credential type to its verifier.
+    """
+    return token.count(".") == 2
 
 
 class DatameshTokenVerifier(TokenVerifier):
@@ -76,6 +85,11 @@ class DatameshTokenVerifier(TokenVerifier):
             self._invalid[key] = now + _INVALID_TTL_S
 
     async def verify_token(self, token: str) -> AccessToken | None:
+        if _is_jwt_shaped(token):
+            # A JWT is never a Datamesh token: skip the gateway round trip
+            # and leave the negative cache unpolluted (matters in auto mode,
+            # where MultiAuth consults this verifier after the JWT one).
+            return None
         hit, cached = self._valid.get(token)
         if hit:
             return cached
@@ -160,6 +174,12 @@ class Auth0JWTVerifier(JWTVerifier):
 def build_auth_provider() -> AuthProvider | None:
     """Build the auth provider for a network transport, per OCEANUM_MCP_AUTH."""
     mode = auth_mode()
+    if mode == "auto":
+        # Per-request credential detection: the JWT verifier is consulted
+        # first and fails fast (locally) on non-JWT bearers; the Datamesh
+        # verifier declines JWT-shaped bearers, so each credential type is
+        # only ever checked against its own backend.
+        return MultiAuth(verifiers=[Auth0JWTVerifier(), DatameshTokenVerifier()])
     if mode == "datamesh":
         return DatameshTokenVerifier()
     if mode == "auth0":

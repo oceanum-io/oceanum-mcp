@@ -10,6 +10,8 @@ import pytest
 from fastmcp.server.auth import AccessToken
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 
+from fastmcp.server.auth import MultiAuth
+
 from oceanum_mcp.common.auth import (
     Auth0JWTVerifier,
     DatameshTokenVerifier,
@@ -133,6 +135,8 @@ def test_auth0_verifier_default_tenant():
 
 
 def test_build_auth_provider_modes():
+    with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "auto"}, clear=False):
+        assert isinstance(build_auth_provider(), MultiAuth)
     with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "datamesh"}, clear=False):
         assert isinstance(build_auth_provider(), DatameshTokenVerifier)
     with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "auth0"}, clear=False):
@@ -142,3 +146,35 @@ def test_build_auth_provider_modes():
     with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "bogus"}, clear=False):
         with pytest.raises(ValueError, match="OCEANUM_MCP_AUTH"):
             build_auth_provider()
+
+
+async def test_datamesh_verifier_declines_jwt_shaped_tokens(fake_gateway):
+    """JWTs are never Datamesh tokens: no gateway round trip, no negative-cache
+    entry for a credential that belongs to the other verifier."""
+    verifier = DatameshTokenVerifier(service="https://datamesh.test")
+    assert (
+        await verifier.verify_token("eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig") is None
+    )
+    assert fake_gateway.calls == 0
+
+
+async def test_auto_mode_accepts_either_credential(fake_gateway):
+    """MultiAuth routes a JWT to the Auth0 verifier and an opaque token to the
+    Datamesh verifier, each yielding its own credential claim."""
+    fake_gateway.payload = [{"username": "alice"}]
+    jwt = "eyJhbGciOiJSUzI1NiJ9.eyJzdWIiOiJ4In0.sig"
+    jwt_result = AccessToken(token=jwt, client_id="c", scopes=[], claims={})
+
+    async def fake_jwt_verify(self, token):
+        return jwt_result if token == jwt else None
+
+    with patch.dict(os.environ, {"OCEANUM_MCP_AUTH": "auto"}, clear=False):
+        provider = build_auth_provider()
+    with patch.object(JWTVerifier, "verify_token", new=fake_jwt_verify):
+        via_jwt = await provider.verify_token(jwt)
+        via_datamesh = await provider.verify_token("opaque-datamesh-token")
+    assert via_jwt is not None
+    assert via_jwt.claims[CREDENTIAL_CLAIM] == f"Bearer {jwt}"
+    assert via_datamesh is not None
+    assert via_datamesh.claims[CREDENTIAL_CLAIM] == "opaque-datamesh-token"
+    assert fake_gateway.calls == 1, "only the opaque token may reach the gateway"
