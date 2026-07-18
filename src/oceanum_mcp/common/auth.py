@@ -12,7 +12,13 @@ import time
 from typing import Any
 
 import httpx
-from fastmcp.server.auth import AccessToken, AuthProvider, MultiAuth, TokenVerifier
+from fastmcp.server.auth import (
+    AccessToken,
+    AuthProvider,
+    MultiAuth,
+    RemoteAuthProvider,
+    TokenVerifier,
+)
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.utilities.token_cache import TokenCache
 from starlette.types import ASGIApp, Receive, Scope, Send
@@ -23,6 +29,7 @@ from oceanum_mcp.common.config import (
     auth0_domain,
     auth_mode,
     datamesh_service,
+    public_url,
 )
 
 # Verification results are cached so a chatty MCP session does not hit the
@@ -199,17 +206,42 @@ class Auth0JWTVerifier(JWTVerifier):
         return result
 
 
+def _jwt_provider() -> AuthProvider:
+    """The Auth0 verifier, with OAuth discovery when a public URL is set.
+
+    RemoteAuthProvider serves RFC 9728 Protected Resource Metadata naming the
+    Auth0 tenant, which is how OAuth clients (claude.ai custom connectors)
+    discover where to authorize. Requires OCEANUM_MCP_PUBLIC_URL, since the
+    metadata must state the server's externally visible resource URL.
+    """
+    verifier = Auth0JWTVerifier()
+    base = public_url()
+    if base is None:
+        return verifier
+    return RemoteAuthProvider(
+        token_verifier=verifier,
+        authorization_servers=[f"https://{auth0_domain()}/"],
+        base_url=base,
+        resource_name="Oceanum MCP",
+    )
+
+
 def build_auth_provider() -> AuthProvider | None:
     """Build the auth provider for a network transport, per OCEANUM_MCP_AUTH."""
     mode = auth_mode()
     if mode == "auto":
-        # Per-request credential detection: the JWT verifier is consulted
+        # Per-request credential detection: the JWT provider is consulted
         # first and fails fast (locally) on non-JWT bearers; the Datamesh
         # verifier declines JWT-shaped bearers, so each credential type is
-        # only ever checked against its own backend.
-        return MultiAuth(verifiers=[Auth0JWTVerifier(), DatameshTokenVerifier()])
+        # only ever checked against its own backend. When the JWT side is a
+        # RemoteAuthProvider it goes in the server slot, which contributes
+        # the discovery routes as well as verification.
+        jwt_provider = _jwt_provider()
+        if isinstance(jwt_provider, RemoteAuthProvider):
+            return MultiAuth(server=jwt_provider, verifiers=[DatameshTokenVerifier()])
+        return MultiAuth(verifiers=[jwt_provider, DatameshTokenVerifier()])
     if mode == "datamesh":
         return DatameshTokenVerifier()
     if mode == "auth0":
-        return Auth0JWTVerifier()
+        return _jwt_provider()
     return None

@@ -109,3 +109,15 @@ def auth0_domain() -> str:
 
 def auth0_audience() -> str:
     return os.environ.get("OCEANUM_MCP_AUTH0_AUDIENCE", "https://api.oceanum.io")
+
+
+def public_url() -> str | None:
+    """Externally visible base URL of this server, from OCEANUM_MCP_PUBLIC_URL.
+
+    e.g. "https://mcp.oceanum.io". When set, network transports serve OAuth
+    Protected Resource Metadata (RFC 9728) so OAuth clients — claude.ai
+    custom connectors in particular — can discover the Auth0 authorization
+    server. Unset means no discovery routes (header/bearer auth still works).
+    """
+    raw = os.environ.get("OCEANUM_MCP_PUBLIC_URL", "").strip().rstrip("/")
+    return raw or None

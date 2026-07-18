@@ -206,3 +206,35 @@ def test_create_http_app_rejects_unknown_server():
 
     with pytest.raises(ValueError, match="Unknown server"):
         create_http_app("nonexistent")
+
+
+async def test_oauth_discovery_metadata_served(restore_datamesh_policy):
+    """With a public URL configured, the app serves RFC 9728 Protected
+    Resource Metadata naming the Auth0 tenant, and 401s carry a
+    WWW-Authenticate header pointing OAuth clients at it."""
+    from oceanum_mcp.app import create_http_app
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("OCEANUM_MCP_AUTH", "auto")
+        mp.setenv("OCEANUM_MCP_PUBLIC_URL", "https://mcp.example.test")
+        app = create_http_app("datamesh")
+    async with app.router.lifespan_context(app):
+        transport = httpx.ASGITransport(app=app)
+        async with httpx.AsyncClient(
+            transport=transport, base_url="http://test"
+        ) as client:
+            # claude.ai probes the path-suffixed form first, then the root.
+            resp = None
+            for well_known in (
+                "/.well-known/oauth-protected-resource/datamesh",
+                "/.well-known/oauth-protected-resource",
+            ):
+                candidate = await client.get(well_known)
+                if candidate.status_code == 200:
+                    resp = candidate
+                    break
+            assert resp is not None, "no protected-resource metadata route served"
+            assert "auth.oceanum.io" in resp.text
+            unauth = await client.post("/datamesh", json=INIT, headers=HDRS)
+            assert unauth.status_code == 401
+            assert "www-authenticate" in unauth.headers
