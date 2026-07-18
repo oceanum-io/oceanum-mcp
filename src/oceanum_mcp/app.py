@@ -26,7 +26,7 @@ def create_http_app(
     server: str = "combined",
     *,
     stateless: bool = True,
-    path: str = "/mcp",
+    path: str | None = None,
     **http_app_kwargs: Any,
 ) -> Starlette:
     """Build a fully wired ASGI app for the named server.
@@ -34,7 +34,8 @@ def create_http_app(
     Auth comes from OCEANUM_MCP_AUTH exactly as in the CLI's http mode.
     Stateless by default: external ASGI servers usually mean multiple
     workers or instances, where in-memory MCP sessions do not survive
-    request routing.
+    request routing. The endpoint path defaults to /<server> (matching the
+    CLI), so several servers can share one domain behind an ingress.
     """
     if server not in SERVER_REGISTRY:
         raise ValueError(
@@ -53,4 +54,6 @@ def create_http_app(
     provider = build_auth_provider()
     if provider is not None:
         mcp.auth = provider
-    return mcp.http_app(stateless_http=stateless, path=path, **http_app_kwargs)
+    return mcp.http_app(
+        stateless_http=stateless, path=path or f"/{server}", **http_app_kwargs
+    )

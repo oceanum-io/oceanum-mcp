@@ -129,7 +129,10 @@ Run any server as a shared, multi-tenant HTTP service:
 oceanum-mcp datamesh --transport http --host 0.0.0.0 --port 8000
 ```
 
-This serves the MCP streamable-HTTP endpoint at `http://<host>:<port>/mcp`.
+This serves the MCP streamable-HTTP endpoint at `http://<host>:<port>/<server>`
+(`/datamesh` here; override with `--path`). Each server owning its own path
+lets several MCP servers share one domain behind an ingress — e.g.
+`https://mcp.oceanum.io/datamesh` and `https://mcp.oceanum.io/storage`.
 Every request must present a bearer credential, and all Datamesh/Storage calls
 are made **as that request's user** — connections are cached per credential and
 never shared between tokens.
@@ -141,7 +144,7 @@ Auth schemes (`OCEANUM_MCP_AUTH`):
   the gateway. Add to Claude Code with:
 
   ```bash
-  claude mcp add --transport http oceanum-datamesh https://your-host/mcp \
+  claude mcp add --transport http oceanum-datamesh https://mcp.oceanum.io/datamesh \
     --header "Authorization: Bearer <datamesh-token>"
   ```
 

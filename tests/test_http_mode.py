@@ -145,12 +145,14 @@ def restore_datamesh_policy():
 
 async def test_create_http_app_applies_tool_policy(restore_datamesh_policy):
     """The ASGI factory disables export_query even when the server module was
-    already imported (in stdio mode) before the factory ran."""
+    already imported (in stdio mode) before the factory ran, and mounts the
+    endpoint at /<server> for multi-server ingress routing."""
     from oceanum_mcp.app import create_http_app
 
     with pytest.MonkeyPatch.context() as mp:
         mp.setenv("OCEANUM_MCP_AUTH", "none")
-        create_http_app("datamesh")
+        app = create_http_app("datamesh")
+    assert "/datamesh" in [r.path for r in app.routes]
     async with Client(datamesh_server.mcp) as client:
         tools = {t.name for t in await client.list_tools()}
     assert "export_query" not in tools

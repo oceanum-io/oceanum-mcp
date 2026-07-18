@@ -49,6 +49,15 @@ def main():
         help="Bind port for http/sse transports (default: 8000).",
     )
     parser.add_argument(
+        "--path",
+        default=None,
+        help=(
+            "URL path of the MCP endpoint for http/sse transports. Defaults "
+            "to /<server> (e.g. /datamesh), so multiple servers can share one "
+            "domain behind an ingress (https://mcp.oceanum.io/datamesh)."
+        ),
+    )
+    parser.add_argument(
         "--stateless",
         action="store_true",
         help=(
@@ -91,7 +100,11 @@ def main():
             )
         else:
             mcp_server.auth = provider
-        run_kwargs = {"host": args.host, "port": args.port}
+        run_kwargs = {
+            "host": args.host,
+            "port": args.port,
+            "path": args.path or f"/{args.server}",
+        }
         if args.stateless:
             run_kwargs["stateless_http"] = True
         mcp_server.run(transport=args.transport, **run_kwargs)

@@ -52,3 +52,4 @@ def test_cli_help_lists_transports():
     assert "--host" in result.stdout
     assert "--port" in result.stdout
     assert "--stateless" in result.stdout
+    assert "--path" in result.stdout
