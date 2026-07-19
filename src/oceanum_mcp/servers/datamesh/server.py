@@ -53,8 +53,16 @@ _DATAMESH_ERRORS = (DatameshConnectError, DatameshQueryError, DatameshSessionErr
 # Server caps tabular (dataframe/geodataframe) query results at this many rows.
 DATAMESH_ROW_CAP = 2_000_000
 
-# Ceiling on bytes loaded into memory for a tabular export.
+# Ceiling on bytes loaded into memory for a tabular export (local/stdio path).
 MAX_EXPORT_FRAME_BYTES = 2_000_000_000
+
+# Above this staged size the hosted download link is flagged as a large
+# transfer. Not a refusal: the URL streams from the gateway at no cost to this
+# server, and exporting large results is the whole point of the download path.
+LARGE_DOWNLOAD_BYTES = 2_000_000_000
+
+# The tool's format names mapped to the gateway's `&f=` download tokens.
+_GATEWAY_FORMAT = {"netcdf": "nc", "parquet": "parquet", "csv": "csv"}
 
 READ_TOOL = {"readOnlyHint": True, "openWorldHint": True}
 
@@ -121,6 +129,44 @@ def _stage(conn: Connector, query: Query) -> Stage | None:
         ) from exc
     finally:
         session.close()
+
+
+def _download_stage(conn: Connector, query: Query) -> dict[str, Any] | None:
+    """Stage a query for download, returning the gateway's response dict.
+
+    POSTs to the gateway's /oceanql/download/ endpoint, which the oceanum<2
+    library does not wrap. The response carries a self-authenticating signed
+    `url` (append `&f=<format>` to pick a format), plus `formats`, `size`, and
+    `container`. Mirrors Connector._stage_request's auth/error handling.
+    Returns None when no data matches (HTTP 204).
+    """
+    session = Session.acquire(conn)
+    try:
+        resp = conn._retried_request(
+            f"{conn._gateway}/oceanql/download/",
+            method="POST",
+            headers=session.header,
+            data=query.model_dump_json(warnings=False),
+        )
+    except AttributeError as exc:  # private API drift within the 1.x pin
+        raise ToolError(
+            "The installed oceanum version no longer exposes the connection "
+            "internals this server relies on; install a version matching "
+            "the pyproject.toml pin."
+        ) from exc
+    finally:
+        session.close()
+    if resp.status_code == 204:
+        return None
+    if resp.status_code >= 400:
+        try:
+            detail = resp.json().get("detail")
+        except ValueError:
+            detail = None
+        if detail:
+            raise DatameshQueryError(detail)
+        raise DatameshConnectError("Datamesh server error: " + resp.text)
+    return resp.json()
 
 
 def _query_echo(query: Query) -> dict[str, Any]:
@@ -555,9 +601,72 @@ def query_data(
     return to_json(out)
 
 
+def _export_download_url(
+    conn: Connector,
+    query: Query,
+    format: Literal["netcdf", "parquet", "csv"] | None,
+) -> str:
+    """Hosted export: return a signed gateway download URL, no local file.
+
+    The gateway stages the result and returns a self-authenticating URL; the
+    data never touches this server's disk or the conversation. The caller (or
+    their code) fetches the URL out-of-band.
+    """
+    try:
+        stage = _download_stage(conn, query)
+    except _DATAMESH_ERRORS as exc:
+        return to_json({"error": str(exc), "query": _query_echo(query)})
+    if stage is None or not stage.get("url"):
+        return to_json(
+            {
+                "status": "no_data",
+                "message": "No data matches this query; nothing to download.",
+                "query": _query_echo(query),
+            }
+        )
+
+    # The gateway renders any format it advertises regardless of container
+    # (a point-extracted dataset serves CSV fine), so validate against the
+    # advertised list rather than the local path's xarray/pandas constraints.
+    is_dataset = stage.get("container") == Container.Dataset.value
+    fmt = format or ("netcdf" if is_dataset else "parquet")
+    gateway_fmt = _GATEWAY_FORMAT[fmt]
+    available = stage.get("formats") or []
+    if available and gateway_fmt not in available:
+        raise ToolError(
+            f"Format {fmt!r} is not available for this query; the gateway "
+            f"offers: {', '.join(available)}."
+        )
+
+    size = int(stage.get("size") or 0)
+    # The signed URL is a capability: append the format token, but keep the
+    # signature intact. It authenticates by itself, so treat it as a secret.
+    download_url = f"{stage['url']}&f={_GATEWAY_FORMAT[fmt]}"
+    out: dict[str, Any] = {
+        "download_url": download_url,
+        "format": fmt,
+        "container": stage.get("container"),
+        "size_bytes": size,
+        "size_human": human_bytes(size),
+        "available_formats": stage.get("formats", []),
+        "note": (
+            "Time-limited, self-authenticating download link (it needs no "
+            "token, so treat it like a password). Fetch it out-of-band; the "
+            "data is not returned inline."
+        ),
+        "query": _query_echo(query),
+    }
+    if size > LARGE_DOWNLOAD_BYTES:
+        out["warning"] = (
+            f"Large download ({human_bytes(size)}); ensure the consumer can "
+            "stream it. Narrow the query to shrink it."
+        )
+    return to_json(out)
+
+
 def export_query(
     datasource_id: str,
-    path: str,
+    path: str | None = None,
     format: Literal["netcdf", "parquet", "csv"] | None = None,
     overwrite: bool = False,
     variables: list[str] | None = None,
@@ -582,12 +691,15 @@ def export_query(
     aggregate_temporal: bool = True,
     limit: int | None = None,
 ) -> str:
-    """Run a query and write the FULL result to a local file.
+    """Export the FULL result of a query — the data never enters the conversation.
 
-    This is the data-handle path for results too large to return inline: the
-    data never enters the conversation — analysis code reads the file instead.
-    Gridded datasets stream lazily to NetCDF; tabular results write Parquet or
-    CSV.
+    Behavior depends on how the server is running:
+    - Hosted (http/sse): returns a time-limited, self-authenticating gateway
+      download_url (choose format via `format`); `path` is ignored. Fetch the
+      URL out-of-band — it needs no credential, so treat it as a secret.
+    - Local (stdio): writes the result to the local file `path` (required) and
+      returns that path. Gridded datasets stream to NetCDF; tabular results
+      write Parquet or CSV.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -614,6 +726,13 @@ def export_query(
         limit=limit,
     )
 
+    if is_network_transport():
+        # Hosted: broker a gateway download link; there is no client-visible
+        # local filesystem. path/overwrite do not apply.
+        return _export_download_url(conn, query, format)
+
+    if path is None:
+        raise ToolError("path is required for local (stdio) export.")
     dest = _resolve_export_path(path)
     if dest.exists():
         if dest.is_dir():
@@ -722,14 +841,15 @@ query_data.__doc__ = f"""{query_data.__doc__}
     """
 export_query.__doc__ = f"""{export_query.__doc__}
     Args:
-        path: Destination file path (parent directories are created; confined to OCEANUM_MCP_EXPORT_DIR when set).
+        path: Local (stdio) destination file path (required on stdio; parent directories are created; confined to OCEANUM_MCP_EXPORT_DIR when set). Ignored on hosted servers, which return a download URL.
         format: Output format: netcdf (datasets), parquet or csv (tabular). Defaults by container: dataset -> netcdf, tabular -> parquet.
-        overwrite: Overwrite an existing file (default false).
+        overwrite: Overwrite an existing local file (default false). Local export only.
 {_QUERY_PARAM_DOCS}
 
     Returns:
-        JSON with the written path, format, bytes_written, and a structure
-        summary of the exported data (no inline values).
+        Hosted: JSON with a signed download_url, format, size, container, and
+        available_formats. Local: JSON with the written path, format,
+        bytes_written, and a structure summary. Neither returns inline values.
     """
 
 stage_query = mcp.tool(annotations=READ_TOOL)(stage_query)
@@ -858,7 +978,6 @@ if is_read_only():
     # and keeps the tool registered (re-enable is possible at runtime).
     mcp.disable(names={"update_metadata"})
 
-if is_network_transport():
-    # A hosted server has no meaningful local filesystem for clients:
-    # export_query writes to the server's disk, not the caller's.
-    mcp.disable(names={"export_query"})
+# export_query stays enabled on every transport: on stdio it writes a local
+# file, on hosted it brokers a gateway download URL (both branches live in the
+# tool itself), so there is no transport for which it is unavailable.

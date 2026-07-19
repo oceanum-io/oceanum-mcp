@@ -127,24 +127,13 @@ def http_transport_datamesh():
         importlib.reload(datamesh_server)
 
 
-async def test_export_query_disabled_in_http_mode(http_transport_datamesh):
+async def test_export_query_enabled_in_http_mode(http_transport_datamesh):
+    # export_query stays enabled on hosted — it brokers a download URL there
+    # instead of writing a local file.
     async with Client(http_transport_datamesh.mcp) as client:
-        tools = {t.name for t in await client.list_tools()}
-    assert "export_query" not in tools
-    assert "query_data" in tools, "only the local-filesystem tool is disabled"
-
-
-async def test_no_hosted_tool_advertises_export_query(http_transport_datamesh):
-    # No enabled tool's DESCRIPTION may name export_query on a hosted server —
-    # the tool is disabled, so advertising it in a docstring would steer the
-    # model at a tool it cannot call.
-    async with Client(http_transport_datamesh.mcp) as client:
-        offenders = [
-            t.name
-            for t in await client.list_tools()
-            if "export_query" in (t.description or "")
-        ]
-    assert not offenders, f"hosted tool descriptions name export_query: {offenders}"
+        tools = {t.name: t for t in await client.list_tools()}
+    assert "export_query" in tools
+    assert "download" in (tools["export_query"].description or "").lower()
 
 
 async def test_export_query_enabled_in_stdio_mode():

@@ -97,18 +97,20 @@ def test_default_inline_cap_is_configurable():
     assert out["truncated"] is True
 
 
-def test_truncation_hint_omits_export_query_on_network_transport():
+def test_truncation_hint_export_wording_by_transport():
     df = pd.DataFrame({"x": range(500)})
     try:
         set_transport("http")
-        out = summarize_data(df)
+        http_out = summarize_data(df)
     finally:
         set_transport("stdio")
-    assert "export_query" not in out["note"]
-    assert "time_resolution" in out["note"]
-    # stdio keeps the export_query escape hatch
+    # Hosted export_query returns a download link; stdio writes a file. Both
+    # name export_query, with transport-appropriate wording.
+    assert "export_query" in http_out["note"]
+    assert "download link" in http_out["note"]
     stdio_out = summarize_data(df)
     assert "export_query" in stdio_out["note"]
+    assert "write the full result to a file" in stdio_out["note"]
 
 
 def test_geodataframe_records_use_wkt():

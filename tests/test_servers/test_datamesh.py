@@ -3,7 +3,7 @@
 import importlib
 import json
 import warnings
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -277,11 +277,11 @@ class TestQueryData:
         assert "export_query" in parsed["message"]
         mock_conn.query.assert_not_called()
 
-    def test_refusal_omits_export_query_on_network_transport(
+    def test_refusal_names_export_query_download_on_network_transport(
         self, mock_conn, mock_stage
     ):
-        # The server's runtime "too large" message must not name export_query
-        # on a hosted transport, where that tool is disabled.
+        # On a hosted transport the "too large" message points at export_query,
+        # which returns a download link there (not a local file).
         from oceanum_mcp.common.config import set_transport
 
         mock_stage.return_value = make_stage(Container.DataFrame, size=10**9)
@@ -291,7 +291,8 @@ class TestQueryData:
         finally:
             set_transport("stdio")
         assert parsed["refused"] is True
-        assert "export_query" not in parsed["message"]
+        assert "export_query" in parsed["message"]
+        assert "download link" in parsed["message"]
 
     def test_large_dataset_goes_lazy(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(Container.Dataset, size=10**9)
@@ -404,6 +405,10 @@ class TestExportQuery:
                 format="csv",
             )
 
+    def test_path_required_on_stdio(self, mock_conn, mock_stage):
+        with pytest.raises(ToolError, match="path is required"):
+            server.export_query(datasource_id="test-ds")
+
     def test_refuses_overwrite(self, mock_conn, mock_stage, tmp_path):
         dest = tmp_path / "exists.nc"
         dest.write_text("data")
@@ -452,6 +457,94 @@ class TestExportQuery:
             server.export_query(
                 datasource_id="test-ds", path=str(tmp_path / "escape.nc")
             )
+
+
+class TestExportQueryHosted:
+    """export_query on a network transport brokers a gateway download URL."""
+
+    @pytest.fixture(autouse=True)
+    def _http(self):
+        from oceanum_mcp.common.config import set_transport
+
+        set_transport("http")
+        yield
+        set_transport("stdio")
+
+    @staticmethod
+    def _stage(container="dataframe", size=1234, url=None):
+        return {
+            "container": container,
+            "size": size,
+            "formats": ["nc", "parquet", "csv"],
+            "url": url or "https://datamesh.oceanum.io/oceanql/abc$?auth=u&sig=xyz",
+        }
+
+    def test_returns_download_url_not_path(self, mock_conn):
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "path" not in parsed
+        assert parsed["download_url"].endswith("&f=parquet")
+        assert parsed["download_url"].startswith("https://datamesh.oceanum.io/oceanql/")
+        assert parsed["format"] == "parquet"
+        assert parsed["size_bytes"] == 1234
+        assert parsed["available_formats"] == ["nc", "parquet", "csv"]
+        assert "self-authenticating" in parsed["note"]
+
+    def test_path_ignored_on_hosted(self, mock_conn):
+        # A path arg does not cause a local write on hosted; a URL is returned.
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds", path="/tmp/ignored.parquet"
+                )
+            )
+        assert "download_url" in parsed
+
+    def test_dataset_defaults_to_netcdf_format_token(self, mock_conn):
+        with patch.object(
+            server, "_download_stage", return_value=self._stage(container="dataset")
+        ):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["format"] == "netcdf"
+        assert parsed["download_url"].endswith("&f=nc")
+
+    def test_dataset_can_export_csv_when_advertised(self, mock_conn):
+        # The gateway serves CSV for a point-extracted dataset; validation is
+        # against the advertised formats, not the container.
+        with patch.object(
+            server, "_download_stage", return_value=self._stage(container="dataset")
+        ):
+            parsed = json.loads(
+                server.export_query(datasource_id="test-ds", format="csv")
+            )
+        assert parsed["download_url"].endswith("&f=csv")
+
+    def test_rejects_format_not_advertised(self, mock_conn):
+        stage = self._stage(container="dataset")
+        stage["formats"] = ["nc"]  # only NetCDF offered
+        with patch.object(server, "_download_stage", return_value=stage):
+            with pytest.raises(ToolError, match="not available"):
+                server.export_query(datasource_id="test-ds", format="csv")
+
+    def test_large_download_warns_but_returns_url(self, mock_conn):
+        big = self._stage(size=5 * 10**9)
+        with patch.object(server, "_download_stage", return_value=big):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "download_url" in parsed
+        assert "warning" in parsed and "Large download" in parsed["warning"]
+
+    def test_no_data(self, mock_conn):
+        with patch.object(server, "_download_stage", return_value=None):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["status"] == "no_data"
+
+    def test_gateway_error_echoes_query(self, mock_conn):
+        with patch.object(
+            server, "_download_stage", side_effect=DatameshQueryError("bad query")
+        ):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "bad query" in parsed["error"]
+        assert parsed["query"]["datasource"] == "test-ds"
 
 
 class TestLoadDatasource:
