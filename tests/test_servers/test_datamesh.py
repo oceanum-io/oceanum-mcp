@@ -16,7 +16,7 @@ from oceanum.datamesh.exceptions import (
     DatameshQueryError,
     DatameshSessionError,
 )
-from oceanum.datamesh.query import Container, CoordSelector, GeoFilter
+from oceanum.datamesh.query import Container, CoordSelector, GeoFilter, Query
 
 import oceanum_mcp.servers.datamesh.server as server
 from tests.conftest import make_stage
@@ -275,6 +275,8 @@ class TestQueryData:
         parsed = json.loads(server.query_data(datasource_id="test-ds"))
         assert parsed["refused"] is True
         assert "export_query" in parsed["message"]
+        # stdio wording is the local-file variant, not the hosted download link.
+        assert "write the full result to a file" in parsed["message"]
         mock_conn.query.assert_not_called()
 
     def test_refusal_names_export_query_download_on_network_transport(
@@ -459,6 +461,75 @@ class TestExportQuery:
             )
 
 
+class _Resp:
+    """Minimal stand-in for a requests.Response from the gateway."""
+
+    def __init__(self, status_code, payload=None, text=""):
+        self.status_code = status_code
+        self._payload = payload
+        self.text = text
+
+    def json(self):
+        if self._payload is None:
+            raise ValueError("no json body")
+        return self._payload
+
+
+class TestDownloadStage:
+    """The gateway-contact helper behind hosted export (not mocked out)."""
+
+    @staticmethod
+    def _conn(resp=None, exc=None):
+        conn = MagicMock()
+        conn._gateway = "https://gw.test"
+        if exc is not None:
+            conn._retried_request.side_effect = exc
+        else:
+            conn._retried_request.return_value = resp
+        return conn
+
+    def _run(self, conn):
+        with patch.object(server.Session, "acquire", return_value=MagicMock(header={})):
+            return server._download_stage(conn, Query(datasource="test-ds"))
+
+    def test_success_returns_dict_with_long_timeout(self):
+        conn = self._conn(_Resp(200, {"url": "https://gw.test/x?a=b", "size": 10}))
+        out = self._run(conn)
+        assert out["url"] == "https://gw.test/x?a=b"
+        # The stage read timeout (not the 10s default) must be used.
+        assert (
+            conn._retried_request.call_args.kwargs["timeout"][1]
+            == server.DATAMESH_STAGE_READ_TIMEOUT
+        )
+        assert conn._retried_request.call_args.args[0].endswith("/oceanql/download/")
+
+    def test_204_returns_none(self):
+        assert self._run(self._conn(_Resp(204))) is None
+
+    def test_400_with_detail_raises_query_error(self):
+        conn = self._conn(_Resp(400, {"detail": "bad datasource"}, text="{}"))
+        with pytest.raises(DatameshQueryError, match="bad datasource"):
+            self._run(conn)
+
+    def test_error_without_detail_raises_connect_error(self):
+        conn = self._conn(_Resp(500, None, text="upstream boom"))
+        with pytest.raises(DatameshConnectError, match="upstream boom"):
+            self._run(conn)
+
+    def test_attribute_error_becomes_toolerror(self):
+        conn = self._conn(exc=AttributeError("no _retried_request"))
+        with pytest.raises(ToolError, match="oceanum version"):
+            self._run(conn)
+
+    def test_session_closed_even_on_error(self):
+        sess = MagicMock(header={})
+        conn = self._conn(exc=AttributeError("boom"))
+        with patch.object(server.Session, "acquire", return_value=sess):
+            with pytest.raises(ToolError):
+                server._download_stage(conn, Query(datasource="test-ds"))
+        sess.close.assert_called_once()
+
+
 class TestExportQueryHosted:
     """export_query on a network transport brokers a gateway download URL."""
 
@@ -490,15 +561,30 @@ class TestExportQueryHosted:
         assert parsed["available_formats"] == ["nc", "parquet", "csv"]
         assert "self-authenticating" in parsed["note"]
 
-    def test_path_ignored_on_hosted(self, mock_conn):
-        # A path arg does not cause a local write on hosted; a URL is returned.
+    def test_path_ignored_on_hosted(self, mock_conn, tmp_path):
+        # A path arg does not cause a local write on hosted; a URL is returned
+        # and the response signals the path was ignored.
+        dest = tmp_path / "ignored.parquet"
         with patch.object(server, "_download_stage", return_value=self._stage()):
             parsed = json.loads(
-                server.export_query(
-                    datasource_id="test-ds", path="/tmp/ignored.parquet"
-                )
+                server.export_query(datasource_id="test-ds", path=str(dest))
             )
         assert "download_url" in parsed
+        assert "path" not in parsed
+        assert not dest.exists(), "hosted export must not write a local file"
+        assert "ignored on hosted" in parsed["note"]
+
+    def test_url_without_query_string_uses_question_mark(self, mock_conn):
+        stage = self._stage(url="https://datamesh.oceanum.io/oceanql/bare")
+        with patch.object(server, "_download_stage", return_value=stage):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["download_url"].endswith("/oceanql/bare?f=parquet")
+
+    def test_missing_url_is_no_data(self, mock_conn):
+        stage = {"container": "dataframe", "size": 1, "formats": ["parquet"]}
+        with patch.object(server, "_download_stage", return_value=stage):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["status"] == "no_data"
 
     def test_dataset_defaults_to_netcdf_format_token(self, mock_conn):
         with patch.object(

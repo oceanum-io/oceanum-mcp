@@ -30,6 +30,10 @@ from oceanum.datamesh.exceptions import (
 )
 from oceanum.datamesh.query import Container, CoordSelector, GeoFilter, Query, Stage
 from oceanum.datamesh.session import Session
+from oceanum.datamesh.utils import (
+    DATAMESH_CONNECT_TIMEOUT,
+    DATAMESH_STAGE_READ_TIMEOUT,
+)
 
 from oceanum_mcp.common.client import get_datamesh_connector
 from oceanum_mcp.common.config import (
@@ -147,6 +151,9 @@ def _download_stage(conn: Connector, query: Query) -> dict[str, Any] | None:
             method="POST",
             headers=session.header,
             data=query.model_dump_json(warnings=False),
+            # Match _stage_request's long read timeout: preparing a download
+            # stage for a large export can far exceed the 10s default.
+            timeout=(DATAMESH_CONNECT_TIMEOUT, DATAMESH_STAGE_READ_TIMEOUT),
         )
     except AttributeError as exc:  # private API drift within the 1.x pin
         raise ToolError(
@@ -605,6 +612,7 @@ def _export_download_url(
     conn: Connector,
     query: Query,
     format: Literal["netcdf", "parquet", "csv"] | None,
+    requested_path: str | None = None,
 ) -> str:
     """Hosted export: return a signed gateway download URL, no local file.
 
@@ -638,10 +646,22 @@ def _export_download_url(
             f"offers: {', '.join(available)}."
         )
 
-    size = int(stage.get("size") or 0)
-    # The signed URL is a capability: append the format token, but keep the
-    # signature intact. It authenticates by itself, so treat it as a secret.
-    download_url = f"{stage['url']}&f={_GATEWAY_FORMAT[fmt]}"
+    try:
+        size = int(stage.get("size") or 0)
+    except (TypeError, ValueError):
+        size = 0
+    # The signed URL is a capability: append the format token, keeping the
+    # signature intact. Use '?' if the URL has no query string yet, else '&'.
+    url = stage["url"]
+    sep = "&" if "?" in url else "?"
+    download_url = f"{url}{sep}f={gateway_fmt}"
+    note = (
+        "Time-limited, self-authenticating download link (it needs no "
+        "token, so treat it like a password). Fetch it out-of-band; the "
+        "data is not returned inline."
+    )
+    if requested_path is not None:
+        note += " (The path argument is ignored on hosted servers.)"
     out: dict[str, Any] = {
         "download_url": download_url,
         "format": fmt,
@@ -649,11 +669,7 @@ def _export_download_url(
         "size_bytes": size,
         "size_human": human_bytes(size),
         "available_formats": stage.get("formats", []),
-        "note": (
-            "Time-limited, self-authenticating download link (it needs no "
-            "token, so treat it like a password). Fetch it out-of-band; the "
-            "data is not returned inline."
-        ),
+        "note": note,
         "query": _query_echo(query),
     }
     if size > LARGE_DOWNLOAD_BYTES:
@@ -729,7 +745,7 @@ def export_query(
     if is_network_transport():
         # Hosted: broker a gateway download link; there is no client-visible
         # local filesystem. path/overwrite do not apply.
-        return _export_download_url(conn, query, format)
+        return _export_download_url(conn, query, format, requested_path=path)
 
     if path is None:
         raise ToolError("path is required for local (stdio) export.")
