@@ -71,10 +71,11 @@ _GATEWAY_FORMAT = {"netcdf": "nc", "parquet": "parquet", "csv": "csv"}
 READ_TOOL = {"readOnlyHint": True, "openWorldHint": True}
 
 # Instructions are transport-neutral: they describe the stage -> narrow
-# workflow without naming export_query, which is disabled on network
-# transports. The runtime "result too large" messages (via export_clause())
-# and the export_query tool's own docstring carry the export path where it is
-# available, so nothing here freezes a transport-specific string at import.
+# workflow without naming export_query, whose behaviour differs by transport
+# (download link on hosted, local file on stdio). The runtime "result too
+# large" messages (via export_clause()) and the export_query tool's own
+# docstring carry the transport-specific wording, so nothing here freezes a
+# transport-specific string at import.
 mcp = FastMCP(
     "Oceanum Datamesh",
     instructions=(

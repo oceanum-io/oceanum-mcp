@@ -182,16 +182,15 @@ async def test_http_invalid_x_datamesh_token_rejected():
 
 @pytest.fixture
 def restore_datamesh_policy():
-    """Undo create_http_app's mutations of the shared datamesh server."""
+    """Undo create_http_app's transport mutation of the shared server module."""
     yield
     set_transport("stdio")
-    datamesh_server.mcp.enable(names={"export_query"})
 
 
-async def test_create_http_app_applies_tool_policy(restore_datamesh_policy):
-    """The ASGI factory disables export_query even when the server module was
-    already imported (in stdio mode) before the factory ran, and mounts the
-    endpoint at /<server> for multi-server ingress routing."""
+async def test_create_http_app_enables_export_query(restore_datamesh_policy):
+    """The ASGI factory — the real hosted serving path — keeps export_query
+    ENABLED (it brokers a download URL there) and mounts the endpoint at
+    /<server> for multi-server ingress routing."""
     from oceanum_mcp.app import create_http_app
 
     with pytest.MonkeyPatch.context() as mp:
@@ -200,7 +199,7 @@ async def test_create_http_app_applies_tool_policy(restore_datamesh_policy):
     assert "/datamesh" in [r.path for r in app.routes]
     async with Client(datamesh_server.mcp) as client:
         tools = {t.name for t in await client.list_tools()}
-    assert "export_query" not in tools
+    assert "export_query" in tools
 
 
 def test_create_http_app_rejects_unknown_server():
