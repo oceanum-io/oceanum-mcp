@@ -127,24 +127,13 @@ def http_transport_datamesh():
         importlib.reload(datamesh_server)
 
 
-async def test_export_query_disabled_in_http_mode(http_transport_datamesh):
+async def test_export_query_enabled_in_http_mode(http_transport_datamesh):
+    # export_query stays enabled on hosted — it brokers a download URL there
+    # instead of writing a local file.
     async with Client(http_transport_datamesh.mcp) as client:
-        tools = {t.name for t in await client.list_tools()}
-    assert "export_query" not in tools
-    assert "query_data" in tools, "only the local-filesystem tool is disabled"
-
-
-async def test_no_hosted_tool_advertises_export_query(http_transport_datamesh):
-    # No enabled tool's DESCRIPTION may name export_query on a hosted server —
-    # the tool is disabled, so advertising it in a docstring would steer the
-    # model at a tool it cannot call.
-    async with Client(http_transport_datamesh.mcp) as client:
-        offenders = [
-            t.name
-            for t in await client.list_tools()
-            if "export_query" in (t.description or "")
-        ]
-    assert not offenders, f"hosted tool descriptions name export_query: {offenders}"
+        tools = {t.name: t for t in await client.list_tools()}
+    assert "export_query" in tools
+    assert "download" in (tools["export_query"].description or "").lower()
 
 
 async def test_export_query_enabled_in_stdio_mode():
@@ -193,16 +182,15 @@ async def test_http_invalid_x_datamesh_token_rejected():
 
 @pytest.fixture
 def restore_datamesh_policy():
-    """Undo create_http_app's mutations of the shared datamesh server."""
+    """Undo create_http_app's transport mutation of the shared server module."""
     yield
     set_transport("stdio")
-    datamesh_server.mcp.enable(names={"export_query"})
 
 
-async def test_create_http_app_applies_tool_policy(restore_datamesh_policy):
-    """The ASGI factory disables export_query even when the server module was
-    already imported (in stdio mode) before the factory ran, and mounts the
-    endpoint at /<server> for multi-server ingress routing."""
+async def test_create_http_app_enables_export_query(restore_datamesh_policy):
+    """The ASGI factory — the real hosted serving path — keeps export_query
+    ENABLED (it brokers a download URL there) and mounts the endpoint at
+    /<server> for multi-server ingress routing."""
     from oceanum_mcp.app import create_http_app
 
     with pytest.MonkeyPatch.context() as mp:
@@ -211,7 +199,7 @@ async def test_create_http_app_applies_tool_policy(restore_datamesh_policy):
     assert "/datamesh" in [r.path for r in app.routes]
     async with Client(datamesh_server.mcp) as client:
         tools = {t.name for t in await client.list_tools()}
-    assert "export_query" not in tools
+    assert "export_query" in tools
 
 
 def test_create_http_app_rejects_unknown_server():

@@ -24,16 +24,16 @@ def to_json(obj: Any) -> str:
 
 
 def export_clause() -> str:
-    """Trailing clause pointing at export_query, only where it is available.
+    """Trailing clause pointing at export_query, in the current transport's terms.
 
-    export_query writes to the server's local disk and is disabled on network
-    transports, so a hosted deployment must never name it. This is the single
-    source of truth for that fact; all result-size guidance (here and in the
-    datamesh server's messages) derives its export wording from this function,
+    export_query behaves differently by transport — on hosted it returns a
+    signed download link, on stdio it writes a local file. This is the single
+    source of truth for that wording; all result-size guidance (here and in the
+    datamesh server's messages) derives its export phrasing from this function,
     evaluated at call time so it always matches the running transport.
     """
     if is_network_transport():
-        return ""
+        return ", or use export_query to get a download link for the full result"
     return ", or use export_query to write the full result to a file"
 
 

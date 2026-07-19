@@ -162,9 +162,11 @@ Auth schemes (`OCEANUM_MCP_AUTH`):
 
 Notes:
 
-- `export_query` is disabled over HTTP — it writes to the server's local
-  filesystem, which is meaningless for remote clients. Use `query_data` with
-  filters, or Oceanum Storage.
+- `export_query` works over HTTP but changes shape: instead of writing to the
+  server's local filesystem (meaningless for remote clients), it returns a
+  time-limited, self-authenticating gateway `download_url` that the caller
+  fetches out-of-band. The `path` argument is ignored on hosted servers. The
+  URL needs no credential, so it is a capability — treat it as a secret.
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance
@@ -268,10 +270,16 @@ refused with the staged size and alternatives. Library warnings (e.g. the
 
 ### `export_query`
 
-Run a query and write the **full** result to a local file — the data-handle
-path for results too large to return inline. Gridded datasets stream lazily to
-NetCDF; tabular results write Parquet or CSV. Accepts the same query
-parameters as `query_data` plus:
+Export the **full** result of a query — the data-handle path for results too
+large to return inline. Behaviour depends on transport:
+
+- **Local (stdio):** writes the result to the local file `path` (required) and
+  returns that path. Gridded datasets stream lazily to NetCDF; tabular results
+  write Parquet or CSV.
+- **Hosted (http/sse):** returns a time-limited, self-authenticating gateway
+  `download_url` (choose `format`; `path` is ignored). Fetch it out-of-band.
+
+Accepts the same query parameters as `query_data` plus:
 
 | Parameter   | Type   | Description                                                              |
 | ----------- | ------ | ------------------------------------------------------------------------ |

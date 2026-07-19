@@ -44,13 +44,9 @@ def create_http_app(
     set_transport("http")
     module = importlib.import_module(SERVER_REGISTRY[server])
     mcp = module.mcp
-    if server in ("datamesh", "combined"):
-        # Idempotent re-application of the network-transport tool policy,
-        # covering the case where the server module was already imported
-        # (in stdio mode) before this factory ran.
-        from oceanum_mcp.servers.datamesh.server import mcp as datamesh_mcp
-
-        datamesh_mcp.disable(names={"export_query"})
+    # No per-tool policy to re-apply for network transports: export_query is
+    # enabled on every transport (it brokers a download URL on hosted, writes a
+    # local file on stdio — the branch lives in the tool itself).
     provider = build_auth_provider()
     if provider is not None:
         mcp.auth = provider
