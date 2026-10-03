@@ -1,6 +1,7 @@
 """Shared configuration for Oceanum MCP servers."""
 
 import os
+import re
 from pathlib import Path
 
 # Default ceiling on bytes downloaded into the server process for inline
@@ -147,3 +148,56 @@ def public_url() -> str | None:
     """
     raw = os.environ.get("OCEANUM_MCP_PUBLIC_URL", "").strip().rstrip("/")
     return raw or None
+
+
+# Browser origins allowed to call the hosted server cross-origin by default.
+# A leading "*." matches exactly one subdomain label (not the apex).
+DEFAULT_CORS_ORIGINS = (
+    "https://*.oceanum.io",
+    "https://*.oceanum.tech",
+    "https://vscode.dev",
+)
+
+# scheme://host[:port]. Labels may not start or end with "-". A wildcard
+# host is "*." followed by at least two labels, so a bare "*" or "*.io" is
+# rejected. (Public suffixes such as "*.co.uk" or "*.github.io" cannot be
+# told apart without a suffix list — don't configure them.)
+DNS_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
+_CORS_ORIGIN_RE = re.compile(
+    rf"(?P<scheme>https?)://"
+    rf"(?P<host>\*\.{DNS_LABEL}(?:\.{DNS_LABEL})+|{DNS_LABEL}(?:\.{DNS_LABEL})*)"
+    r"(?::(?P<port>[0-9]{1,5}))?"
+)
+_DEFAULT_PORTS = {"http": "80", "https": "443"}
+
+
+def cors_origins() -> list[str]:
+    """Browser origins allowed by CORS on network transports.
+
+    From OCEANUM_MCP_CORS_ORIGINS, comma-separated. Unset means the defaults
+    above; set to an empty string to disable CORS entirely. Each entry is an
+    exact origin (scheme://host[:port]) optionally starting its host with
+    "*." to match any single subdomain label. A scheme-default port is
+    dropped, since browsers omit it from the Origin header. Fails fast on
+    anything else — a malformed entry silently dropped (or widened) is worse
+    than a loud misconfiguration.
+    """
+    raw = os.environ.get("OCEANUM_MCP_CORS_ORIGINS")
+    if raw is None:
+        return list(DEFAULT_CORS_ORIGINS)
+    origins = []
+    for entry in (o.strip().lower() for o in raw.split(",")):
+        if not entry:
+            continue
+        match = _CORS_ORIGIN_RE.fullmatch(entry)
+        port = match["port"] if match else None
+        if match is None or (port is not None and not 0 < int(port) < 65536):
+            raise ValueError(
+                "OCEANUM_MCP_CORS_ORIGINS entries must be origins like "
+                "https://app.example.com or https://*.example.com "
+                f"(no paths, no bare '*'); got {entry!r}"
+            )
+        if port == _DEFAULT_PORTS[match["scheme"]]:
+            entry = f"{match['scheme']}://{match['host']}"
+        origins.append(entry)
+    return origins

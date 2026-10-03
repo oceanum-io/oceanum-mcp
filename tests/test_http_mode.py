@@ -4,6 +4,7 @@ Covers the hosted-mode guarantees end to end at the ASGI layer:
 - unauthenticated requests are rejected before any tool runs
 - each request's tool call resolves that request's own credential
 - export_query (server-local filesystem) is disabled in http mode
+- CORS preflights are answered ahead of auth, for allowlisted origins only
 """
 
 import importlib
@@ -234,3 +235,256 @@ async def test_oauth_discovery_metadata_served(restore_datamesh_policy):
             unauth = await client.post("/datamesh", json=INIT, headers=HDRS)
             assert unauth.status_code == 401
             assert "www-authenticate" in unauth.headers
+
+
+# --- CORS (OCE-312) ---------------------------------------------------------
+
+PREFLIGHT_HEADERS = (
+    "authorization, content-type, mcp-protocol-version, mcp-session-id, "
+    "x-datamesh-token, last-event-id"
+)
+
+
+@asynccontextmanager
+async def factory_client(**env: str):
+    """ASGI client for the real create_http_app("datamesh") under ``env``.
+
+    Resets the shared datamesh module's auth first: create_http_app only
+    assigns mcp.auth when a provider is built, so an earlier test's provider
+    would otherwise leak into an OCEANUM_MCP_AUTH=none app.
+    """
+    from oceanum_mcp.app import create_http_app
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.delenv("OCEANUM_MCP_CORS_ORIGINS", raising=False)
+        mp.delenv("OCEANUM_MCP_PUBLIC_URL", raising=False)
+        mp.setenv("OCEANUM_MCP_AUTH", "auto")
+        for key, value in env.items():
+            mp.setenv(key, value)
+        mp.setattr(datamesh_server.mcp, "auth", None)
+        stateless = env.get("OCEANUM_MCP_AUTH") != "none"
+        app = create_http_app("datamesh", stateless=stateless)
+        try:
+            async with app.router.lifespan_context(app):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(
+                    transport=transport, base_url="http://test"
+                ) as client:
+                    yield client
+        finally:
+            set_transport("stdio")
+
+
+async def _preflight(client: httpx.AsyncClient, origin: str) -> httpx.Response:
+    return await client.options(
+        "/datamesh",
+        headers={
+            "Origin": origin,
+            "Access-Control-Request-Method": "POST",
+            "Access-Control-Request-Headers": PREFLIGHT_HEADERS,
+        },
+    )
+
+
+@pytest.mark.parametrize(
+    "origin",
+    ["https://app.oceanum.io", "https://ui.oceanum.tech", "https://vscode.dev"],
+)
+async def test_cors_preflight_allowed_origin_skips_auth(origin):
+    """A preflight from a default-allowlisted origin succeeds without any
+    credential — CORS is outermost, so auth never sees it."""
+    async with factory_client() as client:
+        resp = await _preflight(client, origin)
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == origin
+    methods = {
+        m.strip() for m in resp.headers["access-control-allow-methods"].split(",")
+    }
+    assert {"GET", "POST", "DELETE", "OPTIONS"} <= methods
+    allowed = {
+        h.strip().lower()
+        for h in resp.headers["access-control-allow-headers"].split(",")
+    }
+    assert {h.strip() for h in PREFLIGHT_HEADERS.split(",")} <= allowed
+    assert int(resp.headers["access-control-max-age"]) > 0
+    assert "access-control-allow-credentials" not in resp.headers
+
+
+@pytest.mark.parametrize(
+    "origin",
+    [
+        "https://evil.com",
+        "https://evil-oceanum.io",  # lookalike apex
+        "https://oceanum.io.evil.com",  # allowlisted name as a prefix
+        "https://app.oceanum.io.evil.com",
+        "https://appxoceanum.io",  # unescaped-dot trick
+        "https://a.b.oceanum.io",  # '*' is ONE label, not several
+        "https://oceanum.io",  # apex is not a subdomain
+        "https://app.oceanum.io.",  # trailing dot
+        "https://app.oceanum.io:8443",  # port not in the allowlist entry
+        "http://app.oceanum.io",  # scheme downgrade
+        "https://vscode.dev.evil.com",
+        "https://xvscode.dev",
+        "https://APP.oceanum.io",  # browsers serialize lowercase; exact match
+        "null",
+    ],
+)
+async def test_cors_preflight_disallowed_origin_gets_no_acao(origin):
+    async with factory_client() as client:
+        resp = await _preflight(client, origin)
+    assert resp.status_code != 200
+    assert "access-control-allow-origin" not in resp.headers
+
+
+async def test_cors_actual_post_carries_acao_and_exposes_session_id():
+    origin = "https://app.oceanum.io"
+    async with factory_client(OCEANUM_MCP_AUTH="none") as client:
+        resp = await client.post(
+            "/datamesh", json=INIT, headers={**HDRS, "Origin": origin}
+        )
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == origin
+    exposed = {
+        h.strip().lower()
+        for h in resp.headers["access-control-expose-headers"].split(",")
+    }
+    assert "mcp-session-id" in exposed
+    assert "mcp-session-id" in resp.headers
+    assert "access-control-allow-credentials" not in resp.headers
+
+
+async def test_cors_does_not_bypass_auth_for_real_requests():
+    """Only preflights skip auth: an allowed-origin POST without a credential
+    is still a 401 (readable by the browser, hence the ACAO header)."""
+    origin = "https://app.oceanum.io"
+    async with factory_client() as client:
+        resp = await client.post(
+            "/datamesh", json=INIT, headers={**HDRS, "Origin": origin}
+        )
+    assert resp.status_code == 401
+    assert resp.headers["access-control-allow-origin"] == origin
+
+
+async def test_cors_empty_env_disables():
+    async with factory_client(OCEANUM_MCP_CORS_ORIGINS="") as client:
+        resp = await _preflight(client, "https://app.oceanum.io")
+    assert resp.status_code != 200
+    assert "access-control-allow-origin" not in resp.headers
+
+
+async def test_cors_custom_env_list_replaces_defaults():
+    env = {
+        "OCEANUM_MCP_CORS_ORIGINS": " https://client.example.com ,https://*.corp.test"
+    }
+    async with factory_client(**env) as client:
+        exact = await _preflight(client, "https://client.example.com")
+        wild = await _preflight(client, "https://x.corp.test")
+        default = await _preflight(client, "https://app.oceanum.io")
+    assert exact.headers["access-control-allow-origin"] == "https://client.example.com"
+    assert wild.headers["access-control-allow-origin"] == "https://x.corp.test"
+    assert "access-control-allow-origin" not in default.headers
+
+
+def test_cors_origins_env_parsing(monkeypatch):
+    from oceanum_mcp.common.config import DEFAULT_CORS_ORIGINS, cors_origins
+
+    monkeypatch.delenv("OCEANUM_MCP_CORS_ORIGINS", raising=False)
+    assert cors_origins() == list(DEFAULT_CORS_ORIGINS)
+    for disabled in ("", "  ", " , "):
+        monkeypatch.setenv("OCEANUM_MCP_CORS_ORIGINS", disabled)
+        assert cors_origins() == []
+    monkeypatch.setenv(
+        "OCEANUM_MCP_CORS_ORIGINS", "https://A.example.com, http://localhost:6274"
+    )
+    assert cors_origins() == ["https://a.example.com", "http://localhost:6274"]
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        "*",
+        "https://*",
+        "https://*.io",  # wildcard over a whole TLD
+        "https://*.*.example.com",
+        "https://foo.*.example.com",
+        "https://example.com/",
+        "https://example.com/path",
+        "example.com",
+        "ftp://example.com",
+        "https://exa mple.com",
+        "https://-x.example.com",  # label may not start with "-"
+        "https://x-.example.com",  # ...or end with it
+        "https://example.com:0",
+        "https://example.com:99999",
+    ],
+)
+def test_cors_origins_rejects_malformed(monkeypatch, bad):
+    from oceanum_mcp.common.config import cors_origins
+
+    monkeypatch.setenv("OCEANUM_MCP_CORS_ORIGINS", bad)
+    with pytest.raises(ValueError, match="OCEANUM_MCP_CORS_ORIGINS"):
+        cors_origins()
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+async def test_cors_preflight_covers_stream_and_session_methods(method):
+    """GET (server event stream) and DELETE (end session) preflight too."""
+    async with factory_client() as client:
+        resp = await client.options(
+            "/datamesh",
+            headers={
+                "Origin": "https://app.oceanum.io",
+                "Access-Control-Request-Method": method,
+                "Access-Control-Request-Headers": "mcp-session-id",
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == "https://app.oceanum.io"
+
+
+async def test_cors_wildcard_with_port_and_default_port_entries():
+    """A wildcard entry keeps its port; a scheme-default port is dropped so
+    it matches the port-less Origin a browser actually sends."""
+    env = {
+        "OCEANUM_MCP_CORS_ORIGINS": "https://*.corp.test:8443,https://app.example.com:443"
+    }
+    async with factory_client(**env) as client:
+        wild = await _preflight(client, "https://x.corp.test:8443")
+        wild_no_port = await _preflight(client, "https://x.corp.test")
+        default_port = await _preflight(client, "https://app.example.com")
+    assert wild.headers["access-control-allow-origin"] == "https://x.corp.test:8443"
+    assert "access-control-allow-origin" not in wild_no_port.headers
+    assert (
+        default_port.headers["access-control-allow-origin"] == "https://app.example.com"
+    )
+
+
+def test_cors_origins_drops_default_ports(monkeypatch):
+    from oceanum_mcp.common.config import cors_origins
+
+    monkeypatch.setenv(
+        "OCEANUM_MCP_CORS_ORIGINS",
+        "https://a.example.com:443,http://b.example.com:80,https://c.example.com:80",
+    )
+    assert cors_origins() == [
+        "https://a.example.com",
+        "http://b.example.com",
+        "https://c.example.com:80",
+    ]
+
+
+def test_cors_origin_regex_covers_only_wildcards():
+    """Exact origins go to Starlette's allow_origins membership check; the
+    regex is built from wildcard entries alone (None when there are none)."""
+    import re
+
+    from oceanum_mcp.app import cors_origin_regex
+
+    assert cors_origin_regex(["https://vscode.dev"]) is None
+    pattern = re.compile(
+        cors_origin_regex(["https://vscode.dev", "https://*.oceanum.io"])
+    )
+    assert pattern.fullmatch("https://app.oceanum.io")
+    assert not pattern.fullmatch("https://vscode.dev")
+    assert not pattern.fullmatch("https://a.b.oceanum.io")
+    assert not pattern.fullmatch("https://appxoceanum.io")
