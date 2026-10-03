@@ -314,8 +314,7 @@ def _build_query(
         )
     if (time_resolution or time_resample) and (times or not (time_start or time_end)):
         raise ToolError(
-            "time_resolution/time_resample apply only to a time_start/time_end "
-            "range."
+            "time_resolution/time_resample apply only to a time_start/time_end range."
         )
     if times:
         q["timefilter"] = {"type": "series", "times": times}
