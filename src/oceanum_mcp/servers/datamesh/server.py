@@ -14,6 +14,7 @@ Error conventions:
 from __future__ import annotations
 
 import gc
+import inspect
 import math
 import os
 import re
@@ -1478,21 +1479,32 @@ def _write_netcdf(data: xr.Dataset, path: Path) -> None:
     raise _ExportCancelled("export cancelled")
 
 
+_GENERATOR_FLAGS = (
+    inspect.CO_GENERATOR
+    | inspect.CO_COROUTINE
+    | inspect.CO_ASYNC_GENERATOR
+    | inspect.CO_ITERABLE_COROUTINE
+)
+
+
 def _release_frames(tb: TracebackType | None) -> None:
     """traceback.clear_frames, extended to each frame's callers.
 
     A dask chunk task's exception keeps the worker thread's frames alive
     through f_back, and those frames' locals reference the write graph. The
     traceback keeps its file and line entries; only locals are dropped.
-    Frames still executing (this thread's callers) are skipped.
+    Frames still executing (this thread's callers) are skipped, as are
+    generator and coroutine frames: before Python 3.13, clearing a suspended
+    one closes its generator, which may belong to another thread's loop.
     """
     while tb is not None:
         frame: FrameType | None = tb.tb_frame
         while frame is not None:
-            try:
-                frame.clear()
-            except RuntimeError:  # still executing
-                pass
+            if not frame.f_code.co_flags & _GENERATOR_FLAGS:
+                try:
+                    frame.clear()
+                except RuntimeError:  # still executing
+                    pass
             frame = frame.f_back
         tb = tb.tb_next
 
