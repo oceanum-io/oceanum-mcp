@@ -14,6 +14,14 @@ DEFAULT_MAX_INLINE_BYTES = 50_000_000
 # of a within-budget tabular result is shown at once.
 DEFAULT_MAX_INLINE_ROWS = 100
 
+# Default cap, in seconds, on how long a Datamesh staging/query request may sit
+# waiting for the gateway (OCE-294). The oceanum SDK waits up to 900 s per
+# attempt and retries a timed-out request up to 8 times, holding a server
+# worker thread throughout. Normal stages answer in seconds; 120 s leaves wide
+# headroom for heavy but legitimate stages while freeing the thread 7.5x
+# sooner than one SDK attempt would. Raise it for unusually heavy queries.
+DEFAULT_STAGE_TIMEOUT_S = 120.0
+
 # Transport the current process was started with. Set by the CLI before the
 # server modules are imported (they are imported lazily), so import-time
 # decisions like disabling local-filesystem tools in http mode can key off it.
@@ -84,6 +92,30 @@ def max_inline_rows() -> int:
     if rows < 1:
         raise ValueError(f"OCEANUM_MCP_MAX_INLINE_ROWS must be at least 1, got {rows}")
     return rows
+
+
+def stage_timeout() -> float:
+    """Seconds a Datamesh staging/query request may wait on the gateway.
+
+    From OCEANUM_MCP_STAGE_TIMEOUT. It is a read timeout: the longest the
+    gateway may stay silent on the socket, not a cap on total transfer time.
+    Must be a positive number; fails fast on anything else.
+    """
+    raw = os.environ.get("OCEANUM_MCP_STAGE_TIMEOUT")
+    if not raw:
+        return DEFAULT_STAGE_TIMEOUT_S
+    try:
+        seconds = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"OCEANUM_MCP_STAGE_TIMEOUT must be a number of seconds, got {raw!r}"
+        ) from exc
+    if not 0 < seconds < float("inf"):
+        raise ValueError(
+            f"OCEANUM_MCP_STAGE_TIMEOUT must be a positive number of seconds, "
+            f"got {raw!r}"
+        )
+    return seconds
 
 
 def export_dir() -> Path | None:
