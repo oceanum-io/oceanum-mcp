@@ -19,7 +19,7 @@ import shutil
 import threading
 import uuid
 import warnings as _warnings
-from contextlib import contextmanager, suppress
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -863,13 +863,15 @@ def _flat_frame_bytes(ds: xr.Dataset) -> int:
     return rows * cols * 8
 
 
-def _flatten_rejection(nbytes: int, fmt: str) -> ToolError:
-    return ToolError(
+def _flatten_refusal(stage: Stage, nbytes: int, fmt: str, query: Query) -> str:
+    return _refusal(
+        stage,
         f"This query returns a gridded dataset of about {human_bytes(nbytes)} "
         f"as a table, too large to flatten to {fmt} (limit "
         f"{human_bytes(MAX_EXPORT_FRAME_BYTES)}). Use format='netcdf', or "
         "narrow the query (e.g. a point geofilter_feature, fewer variables, a "
-        "shorter time range)."
+        "shorter time range).",
+        query=_query_echo(query),
     )
 
 
@@ -882,11 +884,20 @@ def _disk_refusal(
     starts (OCE-296). Probes the nearest existing ancestor, since the
     destination directory may not exist yet. An existing file being
     overwritten is not credited: the new file is written alongside it first.
+    Returns error JSON if free space cannot be determined.
     """
-    probe = dest.parent
-    while not probe.exists():
-        probe = probe.parent
-    free = shutil.disk_usage(probe).free
+    try:
+        probe = dest.parent
+        while not probe.exists():
+            probe = probe.parent
+        free = shutil.disk_usage(probe).free
+    except OSError as exc:
+        return to_json(
+            {
+                "error": f"Could not check free disk space for {dest}: {exc}",
+                "query": _query_echo(query),
+            }
+        )
     needed = int(nbytes * _EXPORT_DISK_FACTOR[fmt])
     if needed <= free:
         return None
@@ -999,7 +1010,7 @@ def export_query(
             # Cheap pre-download bound; the flattened size is checked again
             # from the lazy structure once it is open.
             if fmt != "netcdf" and stage.size > MAX_EXPORT_FRAME_BYTES:
-                raise _flatten_rejection(stage.size, fmt)
+                return _flatten_refusal(stage, stage.size, fmt, query)
             if stage.size > MAX_EXPORT_DATASET_BYTES:
                 return _refusal(
                     stage,
@@ -1051,7 +1062,7 @@ def export_query(
         # yet) before materializing it in memory.
         flat_bytes = _flat_frame_bytes(data)
         if flat_bytes > MAX_EXPORT_FRAME_BYTES:
-            raise _flatten_rejection(flat_bytes, fmt)
+            return _flatten_refusal(stage, flat_bytes, fmt, query)
         refusal = _disk_refusal(stage, dest, fmt, flat_bytes, query)
         if refusal is not None:
             return refusal
@@ -1061,13 +1072,16 @@ def export_query(
         except (*_DATAMESH_ERRORS, OSError) as exc:
             return to_json({"error": str(exc), "query": _query_echo(query)})
 
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    # Write to a sibling temp file and rename it into place on success, so a
-    # failure never leaves a partial file at dest nor destroys a file being
-    # overwritten.
-    tmp = dest.with_name(f".{dest.name}.{uuid.uuid4().hex[:8]}.partial")
-    written = False
+    # Write into a private sibling directory under dest's own file name, then
+    # rename into place on success: a failure never leaves a partial file at
+    # dest nor destroys a file being overwritten, and pandas/xarray still see
+    # the real name, from which they infer compression (out.csv.gz) and the
+    # archive member name (out.csv.zip).
+    tmp_dir = dest.with_name(f".{dest.name}.{uuid.uuid4().hex[:8]}.partial")
+    tmp = tmp_dir / dest.name
     try:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        tmp_dir.mkdir()
         if fmt == "netcdf":
             data.to_netcdf(tmp)
         elif fmt == "parquet":
@@ -1075,7 +1089,6 @@ def export_query(
         else:
             data.to_csv(tmp, index=False)
         os.replace(tmp, dest)
-        written = True
     except (*_DATAMESH_ERRORS, OSError) as exc:
         return to_json(
             {
@@ -1084,12 +1097,10 @@ def export_query(
             }
         )
     finally:
-        if not written:
-            # Any failure (zarr chunk fetch, disk, an unexpected exception,
-            # KeyboardInterrupt) leaves a partial temp file. Suppress unlink
-            # errors so they never mask the original failure.
-            with suppress(OSError):
-                tmp.unlink(missing_ok=True)
+        # Any failure (zarr chunk fetch, disk, an unexpected exception,
+        # KeyboardInterrupt) leaves a partial file in tmp_dir; on success it is
+        # empty. Ignore removal errors so they never mask the original failure.
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     summary = summarize_data(data, max_rows=0, warnings=warnings)
     return to_json(
