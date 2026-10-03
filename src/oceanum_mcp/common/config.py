@@ -61,8 +61,7 @@ def max_inline_bytes() -> int:
         return int(raw)
     except ValueError as exc:
         raise ValueError(
-            f"OCEANUM_MCP_MAX_INLINE_BYTES must be an integer byte count, "
-            f"got {raw!r}"
+            f"OCEANUM_MCP_MAX_INLINE_BYTES must be an integer byte count, got {raw!r}"
         ) from exc
 
 
@@ -124,8 +123,7 @@ def auth_mode() -> str:
     mode = os.environ.get("OCEANUM_MCP_AUTH", "auto").strip().lower()
     if mode not in ("auto", "datamesh", "auth0", "none"):
         raise ValueError(
-            f"OCEANUM_MCP_AUTH must be one of auto, datamesh, auth0, none; "
-            f"got {mode!r}"
+            f"OCEANUM_MCP_AUTH must be one of auto, datamesh, auth0, none; got {mode!r}"
         )
     return mode
 
