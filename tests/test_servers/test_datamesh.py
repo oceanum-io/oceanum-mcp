@@ -3,6 +3,7 @@
 import importlib
 import json
 import warnings
+import zipfile
 from unittest.mock import MagicMock, patch
 
 import numpy as np
@@ -225,6 +226,55 @@ class TestStageQuery:
         parsed = json.loads(server.stage_query(datasource_id="test-ds"))
         assert "export_query" in parsed["recommendation"]
 
+    def test_below_large_threshold_keeps_export_wording(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(
+            Container.Dataset, size=server.LARGE_EXPORT_BYTES
+        )
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "write the full result to a file" in rec
+        assert "ask the user" not in rec
+
+    def test_large_result_leads_with_narrowing_and_disk_cost(
+        self, mock_conn, mock_stage
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=7_300_000_000)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert rec.index("Narrow") < rec.index("export_query")
+        for lever in ("time", "bbox", "variables", "time_resolution", "aggregation"):
+            assert lever in rec
+        assert "7.3 GB" in rec
+        assert "to the user's disk" in rec
+        assert "ask the user before exporting" in rec
+
+    def test_large_result_above_local_cap_says_export_refused(
+        self, mock_conn, mock_stage
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=73_000_000_000)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "73.0 GB" in rec
+        assert "refuse" in rec
+        assert rec.index("Narrow") < rec.index("export_query")
+
+    def test_large_result_on_hosted_mentions_download_not_disk(
+        self, mock_conn, mock_stage
+    ):
+        from oceanum_mcp.common.config import set_transport
+
+        mock_stage.return_value = make_stage(Container.Dataset, size=73_000_000_000)
+        try:
+            set_transport("http")
+            rec = json.loads(server.stage_query(datasource_id="test-ds"))[
+                "recommendation"
+            ]
+        finally:
+            set_transport("stdio")
+        assert "73.0 GB download" in rec
+        assert "ask the user before exporting" in rec
+        assert "refuse" not in rec
+
     def test_row_cap_warning(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(
             Container.DataFrame, size=10**9, dlen=3_000_000
@@ -397,15 +447,171 @@ class TestExportQuery:
         assert parsed["format"] == "netcdf"
         assert mock_conn.query.call_args.kwargs["use_dask"] is True
 
-    def test_dataset_rejects_csv(self, mock_conn, mock_stage, tmp_path):
+    @pytest.mark.parametrize("fmt", ["csv", "parquet"])
+    def test_point_series_dataset_exports_tabular(
+        self, mock_conn, mock_stage, tmp_path, fmt
+    ):
         mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = _small_dataset()
+        dest = tmp_path / f"out.{fmt}"
 
-        with pytest.raises(ToolError, match="netcdf"):
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest), format=fmt)
+        )
+        assert parsed["format"] == fmt
+        df = pd.read_csv(dest) if fmt == "csv" else pd.read_parquet(dest)
+        assert list(df.columns) == ["time", "hs"]
+        assert df["hs"].tolist() == [1.0, 2.0, 3.0]
+
+    def test_flattened_size_checked_not_just_staged_size(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        # 3x4 float32 grid: 48 bytes staged, but flattening repeats both
+        # coordinates on every row (12 rows x 3 cols x 8 bytes = 288).
+        grid = xr.Dataset(
+            {"v": (("t", "x"), np.zeros((3, 4), dtype="float32"))},
+            coords={"t": [0, 1, 2], "x": [0, 1, 2, 3]},
+        )
+        mock_stage.return_value = make_stage(Container.Dataset, size=48)
+        mock_conn.query.return_value = grid
+        dest = tmp_path / "out.csv"
+
+        with patch.object(server, "MAX_EXPORT_FRAME_BYTES", 100):
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds", path=str(dest), format="csv"
+                )
+            )
+        assert parsed["refused"] is True
+        assert "too large to flatten" in parsed["message"]
+        assert not dest.exists()
+
+    def test_flatten_fetch_error_is_structured(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        lazy = MagicMock()
+        lazy.sizes = {"time": 3}
+        lazy.dims = {"time": 3}
+        lazy.data_vars = {"hs": None}
+        lazy.coords = {"time": None}
+        lazy.to_dataframe.side_effect = DatameshConnectError("chunk fetch failed")
+        mock_conn.query.return_value = lazy
+        dest = tmp_path / "out.parquet"
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds", path=str(dest), format="parquet"
+            )
+        )
+        assert "chunk fetch failed" in parsed["error"]
+        assert not dest.exists()
+
+    def test_large_gridded_dataset_rejects_csv(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(
+            Container.Dataset, size=server.MAX_EXPORT_FRAME_BYTES + 1
+        )
+
+        parsed = json.loads(
             server.export_query(
                 datasource_id="test-ds",
                 path=str(tmp_path / "out.csv"),
                 format="csv",
             )
+        )
+        assert parsed["refused"] is True
+        assert "gridded" in parsed["message"]
+        assert "too large" in parsed["message"]
+        assert "netcdf" in parsed["message"]
+        mock_conn.query.assert_not_called()
+
+    def test_dataset_above_local_cap_refused(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(
+            Container.Dataset, size=server.MAX_EXPORT_DATASET_BYTES + 1
+        )
+        dest = tmp_path / "out.nc"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        )
+        assert parsed["refused"] is True
+        assert "Narrow" in parsed["message"]
+        assert not dest.exists()
+        mock_conn.query.assert_not_called()
+
+    def test_insufficient_disk_refused(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=500_000_000)
+        dest = tmp_path / "sub" / "out.nc"
+
+        usage = MagicMock(free=400_000_000)
+        with patch.object(server.shutil, "disk_usage", return_value=usage) as du:
+            parsed = json.loads(
+                server.export_query(datasource_id="test-ds", path=str(dest))
+            )
+        # Probed on the nearest existing ancestor of a not-yet-created dir.
+        assert du.call_args.args[0] == tmp_path
+        assert parsed["refused"] is True
+        assert "free" in parsed["message"]
+        assert not dest.exists()
+        mock_conn.query.assert_not_called()
+
+    def test_disk_check_failure_is_structured(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        dest = tmp_path / "out.nc"
+
+        with patch.object(
+            server.shutil, "disk_usage", side_effect=PermissionError("denied")
+        ):
+            parsed = json.loads(
+                server.export_query(datasource_id="test-ds", path=str(dest))
+            )
+        assert "free disk space" in parsed["error"]
+        assert "denied" in parsed["error"]
+        assert parsed["query"]["datasource"] == "test-ds"
+        assert not dest.exists()
+        mock_conn.query.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("suffix", "magic"),
+        [
+            (".csv.gz", b"\x1f\x8b"),
+            (".csv.bz2", b"BZh"),
+            (".csv.xz", b"\xfd7zXZ\x00"),
+            (".csv.zip", b"PK\x03\x04"),
+        ],
+    )
+    def test_csv_compression_inferred_from_destination(
+        self, mock_conn, mock_stage, tmp_path, suffix, magic
+    ):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"temp": [15.0, 16.0]})
+        dest = tmp_path / f"out{suffix}"
+
+        server.export_query(datasource_id="test-ds", path=str(dest), format="csv")
+        assert dest.read_bytes().startswith(magic)
+        assert pd.read_csv(dest)["temp"].tolist() == [15.0, 16.0]
+        if suffix == ".csv.zip":
+            # The archive member is named after the destination, not a temp.
+            with zipfile.ZipFile(dest) as zf:
+                assert zf.namelist() == ["out.csv"]
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_parquet_and_netcdf_written_in_their_formats(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"temp": [15.0]})
+        pq = tmp_path / "out.parquet"
+        server.export_query(datasource_id="test-ds", path=str(pq))
+        assert pq.read_bytes()[:4] == b"PAR1"
+        assert pd.read_parquet(pq)["temp"].tolist() == [15.0]
+
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = _small_dataset()
+        nc = tmp_path / "out.nc"
+        server.export_query(datasource_id="test-ds", path=str(nc))
+        assert nc.read_bytes()[:4] in (b"\x89HDF", b"CDF\x01", b"CDF\x02")
+        with xr.open_dataset(nc) as ds:
+            assert ds["hs"].values.tolist() == [1.0, 2.0, 3.0]
+        assert sorted(tmp_path.iterdir()) == [nc, pq]
 
     def test_path_required_on_stdio(self, mock_conn, mock_stage):
         with pytest.raises(ToolError, match="path is required"):
@@ -452,6 +658,46 @@ class TestExportQuery:
         )
         assert "chunk fetch failed" in parsed["error"]
         assert not dest.exists()
+
+    @pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt])
+    def test_unexpected_failure_mid_write_removes_partial_file(
+        self, mock_conn, mock_stage, tmp_path, exc_type
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        dest = tmp_path / "out.nc"
+
+        def _partial_write(path):
+            path.write_bytes(b"partial")
+            raise exc_type("interrupted")
+
+        broken = MagicMock()
+        broken.to_netcdf.side_effect = _partial_write
+        mock_conn.query.return_value = broken
+
+        with pytest.raises(exc_type):
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []  # no temp file left behind
+
+    def test_failed_overwrite_keeps_original_file(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        dest = tmp_path / "out.nc"
+        dest.write_bytes(b"original")
+
+        def _partial_write(path):
+            path.write_bytes(b"partial")
+            raise KeyboardInterrupt
+
+        broken = MagicMock()
+        broken.to_netcdf.side_effect = _partial_write
+        mock_conn.query.return_value = broken
+
+        with pytest.raises(KeyboardInterrupt):
+            server.export_query(datasource_id="test-ds", path=str(dest), overwrite=True)
+        assert dest.read_bytes() == b"original"
+        assert list(tmp_path.iterdir()) == [dest]
 
     def test_export_dir_confinement(self, mock_conn, mock_stage, tmp_path, monkeypatch):
         monkeypatch.setenv("OCEANUM_MCP_EXPORT_DIR", str(tmp_path / "allowed"))
