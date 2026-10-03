@@ -241,6 +241,14 @@ code reads directly.
 Search the Datamesh catalog with optional text search, time range, and bounding box filters.
 Returns a JSON object with `count` and `results`; if `count` equals `limit`, more matches may exist.
 
+By default each result is a compact summary: `id`, `name`, a `description`
+cut to 200 characters, `tstart`/`tend`, `bounds`, variable names when the
+catalog provides them (first 20, with `variables_total`), and short `tags`
+(with `tags_total`). `detail="full"` returns each datasource's complete
+catalog record instead. The total output is bounded (~30k characters for
+summaries, ~100k for full records): matches beyond the bound are dropped,
+counted in `omitted`, and a note asks to refine the search.
+
 | Parameter    | Type        | Description                                      |
 | ------------ | ----------- | ------------------------------------------------ |
 | `search`     | string      | Text search for name, description, or tags       |
@@ -248,14 +256,27 @@ Returns a JSON object with `count` and `results`; if `count` equals `limit`, mor
 | `time_end`   | string      | ISO 8601 end time                                |
 | `bbox`       | list[float] | Bounding box `[xmin, ymin, xmax, ymax]` in WGS84 |
 | `limit`      | int         | Max results to return (default 20)               |
+| `detail`     | string      | `summary` (default) or `full`                    |
 
 ### `get_datasource_info`
 
-Get full metadata for a datasource including schema, variables, coordinates, and attributes.
+Get the metadata for a datasource: coverage, schema dims and coordinates,
+variables, and attributes.
 
-| Parameter       | Type   | Description   |
-| --------------- | ------ | ------------- |
-| `datasource_id` | string | Datasource ID |
+The default (`detail="summary"`) is a bounded view with the same fields and
+shape as the full record. Each variable and coordinate keeps its `dims`,
+`shape`, `dtype` and `units`/`long_name`/`standard_name`; other attributes are
+capped at 8 per variable (with `attrs_omitted`), global `attributes` and
+`info` at 25 entries, and long values are clipped to 200 characters.
+Variables beyond the first 100 are listed by name only (`more_variables`,
+`variables_total`), and `schema.data_vars`/`schema.attrs` are omitted as
+duplicates of `variables`/`attributes`. `detail="full"` returns the complete
+record.
+
+| Parameter       | Type   | Description                   |
+| --------------- | ------ | ----------------------------- |
+| `datasource_id` | string | Datasource ID                 |
+| `detail`        | string | `summary` (default) or `full` |
 
 ### `stage_query`
 
