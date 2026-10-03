@@ -237,6 +237,13 @@ def _build_query(
     limit: int | None = None,
 ) -> Query:
     """Build a validated Datamesh Query from flat tool parameters."""
+    # Some MCP clients send "null" or "" for omitted optional params. Only the
+    # str-typed ones can carry them this far (schema validation rejects them
+    # for typed params), so normalise just those; datasource_id is untouched.
+    time_start, time_end, time_resolution, crs = (
+        None if v in ("null", "") else v
+        for v in (time_start, time_end, time_resolution, crs)
+    )
     q: dict[str, Any] = {"datasource": datasource_id}
 
     if variables:
