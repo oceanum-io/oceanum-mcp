@@ -15,19 +15,26 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import threading
+import time
 import uuid
 import warnings as _warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
+from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
 import numpy as np
 import pandas as pd
+import requests
 import xarray as xr
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
+from pandas.tseries.frequencies import to_offset
+from urllib3.exceptions import ReadTimeoutError
 
 from oceanum.datamesh import Connector
 from oceanum.datamesh.exceptions import (
@@ -48,6 +55,7 @@ from oceanum_mcp.common.config import (
     is_network_transport,
     is_read_only,
     max_inline_bytes,
+    stage_timeout,
 )
 from oceanum_mcp.common.formatting import (
     export_clause,
@@ -150,6 +158,134 @@ def _captured_warnings(collected: list[str]) -> Iterator[None]:
         collected.extend(str(w.message) for w in caught)
 
 
+class GatewayTimeout(DatameshConnectError):
+    """A Datamesh request exceeded OCEANUM_MCP_STAGE_TIMEOUT (OCE-294).
+
+    Subclasses DatameshConnectError so the tools' existing runtime-error path
+    reports it as {"error": ..., "query": ...}. Deliberately NOT a
+    requests.RequestException: the SDK's retried_request retries those (up to
+    8 attempts), which would multiply the wait instead of ending it.
+    """
+
+
+@dataclass(frozen=True)
+class _TimeoutBudget:
+    """The OCEANUM_MCP_STAGE_TIMEOUT budget of one bounded block."""
+
+    cap: float
+    deadline: float  # time.monotonic() value
+    message: str
+
+
+# Budget for gateway requests made by the current tool call. FastMCP runs each
+# sync tool call in its own worker thread, so the context variable scopes the
+# budget to one call even though connectors are shared between calls.
+_TIMEOUT_BUDGET: ContextVar[_TimeoutBudget | None] = ContextVar(
+    "_TIMEOUT_BUDGET", default=None
+)
+_CAP_INSTALL_LOCK = threading.Lock()
+
+
+def _is_read_timeout(exc: requests.RequestException) -> bool:
+    """True for a read timeout, whether raised before the response headers
+    (ReadTimeout) or while reading the body (requests wraps that in a
+    ConnectionError around urllib3's ReadTimeoutError)."""
+    if isinstance(exc, requests.ReadTimeout):
+        return True
+    return bool(exc.args) and isinstance(exc.args[0], ReadTimeoutError)
+
+
+class _CappedHTTPSession:
+    """Wraps a Connector's HTTPSession to bound long requests inside
+    _gateway_timeout().
+
+    The oceanum SDK sends stage and query requests with a 900 s read timeout
+    and retries a failed request up to 8 times (sleeping 30 s after each 502).
+    Inside _gateway_timeout(), a request whose SDK read timeout exceeds the
+    cap gets the time left before the block's deadline as its read timeout
+    (requests closes the socket when it fires), and the timeout, or a retry
+    attempted after the deadline, raises GatewayTimeout, which the SDK does
+    not retry. Requests with a shorter SDK timeout (session acquire/close)
+    and requests outside the block pass through untouched.
+    """
+
+    def __init__(self, inner: Any) -> None:
+        self._inner = inner
+
+    def __getattr__(self, name: str) -> Any:
+        # Read _inner via __dict__: during copy/unpickle it is not set yet,
+        # and self._inner would recurse back into __getattr__.
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
+
+    def request(self, method: str, url: str, *args: Any, **kwargs: Any) -> Any:
+        budget = _TIMEOUT_BUDGET.get()
+        if budget is None:
+            return self._inner.request(method, url, *args, **kwargs)
+        timeout = kwargs.get("timeout")
+        connect, read = timeout if isinstance(timeout, tuple) else (timeout, timeout)
+        if read is not None and read < budget.cap:
+            # A short request (e.g. session acquire/close): the SDK's own
+            # timeout and retries already bound it.
+            return self._inner.request(method, url, *args, **kwargs)
+        remaining = budget.deadline - time.monotonic()
+        if remaining <= 0:
+            raise GatewayTimeout(budget.message)
+        kwargs["timeout"] = (connect, remaining)
+        try:
+            return self._inner.request(method, url, *args, **kwargs)
+        except requests.RequestException as exc:
+            if not _is_read_timeout(exc):
+                raise
+            raise GatewayTimeout(budget.message) from exc
+
+
+@contextmanager
+def _gateway_timeout(
+    conn: Connector,
+    what: str,
+    hint: str = "The stage may be cold or slow: retrying once may succeed. If "
+    "it times out again, narrow the query (shorter time range, smaller bbox, "
+    "fewer variables) or use a coarser time_resolution",
+) -> Iterator[None]:
+    """Bound the long gateway requests `conn` makes in this block (OCE-294).
+
+    Requests the SDK sends with a read timeout at or above
+    OCEANUM_MCP_STAGE_TIMEOUT (stage, download stage, query, load) share a
+    deadline of that many seconds from entering the block: each waits at most
+    the time left, and the SDK's retries stop once it has passed. On expiry
+    the HTTP socket is closed and GatewayTimeout raised, freeing this worker
+    thread within about the timeout (plus at most one in-flight 30 s SDK
+    back-off after a 502). The deadline is checked when a request starts and
+    by the read timeout, so a response that keeps trickling bytes is only
+    bounded by inactivity. Whatever the gateway was computing is not
+    cancelled by this server: whether it stops when the client disconnects
+    is up to the gateway. Session acquire/close go through the same session:
+    while the timeout is above their SDK read timeout (DATAMESH_READ_TIMEOUT,
+    10 s by default) they pass through untouched; with a lower timeout they
+    are capped and count against the deadline like any other request. Lazy
+    zarr chunk reads use their own session and are not bounded here.
+    """
+    cap = stage_timeout()
+    with _CAP_INSTALL_LOCK:
+        # Connectors are cached and shared across calls: wrap each one once.
+        if not isinstance(conn.http_session, _CappedHTTPSession):
+            conn.http_session = _CappedHTTPSession(conn.http_session)
+    budget = _TimeoutBudget(
+        cap=cap,
+        deadline=time.monotonic() + cap,
+        message=f"Datamesh {what} timed out after {cap:g}s. {hint}. (Server "
+        "operators can raise this limit with OCEANUM_MCP_STAGE_TIMEOUT.)",
+    )
+    token = _TIMEOUT_BUDGET.set(budget)
+    try:
+        yield
+    finally:
+        _TIMEOUT_BUDGET.reset(token)
+
+
 def _stage(conn: Connector, query: Query) -> Stage | None:
     """Stage a query on the Datamesh gateway without downloading data.
 
@@ -158,10 +294,14 @@ def _stage(conn: Connector, query: Query) -> Stage | None:
     oceanum grows a public Connector.stage() (and a way to execute a query
     from an existing stage), switch to it: that also removes the second
     staging round-trip conn.query() currently performs internally.
+
+    Bounded by OCEANUM_MCP_STAGE_TIMEOUT (see _gateway_timeout): raises
+    GatewayTimeout instead of waiting out the SDK's 900 s x retries.
     """
     session = Session.acquire(conn)
     try:
-        return conn._stage_request(query, session)
+        with _gateway_timeout(conn, "staging"):
+            return conn._stage_request(query, session)
     except AttributeError as exc:  # private API drift within the 1.x pin
         raise ToolError(
             "The installed oceanum version no longer exposes the staging "
@@ -179,19 +319,22 @@ def _download_stage(conn: Connector, query: Query) -> dict[str, Any] | None:
     library does not wrap. The response carries a self-authenticating signed
     `url` (append `&f=<format>` to pick a format), plus `formats`, `size`, and
     `container`. Mirrors Connector._stage_request's auth/error handling.
-    Returns None when no data matches (HTTP 204).
+    Returns None when no data matches (HTTP 204). Bounded by
+    OCEANUM_MCP_STAGE_TIMEOUT like _stage.
     """
     session = Session.acquire(conn)
     try:
-        resp = conn._retried_request(
-            f"{conn._gateway}/oceanql/download/",
-            method="POST",
-            headers=session.header,
-            data=query.model_dump_json(warnings=False),
-            # Match _stage_request's long read timeout: preparing a download
-            # stage for a large export can far exceed the 10s default.
-            timeout=(DATAMESH_CONNECT_TIMEOUT, DATAMESH_STAGE_READ_TIMEOUT),
-        )
+        with _gateway_timeout(conn, "download staging"):
+            resp = conn._retried_request(
+                f"{conn._gateway}/oceanql/download/",
+                method="POST",
+                headers=session.header,
+                data=query.model_dump_json(warnings=False),
+                # Match _stage_request's long read timeout: preparing a
+                # download stage for a large export can far exceed the 10s
+                # default. _gateway_timeout caps it at the stage timeout.
+                timeout=(DATAMESH_CONNECT_TIMEOUT, DATAMESH_STAGE_READ_TIMEOUT),
+            )
     except AttributeError as exc:  # private API drift within the 1.x pin
         raise ToolError(
             "The installed oceanum version no longer exposes the connection "
@@ -286,6 +429,10 @@ def _limit_result(data: Any, limit: int, coordkeys: dict[str, str]) -> tuple[Any
             name = coordkeys.get(key)
             if name in data.coords and data.coords[name].dims:
                 dims.append(data.coords[name].dims[0])
+            elif name in data.dims:
+                # A dimension without a coordinate variable (OCE-326), e.g.
+                # an ensemble member index.
+                dims.append(name)
         if not dims:
             # Stage without coordinate keys: fall back to datetime dims.
             dims = [
@@ -342,6 +489,136 @@ def _unset_sentinel(value: Any) -> Any:
     return None if value in ("null", "") else value
 
 
+# Offset types whose meaning survives the engine's lower-casing of
+# time_resolution on every pandas version (pandas 2 upper-cases unknown
+# aliases back, pandas 3 does not): fixed durations and weeks. Calendar
+# month/quarter/year and business offsets are excluded.
+_ENGINE_SAFE_OFFSETS = (pd.offsets.Tick, pd.offsets.Day, pd.offsets.Week)
+
+# Resampling finer than this estimates absurd bin counts over any real range.
+_MIN_TIME_RESOLUTION = pd.Timedelta(minutes=1)
+
+
+@contextmanager
+def _quiet_pandas_aliases() -> Iterator[None]:
+    """Silence pandas' alias-deprecation FutureWarnings (e.g. "'d' is
+    deprecated" on pandas 3) while parsing a time_resolution.
+
+    catch_warnings mutates process-global state, so it is only used when
+    _WARNINGS_LOCK is free. The lock is held by _captured_warnings for a
+    whole query, and validating a parameter must not wait behind one; when
+    it is busy the parse runs unsuppressed (a stray deprecation message is
+    harmless).
+    """
+    if not _WARNINGS_LOCK.acquire(blocking=False):
+        yield
+        return
+    try:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            yield
+    finally:
+        _WARNINGS_LOCK.release()
+
+
+# Legacy pandas aliases, matched on the alias tokens of a time_resolution
+# independently of the local pandas version (OCE-294 gate). pandas 3 removed
+# them, so they no longer parse here and would otherwise be passed through;
+# the engine lower-cases them and, on its pandas, may still parse them, e.g.
+# "1L" -> "1l" = one millisecond, the same hang as "1MS".
+# Sub-minute units, compared lower-cased: L/ms, U/us, N/ns, S/s.
+_SUB_MINUTE_ALIASES = frozenset({"l", "ms", "u", "us", "n", "ns", "s"})
+# Calendar month/quarter/year aliases, incl. legacy A/AS/Y/M/Q, anchored
+# forms (the anchor is a separate token), and business (B, CB) and
+# semi-month variants. Compared upper-cased, except that "ms" written in
+# lower case is milliseconds (handled above), not month start.
+_CALENDAR_ALIAS_RE = re.compile(r"(C?B)?[MQYA][SE]?|SM[SE]?")
+_ALIAS_TOKEN_RE = re.compile(r"[A-Za-z]+")
+
+
+def _resolution_error(
+    resolution: str, reason: Literal["calendar", "fine"]
+) -> ToolError:
+    if reason == "calendar":
+        return ToolError(
+            f"time_resolution {resolution!r} is not supported yet: Datamesh "
+            "currently lower-cases time_resolution, which changes the meaning "
+            'of calendar aliases (e.g. "1MS", month start, becomes "1ms", one '
+            "millisecond, and the query hangs). Monthly, quarterly and yearly "
+            "aliases (MS, ME, QS, YS, M, Q, Y, A, ...) are not supported until "
+            'that engine fix ships: use a fixed length instead, e.g. "30D" '
+            '(about monthly), "90D" (about quarterly) or "365D" (about yearly).'
+        )
+    return ToolError(
+        f"time_resolution {resolution!r} is finer than one minute, which "
+        "makes an enormous number of time bins over any real range. Use "
+        '"1min" or coarser (e.g. "1h", "1D"), or omit time_resolution to '
+        "get the data at its native resolution."
+    )
+
+
+def _denied_alias(resolution: str) -> Literal["calendar", "fine"] | None:
+    """Why a time_resolution uses a denylisted alias, or None.
+
+    Pandas-version independent: looks only at the alias tokens (the letters
+    after the multiplier; an anchor such as "-DEC" is a separate token).
+    """
+    for token in _ALIAS_TOKEN_RE.findall(resolution):
+        if token != "ms" and _CALENDAR_ALIAS_RE.fullmatch(token.upper()):
+            return "calendar"
+        if token.lower() in _SUB_MINUTE_ALIASES:
+            return "fine"
+    return None
+
+
+def _check_time_resolution(resolution: str) -> None:
+    """Reject time_resolution values the current Datamesh engine mishandles.
+
+    OCE-294: the engine lower-cases time_resolution before parsing it, so a
+    case-sensitive alias silently changes meaning: "1MS" (month start)
+    becomes "1ms" (one millisecond), and a year of data at 1 ms hangs the
+    stage. Other calendar aliases (ME, QS, YS, BMS, ...) work or fail
+    depending on the engine's pandas version. Until the engine fix (OCE-324)
+    is deployed, only offsets whose meaning is case-insensitive are allowed,
+    and none finer than a minute. Relax this guard once OCE-324 ships.
+
+    Legacy aliases are denylisted first (_denied_alias), so the result does
+    not depend on whether this host's pandas still parses them. Any other
+    value pandas cannot parse here is left for the engine to validate.
+    """
+    resolution = resolution.strip()
+    if resolution.lower() == "native":
+        return
+    denied = _denied_alias(resolution)
+    if denied is not None:
+        raise _resolution_error(resolution, denied)
+    with _quiet_pandas_aliases():
+        try:
+            offset = to_offset(resolution)
+        except ValueError:
+            offset = None
+        try:
+            engine_offset = to_offset(resolution.lower())
+        except ValueError:
+            engine_offset = None
+    if offset is None and engine_offset is None:
+        return
+    if engine_offset is not None and engine_offset.n <= 0:
+        raise ToolError(
+            f"time_resolution {resolution!r} must be a positive duration, "
+            'e.g. "1h", "1D" or "30D".'
+        )
+    if (offset is not None and offset != engine_offset) or not isinstance(
+        engine_offset, _ENGINE_SAFE_OFFSETS
+    ):
+        raise _resolution_error(resolution, "calendar")
+    if (
+        isinstance(engine_offset, pd.offsets.Tick)
+        and pd.Timedelta(engine_offset) < _MIN_TIME_RESOLUTION
+    ):
+        raise _resolution_error(resolution, "fine")
+
+
 def _build_query(
     datasource_id: str,
     *,
@@ -371,6 +648,9 @@ def _build_query(
     time_start = _unset_sentinel(time_start)
     time_end = _unset_sentinel(time_end)
     time_resolution = _unset_sentinel(time_resolution)
+    if isinstance(time_resolution, str):
+        # Surrounding whitespace never belongs in a pandas frequency string.
+        time_resolution = time_resolution.strip() or None
     crs = _unset_sentinel(crs)
     q: dict[str, Any] = {"datasource": datasource_id}
 
@@ -394,6 +674,7 @@ def _build_query(
             "times": [time_start, time_end],
         }
         if time_resolution:
+            _check_time_resolution(time_resolution)
             timefilter["resolution"] = time_resolution
         if time_resample:
             timefilter["resample"] = time_resample
@@ -458,7 +739,7 @@ _QUERY_PARAM_DOCS = """\
         time_start: ISO 8601 start of a time range (e.g. "2023-01-01T00:00:00Z"). Open-ended if omitted.
         time_end: ISO 8601 end of a time range. Open-ended if omitted.
         times: Discrete times to select (series selection). Mutually exclusive with time_start/time_end.
-        time_resolution: Downsample a time range server-side to this resolution (pandas frequency string, e.g. "1D", "1MS"). Drastically shrinks long time series.
+        time_resolution: Downsample a time range server-side to this resolution (pandas frequency string, e.g. "1h", "6h", "1D", "7D", or "30D" for roughly monthly). Drastically shrinks long time series. Monthly/quarterly/yearly calendar aliases (MS, ME, QS, YS) are not supported until a Datamesh engine fix ships: use "30D", "90D" or "365D". Finer than 1 minute is refused.
         time_resample: Resampling method when time_resolution is set: mean, nearest, or linear.
         bbox: Bounding box [xmin, ymin, xmax, ymax] in WGS84 (or crs units if crs is set).
         geofilter_feature: GeoJSON Feature object (Point, MultiPoint, or Polygon geometry) for spatial selection/interpolation. Mutually exclusive with bbox.
@@ -720,6 +1001,18 @@ def stage_query(
                     f"Exporting as-is makes export_query return a {size} "
                     "download; ask the user before exporting."
                 )
+        elif client_limit is not None and stage.container == Container.Dataset:
+            # OCE-326: export_query sizes a limited dataset on the sliced
+            # result, not on this unlimited stage, so it may well export it.
+            cost = (
+                f"With limit={client_limit}, export_query keeps only the last "
+                f"{client_limit} time/ensemble steps of the resampled or "
+                "aggregated result and applies the local export cap "
+                f"({human_bytes(local_cap)}) and the disk-space check to that "
+                f"slice, which can be far smaller than {size} (if the result "
+                "has no time/ensemble dimension, limit cannot shrink it); ask "
+                "the user before exporting if it is still large."
+            )
         elif stage.size > local_cap:
             cost = (
                 f"export_query will refuse it: local exports are capped at "
@@ -871,7 +1164,9 @@ def query_data(
                     query=_query_echo(query),
                     **extra,
                 )
-        with _captured_warnings(warnings):
+        # Inline results are small (or lazy), so the whole query, including
+        # the SDK's internal re-stage, is held to the stage timeout.
+        with _gateway_timeout(conn, "query"), _captured_warnings(warnings):
             data = conn.query(sent, use_dask=use_dask)
             full_records = _record_count(data)
             limit_note = None
@@ -1216,7 +1511,13 @@ def export_query(
             if refusal is not None:
                 return refusal
 
-        with _captured_warnings(warnings):
+        # A dataset's conn.query only re-stages and opens lazy zarr, so it is
+        # held to the stage timeout. A frame's downloads the whole (up to
+        # MAX_EXPORT_FRAME_BYTES) result, which can legitimately take longer
+        # to start streaming, so it keeps the SDK's timeouts; its re-stage
+        # follows the stage above, which just succeeded within the cap.
+        bound = _gateway_timeout(conn, "query") if is_dataset else nullcontext()
+        with bound, _captured_warnings(warnings):
             # Datasets stream chunk-wise from lazy zarr; frames download fully.
             data = conn.query(sent, use_dask=is_dataset)
     except _DATAMESH_ERRORS as exc:
@@ -1395,7 +1696,14 @@ def load_datasource(datasource_id: str) -> str:
                 f"filters{export_clause()}.",
                 datasource_id=datasource_id,
             )
-        with _captured_warnings(warnings):
+        bound = _gateway_timeout(
+            conn,
+            "load",
+            hint="The datasource may be cold or slow: retrying once may "
+            "succeed. If it times out again, use query_data with time/space "
+            "filters to fetch a subset",
+        )
+        with bound, _captured_warnings(warnings):
             data = conn.load_datasource(datasource_id)
     except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "datasource_id": datasource_id})

@@ -114,6 +114,7 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_MAX_INLINE_ROWS` | No       | Max rows/records previewed inline before truncation (default 100)               |
 | `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |
+| `OCEANUM_MCP_STAGE_TIMEOUT`   | No       | Seconds a Datamesh staging/query request may wait on the gateway before the tool returns a timeout error (default 120) |
 | `OCEANUM_MCP_AUTH`            | No       | Auth scheme for `--transport http`: `auto` (default), `datamesh`, `auth0`, or `none` |
 | `OCEANUM_MCP_AUTH0_DOMAIN`    | No       | Auth0 tenant domain for `auth0` mode (default: `auth.oceanum.io`)               |
 | `OCEANUM_MCP_AUTH0_AUDIENCE`  | No       | Auth0 API audience for `auth0` mode (default: `https://api.oceanum.io`)         |
@@ -303,7 +304,7 @@ refused with the staged size and alternatives. Library warnings (e.g. the
 | `time_start`           | string       | ISO 8601 start of a time range (open-ended if omitted)             |
 | `time_end`             | string       | ISO 8601 end of a time range (open-ended if omitted)               |
 | `times`                | list[string] | Discrete times (series selection); excludes `time_start`/`time_end`|
-| `time_resolution`      | string       | Server-side temporal downsampling (pandas frequency, e.g. `1D`)    |
+| `time_resolution`      | string       | Server-side temporal downsampling (pandas frequency, e.g. `1h`, `1D`, `30D`; not `MS`/`ME`/`QS`/`YS` or finer than 1 minute) |
 | `time_resample`        | string       | Resampling method for `time_resolution`: mean, nearest, linear     |
 | `bbox`                 | list[float]  | Bounding box `[xmin, ymin, xmax, ymax]`                            |
 | `geofilter_feature`    | object       | GeoJSON Feature (Point, MultiPoint, or Polygon) for selection      |
@@ -440,7 +441,7 @@ Get metadata about a file or directory.
 **Shrink a 40-year hourly time series to something inline-sized:**
 
 1. `stage_query(datasource_id="hindcast", variables=["Hs"], time_start="1984-01-01", time_end="2024-01-01")` — too large
-2. `query_data(..., time_resolution="1MS", time_resample="mean")` — monthly means, small enough to return inline
+2. `query_data(..., time_resolution="30D", time_resample="mean")` — roughly monthly means, small enough to return inline (calendar aliases such as `"1MS"` are refused until a Datamesh engine fix ships: the engine currently reads `"1MS"` as 1 millisecond)
 
 **Browse and read files in cloud storage:**
 
