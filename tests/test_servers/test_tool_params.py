@@ -16,6 +16,7 @@ import pytest
 from fastmcp import Client
 
 from oceanum_mcp.servers.datamesh import server
+from tests.test_servers.test_datamesh import _mock_catalog, _mock_datasource
 
 # Hand-enumerated from the tool signatures: params without a default. A new
 # tool, or a param gaining/losing a default, must update this table.
@@ -53,12 +54,6 @@ async def _schemas(mcp) -> dict[str, dict]:
     """Input schemas as an MCP client sees them."""
     async with Client(mcp) as client:
         return {t.name: t.inputSchema for t in await client.list_tools()}
-
-
-@pytest.fixture(autouse=True)
-def _all_tools_enabled(monkeypatch):
-    # Read-only mode hides write tools; the contract covers every tool.
-    monkeypatch.delenv("OCEANUM_MCP_READ_ONLY", raising=False)
 
 
 class TestRequiredParams:
@@ -146,3 +141,25 @@ class TestNullStringNormalisation:
         echoed = json.loads(result.content[0].text)["query"]
         assert "timefilter" not in echoed
         assert "crs" not in echoed
+
+    @pytest.mark.parametrize("sentinel", ["null", ""])
+    def test_search_catalog_ignores_sentinels(self, mock_conn, sentinel):
+        mock_conn.get_catalog.return_value = _mock_catalog([])
+
+        server.search_catalog(search=sentinel, time_start=sentinel, time_end=sentinel)
+        kwargs = mock_conn.get_catalog.call_args.kwargs
+        assert kwargs["search"] is None
+        assert kwargs["timefilter"] is None
+
+    @pytest.mark.parametrize("sentinel", ["null", ""])
+    def test_update_metadata_does_not_write_sentinels(self, mock_conn, sentinel):
+        mock_conn.update_metadata.return_value = _mock_datasource(id="my-ds")
+
+        server.update_metadata(
+            "my-ds",
+            name=sentinel,
+            description=sentinel,
+            details=sentinel,
+            tags=["kept"],
+        )
+        mock_conn.update_metadata.assert_called_once_with("my-ds", tags=["kept"])

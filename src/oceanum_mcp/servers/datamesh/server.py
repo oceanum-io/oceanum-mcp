@@ -211,6 +211,16 @@ def _resolve_export_path(path: str) -> Path:
     return dest
 
 
+def _unset_sentinel(value: Any) -> Any:
+    """None for the literal "null" or "" that some MCP clients send in place
+    of an omitted optional param.
+
+    Only str-typed params can carry these into a tool: schema validation
+    rejects them for typed params. Never apply to required params.
+    """
+    return None if value in ("null", "") else value
+
+
 def _build_query(
     datasource_id: str,
     *,
@@ -237,13 +247,10 @@ def _build_query(
     limit: int | None = None,
 ) -> Query:
     """Build a validated Datamesh Query from flat tool parameters."""
-    # Some MCP clients send "null" or "" for omitted optional params. Only the
-    # str-typed ones can carry them this far (schema validation rejects them
-    # for typed params), so normalise just those; datasource_id is untouched.
-    time_start, time_end, time_resolution, crs = (
-        None if v in ("null", "") else v
-        for v in (time_start, time_end, time_resolution, crs)
-    )
+    time_start = _unset_sentinel(time_start)
+    time_end = _unset_sentinel(time_end)
+    time_resolution = _unset_sentinel(time_resolution)
+    crs = _unset_sentinel(crs)
     q: dict[str, Any] = {"datasource": datasource_id}
 
     if variables:
@@ -377,6 +384,9 @@ def search_catalog(
     """
     if limit < 1:
         raise ToolError("limit must be at least 1.")
+    search = _unset_sentinel(search)
+    time_start = _unset_sentinel(time_start)
+    time_end = _unset_sentinel(time_end)
 
     conn = get_datamesh_connector()
 
@@ -978,6 +988,10 @@ def update_metadata(
         Updated datasource metadata.
     """
     conn = get_datamesh_connector()
+    # A "null"/"" sentinel must not overwrite live metadata.
+    name = _unset_sentinel(name)
+    description = _unset_sentinel(description)
+    details = _unset_sentinel(details)
 
     props: dict[str, Any] = {}
     if name is not None:

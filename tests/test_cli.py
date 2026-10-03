@@ -107,9 +107,12 @@ def test_stdio_runs_without_banner(monkeypatch):
     from unittest.mock import patch
 
     from oceanum_mcp import cli
+    from oceanum_mcp.common import config
 
     module = importlib.import_module(cli.SERVER_REGISTRY["datamesh"])
     monkeypatch.setattr(sys, "argv", ["oceanum-mcp", "datamesh"])
+    # main() records the transport globally; restore it afterwards.
+    monkeypatch.setattr(config, "_transport", config._transport)
     with patch.object(module.mcp, "run") as run:
         cli.main()
     run.assert_called_once_with(transport="stdio", show_banner=False)
@@ -139,15 +142,17 @@ def test_stdio_stdout_guard_routes_text_to_stderr(capsys):
     assert "stray" in err
 
 
-def test_stdio_stdout_is_pure_jsonrpc():
+def test_stdio_stdout_is_pure_jsonrpc(tmp_path):
     """End to end over a real stdio session: no banner, no stray stdout text."""
     import threading
 
+    # stderr goes to a file, not an undrained pipe the server could block on.
+    stderr_file = (tmp_path / "stderr.txt").open("w+")
     proc = subprocess.Popen(
         [sys.executable, "-c", _STDIO_SERVER_SCRIPT],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        stderr=stderr_file,
         text=True,
     )
     watchdog = threading.Timer(60, proc.kill)
@@ -162,10 +167,13 @@ def test_stdio_stdout_is_pure_jsonrpc():
             line = proc.stdout.readline()
             assert line, "server closed stdout before answering the tool call"
             messages.append(json.loads(line))  # raises on any non-JSON line
-        stdout_rest, stderr = proc.communicate()  # closes stdin -> clean exit
+        stdout_rest, _ = proc.communicate()  # closes stdin -> clean exit
     finally:
         watchdog.cancel()
         proc.kill()
+        stderr_file.seek(0)
+        stderr = stderr_file.read()
+        stderr_file.close()
 
     assert not stdout_rest.strip()
     assert all(m.get("jsonrpc") == "2.0" for m in messages)
