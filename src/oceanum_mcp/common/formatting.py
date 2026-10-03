@@ -69,8 +69,38 @@ def human_bytes(n: int | float) -> str:
     raise AssertionError("unreachable")
 
 
+def _float_value(value: np.floating) -> float | None:
+    """A JSON-safe float at full precision; NaN/inf -> None.
+
+    float64 converts exactly (json.dumps then writes its shortest round-trip
+    repr). Narrower floats (float32/float16) go through numpy's shortest repr
+    in their own precision: widening 0.1f to float64 directly would print as
+    0.10000000149011612, digits the source data never had.
+    """
+    if not np.isfinite(value):
+        return None
+    if value.dtype.itemsize < 8:
+        return float(str(value))
+    return float(value)
+
+
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    return json.loads(df.to_json(orient="records", date_format="iso"))
+    records = json.loads(df.to_json(orient="records", date_format="iso"))
+    # to_json rounds floats to 10 decimal places (5e-12 -> 0.0), and its
+    # maximum double_precision=15 is still decimal places, not significant
+    # digits (OCE-325). Keep to_json for every other dtype (ISO datetimes and
+    # durations, NaT -> null) and replace float columns with exact values.
+    # Keys are matched by position, as to_json stringifies column labels;
+    # records orient requires unique columns, so the counts match.
+    if records and len(records[0]) == df.shape[1]:
+        for key, (_, col) in zip(list(records[0]), df.items()):
+            if not pd.api.types.is_float_dtype(col.dtype):
+                continue
+            dtype = getattr(col.dtype, "numpy_dtype", col.dtype)
+            values = col.to_numpy(dtype=dtype, na_value=np.nan)
+            for rec, value in zip(records, values):
+                rec[key] = _float_value(value)
+    return records
 
 
 def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
@@ -124,6 +154,8 @@ def _scalar_value(var: xr.DataArray) -> Any:
     value = var.values[()]
     if isinstance(value, (np.datetime64, np.timedelta64)):
         return _records(pd.DataFrame({"v": [value]}))[0]["v"]
+    if isinstance(value, np.floating):
+        return _float_value(value)
     if isinstance(value, np.generic):
         value = value.item()
     if isinstance(value, float) and not math.isfinite(value):

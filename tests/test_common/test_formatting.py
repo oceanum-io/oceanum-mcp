@@ -310,3 +310,84 @@ def test_zero_d_dataset_without_variables():
     out = summarize_data(xr.Dataset(coords={"time": pd.Timestamp("2024-01-01")}))
     assert out["data"] == []
     assert (out["preview"], out["returned"], out["total"]) == (False, 1, 1)
+
+
+# --- OCE-325: inline records keep full float precision ------------------------
+
+# DataFrame.to_json rounds floats to 10 decimal places by default, and its
+# maximum (double_precision=15) is still decimal places, not significant
+# digits: 1.234567890123e-14 would come back as 1.2e-14.
+_PRECISE = [5e-12, 123456.123456789012, 1.23456789012345, 1.234567890123e-14]
+
+
+def test_frame_records_keep_full_float_precision():
+    df = pd.DataFrame({"v": _PRECISE + [np.nan, np.inf, -np.inf]})
+    out = summarize_data(df)
+    assert [r["v"] for r in out["data"]] == _PRECISE + [None, None, None]
+    # Strict JSON (no NaN/Infinity tokens), and the values survive the
+    # tool's own serialization exactly.
+    text = json.dumps(out, allow_nan=False)
+    assert [r["v"] for r in json.loads(text)["data"]] == _PRECISE + [None] * 3
+
+
+def test_dataset_records_keep_full_float_precision():
+    n = len(_PRECISE)
+    ds = xr.Dataset(
+        {"v": (("x",), np.array(_PRECISE))},
+        coords={"x": np.array(_PRECISE[::-1])},
+    )
+    data = summarize_data(ds)["data"]
+    assert [r["v"] for r in data] == _PRECISE
+    # Float coordinates are record columns too.
+    assert [r["x"] for r in data] == _PRECISE[::-1]
+    assert len(data) == n
+
+
+def test_float32_records_use_shortest_float32_repr():
+    # A float32 widened to float64 carries binary-noise digits
+    # (0.1 -> 0.10000000149011612); records use the shortest decimal that
+    # round-trips to the same float32 instead.
+    f32 = np.array([0.1, 2.5e-7, 1.2345679, 5e-12, np.nan], dtype=np.float32)
+    expected = [0.1, 2.5e-07, 1.2345679, 5e-12, None]
+    frame = summarize_data(pd.DataFrame({"v": f32}))["data"]
+    assert [r["v"] for r in frame] == expected
+    dataset = summarize_data(xr.Dataset({"v": (("x",), f32)}))["data"]
+    assert [r["v"] for r in dataset] == expected
+    for got, orig in zip(expected[:-1], f32[:-1]):
+        assert np.float32(got) == orig
+
+
+def test_zero_d_float32_uses_shortest_float32_repr():
+    ds = xr.Dataset({"v": ((), np.float32(0.1))})
+    assert summarize_data(ds)["data"] == [{"name": "v", "value": 0.1}]
+
+
+def test_nullable_float_records_keep_full_precision():
+    df = pd.DataFrame({"v": pd.array([5e-12, None], dtype="Float64")})
+    assert [r["v"] for r in summarize_data(df)["data"]] == [5e-12, None]
+
+
+def test_non_float_records_unchanged():
+    # Only float columns are re-serialized; everything else keeps the
+    # to_json conversion (ISO datetimes/durations, NaT -> null).
+    df = pd.DataFrame(
+        {
+            "t": pd.to_datetime(["2024-01-02T03:00", None]),
+            "d": pd.to_timedelta(["1h", None]),
+            "i": [7, 8],
+            "b": [True, False],
+            "s": ["a", None],
+            "f": [5e-12, 1.5],
+        }
+    )
+    assert summarize_data(df)["data"] == [
+        {
+            "t": "2024-01-02T03:00:00.000",
+            "d": "P0DT1H0M0S",
+            "i": 7,
+            "b": True,
+            "s": "a",
+            "f": 5e-12,
+        },
+        {"t": None, "d": None, "i": 8, "b": False, "s": None, "f": 1.5},
+    ]
