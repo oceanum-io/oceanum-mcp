@@ -168,6 +168,7 @@ Notes:
   time-limited, self-authenticating gateway `download_url` that the caller
   fetches out-of-band. The `path` argument is ignored on hosted servers. The
   URL needs no credential, so it is a capability — treat it as a secret.
+  Hosted exports are capped at 10 GB to bound what one link can pull.
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance
@@ -295,7 +296,16 @@ refused with the staged size and alternatives. Library warnings (e.g. the
 | `aggregate_operations` | list[string] | Aggregation ops: mean, min, max, std, sum                          |
 | `aggregate_spatial`    | bool         | Aggregate over spatial dims (default true)                         |
 | `aggregate_temporal`   | bool         | Aggregate over temporal dims (default true)                        |
-| `limit`                | int          | Max rows to return                                                 |
+| `limit`                | int          | Keep the last N records (see below)                                |
+
+`limit` keeps the last N records (Datamesh semantics: the last N steps along
+time/ensemble), with the same meaning in `stage_query`, `query_data`, and
+`export_query`. Combined with `time_resolution` or `aggregate_operations` it is
+applied by this server **after** resampling/aggregation instead of being sent
+to Datamesh (which would apply it to the native records first), so
+`stage_query` reports the unlimited size as an upper bound. Hosted
+`export_query` cannot apply it to a gateway download and refuses that
+combination: drop `limit` or narrow the time range.
 
 ### `export_query`
 
@@ -307,6 +317,9 @@ large to return inline. Behaviour depends on transport:
   write Parquet or CSV.
 - **Hosted (http/sse):** returns a time-limited, self-authenticating gateway
   `download_url` (choose `format`; `path` is ignored). Fetch it out-of-band.
+  Results above 10 GB (for CSV, the estimated text size, about 3x the staged
+  size) are refused (narrow the query); above 2 GB the link is returned with
+  a large-download warning.
 
 Accepts the same query parameters as `query_data` plus:
 
