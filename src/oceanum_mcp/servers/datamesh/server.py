@@ -52,6 +52,8 @@ from oceanum_mcp.common.config import (
 from oceanum_mcp.common.formatting import (
     export_clause,
     format_datasource,
+    format_datasource_bounded,
+    format_datasource_summary,
     human_bytes,
     summarize_data,
     to_json,
@@ -446,6 +448,31 @@ _QUERY_PARAM_DOCS = """\
 # ---------------------------------------------------------------------------
 
 
+# Ceiling on the serialized results of one search_catalog call, in characters
+# (~4 per token). Matching datasources beyond it are dropped with a note to
+# refine the search. Live summaries run ~0.7 kB each (~1.2 kB with 20
+# variable names), so the default limit of 20 always fits; full records of
+# live catalog hits run ~2 kB, but a record carrying a schema can reach
+# hundreds of kB, in which case it is returned alone.
+SEARCH_BUDGET_CHARS = {"summary": 30_000, "full": 100_000}
+
+_SEARCH_HINT = (
+    "These are summaries. Call get_datasource_info(datasource_id) for one "
+    "datasource's variables (units, long names, dims), coordinates and "
+    "attributes."
+)
+
+
+def _within_budget(results: list[dict[str, Any]], budget: int) -> int:
+    """How many leading results fit in budget characters (always at least one)."""
+    used = 0
+    for n, result in enumerate(results):
+        used += len(to_json(result))
+        if n and used > budget:
+            return n
+    return len(results)
+
+
 @mcp.tool(annotations=READ_TOOL)
 def search_catalog(
     search: str | None = None,
@@ -453,6 +480,7 @@ def search_catalog(
     time_end: str | None = None,
     bbox: list[float] | None = None,
     limit: int = 20,
+    detail: Literal["summary", "full"] = "summary",
 ) -> str:
     """Search the Oceanum Datamesh catalog for datasets.
 
@@ -462,10 +490,13 @@ def search_catalog(
         time_end: ISO 8601 datetime for end of time range filter (e.g. "2023-12-31").
         bbox: Bounding box as [xmin, ymin, xmax, ymax] in WGS84 coordinates.
         limit: Maximum number of datasources to return (default 20, minimum 1).
+        detail: "summary" (default) returns id, name, a short description, time range, bounds, and variable names when known. "full" returns each datasource's complete catalog record; prefer get_datasource_info for one datasource's details.
 
     Returns:
-        JSON with count and matching datasources (id, name, description, time
-        range, bounds). If count equals limit, more results may exist.
+        JSON with count and matching datasources. If count equals limit, more
+        results may exist. The total output is bounded: matches beyond the
+        bound are dropped and counted in "omitted", with a note to refine the
+        search.
     """
     if limit < 1:
         raise ToolError("limit must be at least 1.")
@@ -490,34 +521,53 @@ def search_catalog(
         limit=limit,
     )
 
-    results = [format_datasource(ds) for ds in catalog if ds is not None]
-    out: dict[str, Any] = {"count": len(results), "results": results}
+    formatter = format_datasource if detail == "full" else format_datasource_summary
+    results = [formatter(ds) for ds in catalog if ds is not None]
+    shown = _within_budget(results, SEARCH_BUDGET_CHARS[detail])
+    omitted = len(results) - shown
+    out: dict[str, Any] = {"count": shown, "results": results[:shown]}
     if not results:
         out["message"] = "No datasources found matching the search criteria."
+    elif omitted:
+        out["omitted"] = omitted
+        out["note"] = (
+            f"{omitted} more results matched but are not shown, to keep this "
+            "response small; refine the search (more specific search text, a "
+            "time range, or a bbox) to see them."
+        )
     elif len(results) >= limit:
         out["note"] = (
             f"Result count equals the limit ({limit}); more matches may exist. "
             "Raise limit or refine the search."
         )
+    if results and detail == "summary":
+        out["hint"] = _SEARCH_HINT
     return to_json(out)
 
 
 @mcp.tool(annotations=READ_TOOL)
-def get_datasource_info(datasource_id: str) -> str:
-    """Get full metadata for a specific datasource.
+def get_datasource_info(
+    datasource_id: str, detail: Literal["summary", "full"] = "summary"
+) -> str:
+    """Get the metadata for one datasource: coverage, coordinates and variables.
 
-    Returns all fields including schema, coordinates, geometry, time range,
-    variables, and attributes.
+    The default view keeps every field of the full record and, per variable
+    and coordinate, its dims, shape, dtype, units, long_name and
+    standard_name; it caps attribute lists, clips long attribute values, and
+    lists only the names of variables beyond the first 100.
 
     Args:
         datasource_id: The unique ID of the datasource.
+        detail: "summary" (default) returns the bounded view described above. "full" returns the complete record, including every attribute; it can be very large.
 
     Returns:
-        Full datasource metadata as JSON.
+        Datasource metadata as JSON.
     """
     conn = get_datamesh_connector()
     ds = conn.get_datasource(datasource_id)
-    return to_json(format_datasource(ds))
+    if detail == "full":
+        return to_json(format_datasource(ds))
+    return to_json(format_datasource_bounded(ds))
 
 
 # ---------------------------------------------------------------------------

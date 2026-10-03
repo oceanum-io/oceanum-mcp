@@ -225,3 +225,150 @@ def format_datasource(ds: Any) -> dict[str, Any]:
     if ds.created:
         result["created"] = ds.created.isoformat()
     return result
+
+
+# ---------------------------------------------------------------------------
+# Compact datasource views (OCE-309)
+#
+# format_datasource above is the complete record (detail="full"). Real records
+# carry GRIB coefficient arrays, hundreds of model-parameter attributes and
+# 100+ variables, and schema.data_vars/attrs repeat variables/attributes, so
+# the full record can run to hundreds of kB per datasource.
+# ---------------------------------------------------------------------------
+
+# search_catalog summaries.
+SUMMARY_DESCRIPTION_CHARS = 200
+SUMMARY_MAX_VARIABLES = 20
+SUMMARY_TAG_CHARS = 120
+
+# get_datasource_info bounded view.
+INFO_MAX_ENTRIES = 100  # variables / coordinates shown with metadata
+INFO_MAX_EXTRA_NAMES = 400  # further variable names listed without metadata
+INFO_MAX_ATTRS = 8  # attributes per variable / coordinate
+INFO_MAX_GLOBAL_ATTRS = 25  # global attributes, and info entries
+INFO_VALUE_CHARS = 200  # longest attribute value shown before clipping
+
+# Kept first, so a capped attribute list still carries what code needs.
+_PRIORITY_ATTRS = ("units", "long_name", "standard_name")
+
+_BOUNDED_NOTE = (
+    "Bounded view: long attribute values are clipped (ending in ...), attribute "
+    "lists are capped (see *_omitted counts), and schema.data_vars/attrs are "
+    'omitted as duplicates of variables/attributes. Pass detail="full" for '
+    "the complete record."
+)
+
+
+def _clip(text: str, limit: int) -> str:
+    """text cut to limit characters, with an ellipsis when cut."""
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _clip_value(value: Any, limit: int) -> Any:
+    """An attribute value, replaced by a clipped JSON string if it is long."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return value if len(text) <= limit else _clip(text, limit)
+
+
+def _bounded_attrs(attrs: dict[str, Any], max_items: int) -> tuple[dict, int]:
+    """Up to max_items attributes (priority names first), values clipped.
+
+    Returns the kept attributes and how many were omitted.
+    """
+    keys = [k for k in _PRIORITY_ATTRS if k in attrs]
+    keys += [k for k in attrs if k not in _PRIORITY_ATTRS]
+    kept = {str(k): _clip_value(attrs[k], INFO_VALUE_CHARS) for k in keys[:max_items]}
+    return kept, len(keys) - len(kept)
+
+
+def _bounded_entry(entry: Any) -> Any:
+    """A schema variable/coordinate entry with its attributes bounded."""
+    if not isinstance(entry, dict):
+        return _clip_value(entry, INFO_VALUE_CHARS)
+    out: dict[str, Any] = {}
+    for key, value in entry.items():
+        if key == "attrs" and isinstance(value, dict):
+            out["attrs"], omitted = _bounded_attrs(value, INFO_MAX_ATTRS)
+            if omitted:
+                out["attrs_omitted"] = omitted
+        else:
+            out[key] = _clip_value(value, INFO_VALUE_CHARS)
+    return out
+
+
+def _bounded_entries(entries: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """The first INFO_MAX_ENTRIES entries bounded, plus the remaining names."""
+    names = list(entries)
+    kept = {str(n): _bounded_entry(entries[n]) for n in names[:INFO_MAX_ENTRIES]}
+    rest = [str(n) for n in names[INFO_MAX_ENTRIES:]]
+    return kept, rest
+
+
+def format_datasource_summary(ds: Any) -> dict[str, Any]:
+    """A compact search_catalog hit: identity, coverage and variable names.
+
+    Catalog hits from the gateway usually carry no schema, so variable names
+    appear only when the record includes them.
+    """
+    description = ds.description
+    if isinstance(description, str):
+        description = _clip(" ".join(description.split()), SUMMARY_DESCRIPTION_CHARS)
+    result: dict[str, Any] = {"id": ds.id, "name": ds.name, "description": description}
+    if ds.geom is not None:
+        result["bounds"] = list(ds.bounds)
+    if ds.tstart is not None:
+        result["tstart"] = ds.tstart.isoformat()
+    if ds.tend is not None:
+        result["tend"] = ds.tend.isoformat()
+
+    data_vars = getattr(ds.dataschema, "data_vars", None)
+    if isinstance(data_vars, dict) and data_vars:
+        names = [str(n) for n in data_vars]
+        result["variables"] = names[:SUMMARY_MAX_VARIABLES]
+        if len(names) > SUMMARY_MAX_VARIABLES:
+            result["variables_total"] = len(names)
+
+    tags = [str(t) for t in ds.tags or []]
+    shown: list[str] = []
+    for tag in tags:
+        if sum(map(len, shown)) + len(tag) > SUMMARY_TAG_CHARS:
+            break
+        shown.append(tag)
+    if shown:
+        result["tags"] = shown
+    if len(shown) < len(tags):
+        result["tags_total"] = len(tags)
+    return result
+
+
+def format_datasource_bounded(ds: Any) -> dict[str, Any]:
+    """The full record's fields and shape, with every large section bounded.
+
+    Variables and coordinates keep dims, shape, dtype and their priority
+    attributes (units, long_name, standard_name); the remaining attributes are
+    capped and long values clipped. Beyond INFO_MAX_ENTRIES variables only
+    names are listed. schema.data_vars and schema.attrs are dropped: on a
+    detailed datasource they are the same objects as variables/attributes.
+    """
+    full = format_datasource(ds)
+    out = dict(full)
+    for key in ("attributes", "info"):
+        if isinstance(full.get(key), dict):
+            out[key], omitted = _bounded_attrs(full[key], INFO_MAX_GLOBAL_ATTRS)
+            if omitted:
+                out[f"{key}_omitted"] = omitted
+    if isinstance(full.get("variables"), dict):
+        out["variables"], rest = _bounded_entries(full["variables"])
+        if rest:
+            out["more_variables"] = rest[:INFO_MAX_EXTRA_NAMES]
+            out["variables_total"] = len(full["variables"])
+    if isinstance(full.get("schema"), dict):
+        schema = full["schema"]
+        coords, rest = _bounded_entries(schema.get("coords") or {})
+        out["schema"] = {"dims": schema.get("dims"), "coords": coords}
+        if rest:
+            out["schema"]["more_coords"] = rest[:INFO_MAX_EXTRA_NAMES]
+    out["note"] = _BOUNDED_NOTE
+    return out
