@@ -121,6 +121,11 @@ def make_datasource(
     return ds
 
 
+def _results_chars(out: dict[str, Any]) -> int:
+    """Characters the "results" array occupies in the serialized response."""
+    return len(to_json(out)) - len(to_json({**out, "results": []}))
+
+
 def _search(mock_conn, datasources, **kwargs) -> dict[str, Any]:
     mock_conn.get_catalog.return_value = _mock_catalog(datasources)
     return json.loads(server.search_catalog(**kwargs))
@@ -203,7 +208,7 @@ class TestSearchCatalogTotalBound:
         assert out["omitted"] == 200 - out["count"]
         assert f"{out['omitted']} more results" in out["note"]
         assert "refine the search" in out["note"]
-        results_chars = sum(len(to_json(r)) for r in out["results"])
+        results_chars = _results_chars(out)
         assert results_chars <= server.SEARCH_BUDGET_CHARS["summary"]
 
     def test_full_output_bounded(self, mock_conn):
@@ -214,7 +219,7 @@ class TestSearchCatalogTotalBound:
         out = _search(mock_conn, hits, limit=50, detail="full")
         assert 0 < out["count"] < 50
         assert out["omitted"] == 50 - out["count"]
-        results_chars = sum(len(to_json(r)) for r in out["results"])
+        results_chars = _results_chars(out)
         assert results_chars <= server.SEARCH_BUDGET_CHARS["full"]
 
     def test_full_record_larger_than_budget_still_shown_alone(self, mock_conn):
@@ -238,6 +243,14 @@ class TestSearchCatalogTotalBound:
         assert "omitted" not in out
         assert "note" not in out
 
+    def test_omitted_note_keeps_limit_caveat(self, mock_conn, monkeypatch):
+        monkeypatch.setitem(server.SEARCH_BUDGET_CHARS, "summary", 10)
+        hits = [make_datasource(i, detail=False) for i in range(3)]
+        out = _search(mock_conn, hits, limit=3)
+        assert "further matches may exist" in out["note"]
+        out = _search(mock_conn, hits, limit=10)
+        assert "further matches may exist" not in out["note"]
+
     def test_omitted_note_replaces_raise_limit_advice(self, mock_conn, monkeypatch):
         # Raising limit cannot help when results are already being dropped.
         monkeypatch.setitem(server.SEARCH_BUDGET_CHARS, "summary", 10)
@@ -258,8 +271,9 @@ class TestSearchCatalogTotalBound:
 
 
 class TestGetDatasourceInfoDetail:
-    def _info(self, mock_conn, **kwargs) -> dict[str, Any]:
-        ds = make_datasource()
+    def _info(self, mock_conn, n_variables=10, **kwargs) -> dict[str, Any]:
+        # 10 variables fit INFO_BUDGET_CHARS; N_VARIABLES does not.
+        ds = make_datasource(n_variables=n_variables)
         mock_conn.get_datasource.return_value = ds
         return json.loads(server.get_datasource_info(ds.id, **kwargs))
 
@@ -321,15 +335,35 @@ class TestGetDatasourceInfoDetail:
         out = self._info(mock_conn)
         assert set(out["schema"]) == {"dims", "coords"}
 
-    def test_default_caps_detailed_variables_and_lists_the_rest(self, mock_conn):
+    def test_large_record_goes_lean_but_keeps_every_variable(self, mock_conn):
+        # oceanum-ai's compact_datasource reads only variables[*]: every name
+        # must stay there, with dims and units, however large the record.
+        out = self._info(mock_conn, n_variables=N_VARIABLES)
+        assert list(out["variables"]) == [f"hs_part{i}" for i in range(N_VARIABLES)]
+        for var in out["variables"].values():
+            assert var["dims"] == ["time", "latitude", "longitude"]
+            assert set(var["attrs"]) == {"units", "long_name", "standard_name"}
+            assert var["attrs_omitted"] > 0
+        assert "large record" in out["note"]
+        assert len(to_json(out)) <= formatting.INFO_BUDGET_CHARS
+
+    def test_normal_record_within_budget_not_lean(self, mock_conn):
         out = self._info(mock_conn)
-        cap = formatting.INFO_MAX_ENTRIES
-        assert len(out["variables"]) == cap
-        assert out["more_variables"] == [f"hs_part{i}" for i in range(cap, N_VARIABLES)]
-        assert out["variables_total"] == N_VARIABLES
+        assert len(to_json(out)) <= formatting.INFO_BUDGET_CHARS
+        assert "large record" not in out["note"]
+
+    def test_undetailed_record_keeps_schema_variables(self, mock_conn):
+        # data_vars/attrs are only duplicates when variables/attributes exist.
+        ds = make_datasource(n_variables=3, detail=False)
+        mock_conn.get_datasource.return_value = ds
+        out = json.loads(server.get_datasource_info(ds.id))
+        assert "variables" not in out
+        assert list(out["schema"]["data_vars"]) == ["hs_part0", "hs_part1", "hs_part2"]
+        assert out["schema"]["data_vars"]["hs_part0"]["attrs"]["units"] == "m"
+        assert len(out["schema"]["attrs"]) == formatting.INFO_MAX_GLOBAL_ATTRS
 
     def test_default_much_smaller_than_full(self, mock_conn):
-        ds = make_datasource()
+        ds = make_datasource(n_variables=N_VARIABLES)
         mock_conn.get_datasource.return_value = ds
         default = server.get_datasource_info(ds.id)
         full = server.get_datasource_info(ds.id, detail="full")

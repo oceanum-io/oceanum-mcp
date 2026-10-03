@@ -464,10 +464,15 @@ _SEARCH_HINT = (
 
 
 def _within_budget(results: list[dict[str, Any]], budget: int) -> int:
-    """How many leading results fit in budget characters (always at least one)."""
-    used = 0
+    """How many leading results fit in budget characters (always at least one).
+
+    Sizes are measured as each result serializes inside the response's
+    "results" array: every line indented 4 more spaces, plus the separator
+    and the array's closing line.
+    """
+    used = 2
     for n, result in enumerate(results):
-        used += len(to_json(result))
+        used += len(to_json(result).replace("\n", "\n    ")) + 6
         if n and used > budget:
             return n
     return len(results)
@@ -532,8 +537,15 @@ def search_catalog(
         out["omitted"] = omitted
         out["note"] = (
             f"{omitted} more results matched but are not shown, to keep this "
-            "response small; refine the search (more specific search text, a "
-            "time range, or a bbox) to see them."
+            "response small"
+            + (
+                f" (and the {limit}-result limit was reached, so further "
+                "matches may exist)"
+                if len(results) >= limit
+                else ""
+            )
+            + "; refine the search (more specific search text, a time "
+            "range, or a bbox) to see them."
         )
     elif len(results) >= limit:
         out["note"] = (
@@ -553,8 +565,8 @@ def get_datasource_info(
 
     The default view keeps every field of the full record and, per variable
     and coordinate, its dims, shape, dtype, units, long_name and
-    standard_name; it caps attribute lists, clips long attribute values, and
-    lists only the names of variables beyond the first 100.
+    standard_name; it caps the other attributes, clips long attribute values,
+    and on very large records keeps only those core fields per variable.
 
     Args:
         datasource_id: The unique ID of the datasource.

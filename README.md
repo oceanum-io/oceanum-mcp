@@ -267,11 +267,12 @@ The default (`detail="summary"`) is a bounded view with the same fields and
 shape as the full record. Each variable and coordinate keeps its `dims`,
 `shape`, `dtype` and `units`/`long_name`/`standard_name`; other attributes are
 capped at 8 per variable (with `attrs_omitted`), global `attributes` and
-`info` at 25 entries, and long values are clipped to 200 characters.
-Variables beyond the first 100 are listed by name only (`more_variables`,
-`variables_total`), and `schema.data_vars`/`schema.attrs` are omitted as
-duplicates of `variables`/`attributes`. `detail="full"` returns the complete
-record.
+`info` at 25 entries, and long values are clipped to 200 characters. If the
+view still exceeds ~60k characters, each variable and coordinate keeps only
+`dims`, `shape`, `dtype` and `units`/`long_name`/`standard_name`; every
+variable is listed either way. `schema.data_vars`/`schema.attrs` are omitted
+as duplicates of `variables`/`attributes`. `detail="full"` returns the
+complete record.
 
 | Parameter       | Type   | Description                   |
 | --------------- | ------ | ----------------------------- |

@@ -242,11 +242,13 @@ SUMMARY_MAX_VARIABLES = 20
 SUMMARY_TAG_CHARS = 120
 
 # get_datasource_info bounded view.
-INFO_MAX_ENTRIES = 100  # variables / coordinates shown with metadata
-INFO_MAX_EXTRA_NAMES = 400  # further variable names listed without metadata
 INFO_MAX_ATTRS = 8  # attributes per variable / coordinate
 INFO_MAX_GLOBAL_ATTRS = 25  # global attributes, and info entries
 INFO_VALUE_CHARS = 200  # longest attribute value shown before clipping
+# Above this serialized size the view is rebuilt lean: every variable and
+# coordinate keeps only dims/shape/dtype and its priority attributes. Every
+# variable stays listed either way: its exact name is what a query needs.
+INFO_BUDGET_CHARS = 60_000
 
 # Kept first, so a capped attribute list still carries what code needs.
 _PRIORITY_ATTRS = ("units", "long_name", "standard_name")
@@ -256,6 +258,13 @@ _BOUNDED_NOTE = (
     "lists are capped (see *_omitted counts), and schema.data_vars/attrs are "
     'omitted as duplicates of variables/attributes. Pass detail="full" for '
     "the complete record."
+)
+_LEAN_NOTE = (
+    "Bounded view of a large record: each variable and coordinate keeps only "
+    "dims, shape, dtype and units/long_name/standard_name (see attrs_omitted "
+    "counts), global attribute lists are capped, long values are clipped "
+    "(ending in ...), and schema.data_vars/attrs are omitted as duplicates of "
+    'variables/attributes. Pass detail="full" for the complete record.'
 )
 
 
@@ -273,37 +282,39 @@ def _clip_value(value: Any, limit: int) -> Any:
 
 
 def _bounded_attrs(attrs: dict[str, Any], max_items: int) -> tuple[dict, int]:
-    """Up to max_items attributes (priority names first), values clipped.
+    """Priority attributes plus others up to max_items in all, values clipped.
 
-    Returns the kept attributes and how many were omitted.
+    Priority attributes are always kept. Returns the kept attributes and how
+    many were omitted.
     """
     keys = [k for k in _PRIORITY_ATTRS if k in attrs]
-    keys += [k for k in attrs if k not in _PRIORITY_ATTRS]
-    kept = {str(k): _clip_value(attrs[k], INFO_VALUE_CHARS) for k in keys[:max_items]}
-    return kept, len(keys) - len(kept)
+    others = [k for k in attrs if k not in _PRIORITY_ATTRS]
+    keys += others[: max(0, max_items - len(keys))]
+    kept = {str(k): _clip_value(attrs[k], INFO_VALUE_CHARS) for k in keys}
+    return kept, len(attrs) - len(kept)
 
 
-def _bounded_entry(entry: Any) -> Any:
-    """A schema variable/coordinate entry with its attributes bounded."""
+def _bounded_entry(entry: Any, max_attrs: int) -> Any:
+    """A schema variable/coordinate entry with its attributes bounded.
+
+    dims, shape and dtype pass through unchanged: they are small, and clients
+    index them structurally.
+    """
     if not isinstance(entry, dict):
-        return _clip_value(entry, INFO_VALUE_CHARS)
+        return entry
     out: dict[str, Any] = {}
     for key, value in entry.items():
         if key == "attrs" and isinstance(value, dict):
-            out["attrs"], omitted = _bounded_attrs(value, INFO_MAX_ATTRS)
+            out["attrs"], omitted = _bounded_attrs(value, max_attrs)
             if omitted:
                 out["attrs_omitted"] = omitted
         else:
-            out[key] = _clip_value(value, INFO_VALUE_CHARS)
+            out[key] = value
     return out
 
 
-def _bounded_entries(entries: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
-    """The first INFO_MAX_ENTRIES entries bounded, plus the remaining names."""
-    names = list(entries)
-    kept = {str(n): _bounded_entry(entries[n]) for n in names[:INFO_MAX_ENTRIES]}
-    rest = [str(n) for n in names[INFO_MAX_ENTRIES:]]
-    return kept, rest
+def _bounded_entries(entries: dict[str, Any], max_attrs: int) -> dict[str, Any]:
+    return {str(n): _bounded_entry(e, max_attrs) for n, e in entries.items()}
 
 
 def format_datasource_summary(ds: Any) -> dict[str, Any]:
@@ -343,16 +354,7 @@ def format_datasource_summary(ds: Any) -> dict[str, Any]:
     return result
 
 
-def format_datasource_bounded(ds: Any) -> dict[str, Any]:
-    """The full record's fields and shape, with every large section bounded.
-
-    Variables and coordinates keep dims, shape, dtype and their priority
-    attributes (units, long_name, standard_name); the remaining attributes are
-    capped and long values clipped. Beyond INFO_MAX_ENTRIES variables only
-    names are listed. schema.data_vars and schema.attrs are dropped: on a
-    detailed datasource they are the same objects as variables/attributes.
-    """
-    full = format_datasource(ds)
+def _bounded_view(full: dict[str, Any], max_attrs: int) -> dict[str, Any]:
     out = dict(full)
     for key in ("attributes", "info"):
         if isinstance(full.get(key), dict):
@@ -360,15 +362,37 @@ def format_datasource_bounded(ds: Any) -> dict[str, Any]:
             if omitted:
                 out[f"{key}_omitted"] = omitted
     if isinstance(full.get("variables"), dict):
-        out["variables"], rest = _bounded_entries(full["variables"])
-        if rest:
-            out["more_variables"] = rest[:INFO_MAX_EXTRA_NAMES]
-            out["variables_total"] = len(full["variables"])
+        out["variables"] = _bounded_entries(full["variables"], max_attrs)
     if isinstance(full.get("schema"), dict):
         schema = full["schema"]
-        coords, rest = _bounded_entries(schema.get("coords") or {})
-        out["schema"] = {"dims": schema.get("dims"), "coords": coords}
-        if rest:
-            out["schema"]["more_coords"] = rest[:INFO_MAX_EXTRA_NAMES]
+        bounded: dict[str, Any] = {
+            "dims": schema.get("dims"),
+            "coords": _bounded_entries(schema.get("coords") or {}, max_attrs),
+        }
+        # data_vars/attrs duplicate variables/attributes only on a detailed
+        # record; keep them (bounded) when the record has no such fields.
+        if "variables" not in full and schema.get("data_vars"):
+            bounded["data_vars"] = _bounded_entries(schema["data_vars"], max_attrs)
+        if "attributes" not in full and schema.get("attrs"):
+            bounded["attrs"], _ = _bounded_attrs(schema["attrs"], INFO_MAX_GLOBAL_ATTRS)
+        out["schema"] = bounded
+    return out
+
+
+def format_datasource_bounded(ds: Any) -> dict[str, Any]:
+    """The full record's fields and shape, with every large section bounded.
+
+    Every variable and coordinate is kept with its dims, shape, dtype and
+    priority attributes (units, long_name, standard_name); up to
+    INFO_MAX_ATTRS attributes in all, with long values clipped. If that still
+    serializes past INFO_BUDGET_CHARS, entries keep only the priority
+    attributes. schema.data_vars and schema.attrs are dropped when they
+    duplicate variables/attributes.
+    """
+    full = format_datasource(ds)
+    out = _bounded_view(full, INFO_MAX_ATTRS)
     out["note"] = _BOUNDED_NOTE
+    if len(to_json(out)) > INFO_BUDGET_CHARS:
+        out = _bounded_view(full, 0)
+        out["note"] = _LEAN_NOTE
     return out
