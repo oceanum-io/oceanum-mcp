@@ -127,3 +127,69 @@ def test_geodataframe_records_use_wkt():
 def test_warnings_attached():
     out = summarize_data(None, warnings=["row cap hit"])
     assert out["warnings"] == ["row cap hit"]
+
+
+# --- OCE-306: previews are machine-readable and flagged unfit for statistics --
+
+
+def _assert_stats_warning(note: str) -> None:
+    assert "NOT suitable for statistics" in note
+    for pointer in ("aggregate_operations", "time_resolution", "export_query"):
+        assert pointer in note
+
+
+def test_truncated_frame_preview_fields():
+    out = summarize_data(pd.DataFrame({"x": range(100)}), max_rows=10)
+    assert out["preview"] is True
+    assert out["returned"] == 10
+    assert out["total"] == 100
+    _assert_stats_warning(out["note"])
+    # Existing fields are kept for current consumers.
+    assert out["truncated"] is True
+    assert out["rows"] == 100
+
+
+def test_complete_frame_is_not_a_preview():
+    out = summarize_data(pd.DataFrame({"x": [1, 2]}))
+    assert out["preview"] is False
+    assert out["returned"] == 2
+    assert out["total"] == 2
+    assert "note" not in out
+
+
+def test_truncated_eager_dataset_preview_fields():
+    out = summarize_data(_dataset(50), max_rows=10)
+    assert out["preview"] is True
+    assert out["returned"] == 10
+    assert out["total"] == 50
+    assert out["truncated"] is True
+    _assert_stats_warning(out["note"])
+
+
+def test_complete_eager_dataset_is_not_a_preview():
+    out = summarize_data(_dataset(3))
+    assert out["preview"] is False
+    assert out["returned"] == 3
+    assert out["total"] == 3
+    assert "note" not in out
+
+
+def test_lazy_dataset_preview_fields():
+    ds = xr.Dataset(
+        {"hs": (("time", "x"), np.zeros((4, 5)))},
+        coords={"time": pd.date_range("2024-01-01", periods=4, freq="h")},
+    ).chunk({"time": 1})
+    out = summarize_data(ds)
+    assert out["preview"] is True
+    assert out["returned"] == 0
+    # Record count is known from the dims without downloading values.
+    assert out["total"] == 20
+    assert out["lazy"] is True
+    _assert_stats_warning(out["note"])
+
+
+def test_structure_only_mode_has_no_preview_fields():
+    # After an export the written file is complete: nothing may flag a preview.
+    out = summarize_data(pd.DataFrame({"x": range(200)}), max_rows=0)
+    for key in ("preview", "returned", "total"):
+        assert key not in out

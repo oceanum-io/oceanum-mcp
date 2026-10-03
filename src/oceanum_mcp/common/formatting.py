@@ -9,6 +9,7 @@ never mistakes a preview for the full result.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from typing import Any
 
@@ -37,12 +38,24 @@ def export_clause() -> str:
     return ", or use export_query to write the full result to a file"
 
 
-def _narrow_hint() -> str:
-    """How to get more than the inline preview, appropriate to the transport."""
+def _preview_note(lead: str) -> str:
+    """Note for a partial inline result: never analyse it, get stats server-side."""
     return (
-        "Narrow the query with filters, aggregation, or time_resolution "
-        "downsampling" + export_clause() + "."
+        lead + " PREVIEW ONLY: this is not the full result, so it is NOT "
+        "suitable for statistics or aggregation (means, extremes, counts, "
+        "trends). Compute statistics over the full result server-side with "
+        "aggregate_operations or time_resolution downsampling; narrow the "
+        "query with filters to see more values inline" + export_clause() + "."
     )
+
+
+def _preview_fields(returned: int, total: int) -> dict[str, Any]:
+    """Machine-readable preview flags shared by every inline result shape.
+
+    total is the record count of the full result; preview is true whenever
+    fewer records were returned than the result holds.
+    """
+    return {"preview": returned < total, "returned": returned, "total": total}
 
 
 def human_bytes(n: int | float) -> str:
@@ -84,10 +97,9 @@ def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
         shown = plain
     out["data"] = _records(shown)
     out["truncated"] = df.shape[0] > max_rows
+    out.update(_preview_fields(int(shown.shape[0]), int(df.shape[0])))
     if out["truncated"]:
-        out["note"] = (
-            f"Showing first {max_rows} of {df.shape[0]} rows. " + _narrow_hint()
-        )
+        out["note"] = _preview_note(f"Showing first {max_rows} of {df.shape[0]} rows.")
     return out
 
 
@@ -121,7 +133,12 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
         "size_human": human_bytes(ds.nbytes),
         "lazy": lazy,
     }
-    if lazy:
+    if lazy and max_rows > 0:
+        # No values are returned; the record count (the full dim product, as
+        # to_dataframe would yield) is known without downloading anything.
+        out.update(_preview_fields(0, math.prod(out["dims"].values())))
+        out["note"] = _preview_note("Dataset is lazily loaded (values not downloaded).")
+    elif lazy:
         out["note"] = (
             "Dataset is lazily loaded (values not downloaded). Narrow the query "
             "with filters, aggregation, or time_resolution downsampling to see "
@@ -131,12 +148,14 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
         # Eager data is already in memory — always include a preview of
         # coordinate-attributed values.
         df = ds.to_dataframe().reset_index()
-        out["data"] = _records(df.head(max_rows))
+        shown = df.head(max_rows)
+        out["data"] = _records(shown)
         out["truncated"] = df.shape[0] > max_rows
+        out.update(_preview_fields(int(shown.shape[0]), int(df.shape[0])))
         if out["truncated"]:
-            out["note"] = (
-                f"Showing first {max_rows} of {df.shape[0]} records. "
-            ) + _narrow_hint()
+            out["note"] = _preview_note(
+                f"Showing first {max_rows} of {df.shape[0]} records."
+            )
     return out
 
 

@@ -13,12 +13,16 @@ Error conventions:
 
 from __future__ import annotations
 
+import math
 import threading
 import warnings as _warnings
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
+import numpy as np
+import pandas as pd
+import xarray as xr
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 
@@ -180,6 +184,67 @@ def _download_stage(conn: Connector, query: Query) -> dict[str, Any] | None:
 def _query_echo(query: Query) -> dict[str, Any]:
     """Canonical JSON form of a query, for echoing in responses."""
     return query.model_dump(mode="json", exclude_none=True, warnings=False)
+
+
+# Coordinate keys Datamesh applies `limit` along (time, ensemble, quantile):
+# it keeps the last N steps of each, mirrored by _limit_result.
+_LIMIT_COORD_KEYS = ("t", "e", "q")
+
+
+def _resamples_or_aggregates(query: Query) -> bool:
+    """True if Datamesh resamples (time_resolution) or aggregates this query."""
+    tf = query.timefilter
+    resamples = tf is not None and getattr(tf, "resolution", None) not in (
+        None,
+        "native",
+    )
+    return resamples or query.aggregate is not None
+
+
+def _record_count(data: Any) -> int | None:
+    """Records in a result, counted as summarize_data counts them."""
+    if isinstance(data, pd.DataFrame):
+        return int(data.shape[0])
+    if isinstance(data, xr.Dataset):
+        return math.prod(int(n) for n in data.sizes.values())
+    return None
+
+
+def _limit_result(data: Any, limit: int, coordkeys: dict[str, str]) -> tuple[Any, str]:
+    """Apply Datamesh `limit` semantics (keep the last N) to a returned result.
+
+    Used when limit cannot be sent to Datamesh because it would be applied to
+    native records before resampling/aggregation (OCE-298). Returns the
+    limited data and a note describing what was kept.
+    """
+    lead = (
+        f"limit={limit} was applied by this server AFTER time_resolution "
+        "resampling / aggregation (it is not sent to Datamesh with those, "
+        "which would apply it to the native records first)"
+    )
+    if isinstance(data, pd.DataFrame):
+        return data.tail(limit), f"{lead}: kept the last {limit} rows as returned."
+    if isinstance(data, xr.Dataset):
+        dims = []
+        for key in _LIMIT_COORD_KEYS:
+            name = coordkeys.get(key)
+            if name in data.coords and data.coords[name].dims:
+                dims.append(data.coords[name].dims[0])
+        if not dims:
+            # Stage without coordinate keys: fall back to datetime dims.
+            dims = [
+                d
+                for d in data.dims
+                if d in data.coords and np.issubdtype(data[d].dtype, np.datetime64)
+            ]
+        if dims:
+            dims = list(dict.fromkeys(dims))
+            limited = data.isel({d: slice(-limit, None) for d in dims})
+            return limited, f"{lead}: kept the last {limit} steps along {dims}."
+    return data, (
+        f"{lead}; the result has no time/ensemble dimension to limit, so limit "
+        "had no effect."
+    )
 
 
 def _stage_summary(stage: Stage) -> dict[str, Any]:
@@ -549,6 +614,17 @@ def query_data(
     The query is staged first; results larger than the inline limit are not
     downloaded (datasets are summarized lazily, tabular queries are refused
     with alternatives). Use stage_query to size a query before calling this.
+
+    Inline values are a preview when `preview` is true (`returned` of `total`
+    records): never compute statistics from a preview; use
+    aggregate_operations or time_resolution instead.
+
+    limit keeps the last N records (Datamesh semantics: the last N steps along
+    time/ensemble). Combined with time_resolution or aggregate_operations,
+    limit is applied by this server AFTER resampling/aggregation (to the last
+    N resampled steps, or the last N rows of a table) rather than sent to
+    Datamesh. A limited result is a subset of the requested range, so it is
+    flagged as a preview, with a limit_note.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -574,9 +650,19 @@ def query_data(
         aggregate_temporal=aggregate_temporal,
         limit=limit,
     )
+    # OCE-298: Datamesh applies limit to native records BEFORE resampling or
+    # aggregation, so with those it is stripped from the query sent and
+    # applied to the returned result instead (the size check therefore sees
+    # the full resampled/aggregated result that is actually downloaded).
+    # Responses keep echoing the caller's query, limit included.
+    sent = query
+    client_limit = None
+    if query.limit is not None and _resamples_or_aggregates(query):
+        client_limit = query.limit
+        sent = query.model_copy(update={"limit": None})
     warnings: list[str] = []
     try:
-        stage = _stage(conn, query)
+        stage = _stage(conn, sent)
         if stage is None:
             return to_json(
                 {
@@ -592,20 +678,56 @@ def query_data(
                 # Lazy zarr access: structure only, no data download.
                 use_dask = True
             else:
+                extra: dict[str, Any] = {}
+                if client_limit is not None:
+                    extra["limit_note"] = (
+                        f"limit={client_limit} cannot shrink this download: with "
+                        "time_resolution/aggregate_operations it is applied "
+                        "after the full result is fetched."
+                    )
                 return _refusal(
                     stage,
                     f"Result is {human_bytes(stage.size)}, above the inline "
                     f"limit of {human_bytes(inline_limit)}. Narrow the query "
                     f"with filters or aggregation{export_clause()}.",
                     query=_query_echo(query),
+                    **extra,
                 )
         with _captured_warnings(warnings):
-            data = conn.query(query, use_dask=use_dask)
+            data = conn.query(sent, use_dask=use_dask)
+            full_records = _record_count(data)
+            limit_note = None
+            if client_limit is not None and data is not None:
+                data, limit_note = _limit_result(data, client_limit, stage.coordkeys)
+                if use_dask and data.nbytes <= inline_limit:
+                    # The limited slice is small: fetch just its chunks so
+                    # it comes back inline rather than as a lazy summary.
+                    data = data.load()
     except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
     out = summarize_data(data, warnings=warnings)
     out["staged_size_bytes"] = stage.size
+    if query.limit is not None and "preview" in out:
+        # A limited result is a subset of what the query selects, so it is a
+        # preview too: never let it pass as the full range (OCE-306).
+        if client_limit is None:
+            # Datamesh applied it; the unlimited size is unknown.
+            out["preview"], out["total"] = True, None
+            limit_note = (
+                f"limit={query.limit} was applied by Datamesh (it keeps the "
+                "last N steps); the full result may be larger."
+            )
+        elif full_records is not None and _record_count(data) < full_records:
+            out["preview"], out["total"] = True, full_records
+        if out["preview"]:
+            limit_note += (
+                " This limited result is a subset of the requested range: NOT "
+                "suitable for statistics over that range; use "
+                "aggregate_operations or time_resolution instead."
+            )
+    if limit_note:
+        out["limit_note"] = limit_note
     return to_json(out)
 
 
@@ -853,8 +975,9 @@ query_data.__doc__ = f"""{query_data.__doc__}
 
     Returns:
         JSON with the result data (coordinate-attributed records) or a
-        structure summary, explicit truncated/lazy flags, staged size, and any
-        server warnings.
+        structure summary, explicit truncated/lazy flags, preview/returned/
+        total record counts, staged size, any limit_note, and any server
+        warnings.
     """
 export_query.__doc__ = f"""{export_query.__doc__}
     Args:
