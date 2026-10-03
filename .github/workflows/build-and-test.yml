@@ -10,8 +10,9 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # 3.13+ dedents docstrings at compile time, which changes how FastMCP
-        # parses tool docstrings (OCE-331); test both ends of the range.
+        # The oldest supported version, plus 3.13: from 3.13 docstrings are
+        # dedented at compile time, which changes how FastMCP parses the
+        # tools' assembled docstrings (OCE-331).
         python-version: ['3.10', '3.13']
     env:
       DATAMESH_TOKEN: ${{ secrets.DATAMESH_TOKEN }}

@@ -125,6 +125,22 @@ class TestParamDescriptions:
             assert "Args:" not in desc, name
             assert "datasource_id:" not in desc, name
 
+    @pytest.mark.parametrize("module_name", sorted(EXPECTED_REQUIRED))
+    async def test_description_is_full_docstring_text_before_args(self, module_name):
+        """The published description is the whole docstring summary/body.
+
+        Pins that normalising the docstrings drops nothing an agent reads:
+        everything before the Args section is published, on every version.
+        """
+        module = importlib.import_module(module_name)
+        tools = {t.name: t for t in await module.mcp.list_tools()}
+
+        for name, tool in tools.items():
+            doc = inspect.getdoc(getattr(module, name))
+            head = doc.split("\n\nArgs:\n", 1)[0].strip()
+            assert head, name
+            assert tool.description == head, name
+
 
 class TestNullStringNormalisation:
     @pytest.mark.parametrize("sentinel", ["null", ""])
