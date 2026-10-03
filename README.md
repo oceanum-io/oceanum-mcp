@@ -209,8 +209,12 @@ OCEANUM_MCP_CORS_ORIGINS="https://*.oceanum.io,https://vscode.dev,http://localho
 - Each entry is an exact origin (`scheme://host[:port]`, no path). A leading
   `*.` matches exactly one subdomain label: `https://*.oceanum.io` allows
   `https://app.oceanum.io` but not `https://oceanum.io`,
-  `https://a.b.oceanum.io` or `https://oceanum.io.evil.com`. Bare `*` and
-  whole-TLD wildcards (`https://*.io`) are rejected at startup.
+  `https://a.b.oceanum.io` or `https://oceanum.io.evil.com`. Bare `*`,
+  single-label wildcards (`https://*.io`) and malformed entries are rejected
+  at startup; a scheme-default port (`:443` on https) is dropped, as browsers
+  omit it. Multi-label public suffixes (`https://*.co.uk`,
+  `https://*.github.io`) cannot be detected — never configure them: they
+  would admit every site under that suffix.
 - Credentials travel in `Authorization` / `X-DATAMESH-TOKEN` headers, never
   cookies, so `Access-Control-Allow-Credentials` is never sent.
   `Mcp-Session-Id` and `WWW-Authenticate` are exposed to browser scripts.

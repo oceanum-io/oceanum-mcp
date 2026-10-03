@@ -21,7 +21,7 @@ from starlette.middleware.cors import CORSMiddleware
 
 from oceanum_mcp.cli import SERVER_REGISTRY
 from oceanum_mcp.common.auth import DatameshHeaderMiddleware, build_auth_provider
-from oceanum_mcp.common.config import cors_origins, set_transport
+from oceanum_mcp.common.config import DNS_LABEL, cors_origins, set_transport
 
 # What the MCP streamable-HTTP transport sends cross-origin: POST for
 # messages, GET for the server event stream, DELETE to end a session.
@@ -39,28 +39,22 @@ CORS_ALLOW_HEADERS = [
 CORS_EXPOSE_HEADERS = ["Mcp-Session-Id", "WWW-Authenticate"]
 CORS_MAX_AGE = 3600
 
-# One DNS label: what a leading "*." in an allowlist entry may stand for.
-# No dots, so "*" never spans several labels.
-_LABEL = r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?"
-
 
 def cors_origin_regex(origins: list[str]) -> str | None:
-    """Anchored regex matching exactly the given (validated) origins.
+    """Anchored regex matching the wildcard (``*.``) origins in the list.
 
-    Literal parts are escaped, so dots only match dots; "*." becomes a single
-    label. Matched with fullmatch by Starlette, and \\Z-anchored as well so
-    no suffix (``https://app.oceanum.io.evil.com``) can slip through.
+    Exact origins are left to Starlette's plain ``allow_origins`` membership
+    check. Literal parts are escaped, so dots only match dots; "*." becomes
+    exactly one DNS label (no dots, so it never spans several). Starlette
+    applies it with fullmatch, so no suffix
+    (``https://app.oceanum.io.evil.com``) can slip through.
     """
-    if not origins:
-        return None
     parts = []
     for origin in origins:
         scheme, _, host = origin.partition("://")
         if host.startswith("*."):
-            parts.append(re.escape(f"{scheme}://") + _LABEL + re.escape(host[1:]))
-        else:
-            parts.append(re.escape(origin))
-    return rf"(?:{'|'.join(parts)})\Z"
+            parts.append(re.escape(f"{scheme}://") + DNS_LABEL + re.escape(host[1:]))
+    return f"(?:{'|'.join(parts)})" if parts else None
 
 
 def create_http_app(
@@ -102,11 +96,12 @@ def create_http_app(
     # credential, so it must be answered before auth (or the header
     # promotion) ever sees it. Credentials travel in headers, never cookies,
     # hence allow_credentials=False.
-    origin_regex = cors_origin_regex(cors_origins())
-    if origin_regex is not None:
+    origins = cors_origins()
+    if origins:
         app.add_middleware(
             CORSMiddleware,
-            allow_origin_regex=origin_regex,
+            allow_origins=[o for o in origins if "*" not in o],
+            allow_origin_regex=cors_origin_regex(origins),
             allow_methods=CORS_ALLOW_METHODS,
             allow_headers=CORS_ALLOW_HEADERS,
             expose_headers=CORS_EXPOSE_HEADERS,

@@ -325,6 +325,7 @@ async def test_cors_preflight_allowed_origin_skips_auth(origin):
         "http://app.oceanum.io",  # scheme downgrade
         "https://vscode.dev.evil.com",
         "https://xvscode.dev",
+        "https://APP.oceanum.io",  # browsers serialize lowercase; exact match
         "null",
     ],
 )
@@ -411,6 +412,10 @@ def test_cors_origins_env_parsing(monkeypatch):
         "example.com",
         "ftp://example.com",
         "https://exa mple.com",
+        "https://-x.example.com",  # label may not start with "-"
+        "https://x-.example.com",  # ...or end with it
+        "https://example.com:0",
+        "https://example.com:99999",
     ],
 )
 def test_cors_origins_rejects_malformed(monkeypatch, bad):
@@ -419,3 +424,67 @@ def test_cors_origins_rejects_malformed(monkeypatch, bad):
     monkeypatch.setenv("OCEANUM_MCP_CORS_ORIGINS", bad)
     with pytest.raises(ValueError, match="OCEANUM_MCP_CORS_ORIGINS"):
         cors_origins()
+
+
+@pytest.mark.parametrize("method", ["GET", "DELETE"])
+async def test_cors_preflight_covers_stream_and_session_methods(method):
+    """GET (server event stream) and DELETE (end session) preflight too."""
+    async with factory_client() as client:
+        resp = await client.options(
+            "/datamesh",
+            headers={
+                "Origin": "https://app.oceanum.io",
+                "Access-Control-Request-Method": method,
+                "Access-Control-Request-Headers": "mcp-session-id",
+            },
+        )
+    assert resp.status_code == 200
+    assert resp.headers["access-control-allow-origin"] == "https://app.oceanum.io"
+
+
+async def test_cors_wildcard_with_port_and_default_port_entries():
+    """A wildcard entry keeps its port; a scheme-default port is dropped so
+    it matches the port-less Origin a browser actually sends."""
+    env = {
+        "OCEANUM_MCP_CORS_ORIGINS": "https://*.corp.test:8443,https://app.example.com:443"
+    }
+    async with factory_client(**env) as client:
+        wild = await _preflight(client, "https://x.corp.test:8443")
+        wild_no_port = await _preflight(client, "https://x.corp.test")
+        default_port = await _preflight(client, "https://app.example.com")
+    assert wild.headers["access-control-allow-origin"] == "https://x.corp.test:8443"
+    assert "access-control-allow-origin" not in wild_no_port.headers
+    assert (
+        default_port.headers["access-control-allow-origin"] == "https://app.example.com"
+    )
+
+
+def test_cors_origins_drops_default_ports(monkeypatch):
+    from oceanum_mcp.common.config import cors_origins
+
+    monkeypatch.setenv(
+        "OCEANUM_MCP_CORS_ORIGINS",
+        "https://a.example.com:443,http://b.example.com:80,https://c.example.com:80",
+    )
+    assert cors_origins() == [
+        "https://a.example.com",
+        "http://b.example.com",
+        "https://c.example.com:80",
+    ]
+
+
+def test_cors_origin_regex_covers_only_wildcards():
+    """Exact origins go to Starlette's allow_origins membership check; the
+    regex is built from wildcard entries alone (None when there are none)."""
+    import re
+
+    from oceanum_mcp.app import cors_origin_regex
+
+    assert cors_origin_regex(["https://vscode.dev"]) is None
+    pattern = re.compile(
+        cors_origin_regex(["https://vscode.dev", "https://*.oceanum.io"])
+    )
+    assert pattern.fullmatch("https://app.oceanum.io")
+    assert not pattern.fullmatch("https://vscode.dev")
+    assert not pattern.fullmatch("https://a.b.oceanum.io")
+    assert not pattern.fullmatch("https://appxoceanum.io")
