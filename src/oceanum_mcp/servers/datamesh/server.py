@@ -14,9 +14,10 @@ Error conventions:
 from __future__ import annotations
 
 import math
+import shutil
 import threading
 import warnings as _warnings
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -63,6 +64,24 @@ DATAMESH_ROW_CAP = 2_000_000
 
 # Ceiling on bytes loaded into memory for a tabular export (local/stdio path).
 MAX_EXPORT_FRAME_BYTES = 2_000_000_000
+
+# Ceiling on a local (stdio) dataset export. Real cancellation of an
+# in-flight write is not possible yet (the to_netcdf call runs to completion in
+# a worker thread), so this bounds the damage of a runaway export: at the
+# ~145 MB/s observed in OCE-296 it is ~70 s of disk writing, versus the 36.5 GB
+# written before that export was killed. 10x the "ask the user" threshold, so
+# multi-GB exports the user has agreed to still work; anything larger belongs
+# on the hosted download link or in direct oceanum library code.
+MAX_EXPORT_DATASET_BYTES = 10_000_000_000
+
+# Above this staged size stage_query leads with narrowing, states the cost of
+# exporting as-is, and tells the agent to ask the user before exporting.
+LARGE_EXPORT_BYTES = 1_000_000_000
+
+# Free space required before a local export writes, as a multiple of the staged
+# size. NetCDF/Parquet land at or below the staged (in-memory) size; CSV text
+# runs well above binary floats.
+_EXPORT_DISK_FACTOR = {"netcdf": 1.1, "parquet": 1.1, "csv": 3.0}
 
 # Above this staged size the hosted download link is flagged as a large
 # transfer. Not a refusal: the URL streams from the gateway at no cost to this
@@ -561,6 +580,33 @@ def stage_query(
         out["recommendation"] = (
             "Small enough to return inline: call query_data with these parameters."
         )
+    elif stage.size > LARGE_EXPORT_BYTES:
+        size = human_bytes(stage.size)
+        local_cap = (
+            MAX_EXPORT_DATASET_BYTES
+            if stage.container == Container.Dataset
+            else MAX_EXPORT_FRAME_BYTES
+        )
+        if is_network_transport():
+            cost = (
+                f"Exporting as-is makes export_query return a {size} download; "
+                "ask the user before exporting."
+            )
+        elif stage.size > local_cap:
+            cost = (
+                f"export_query will refuse it: local exports are capped at "
+                f"{human_bytes(local_cap)}."
+            )
+        else:
+            cost = (
+                f"Exporting as-is makes export_query write {size} to the user's "
+                "disk; ask the user before exporting."
+            )
+        out["recommendation"] = (
+            f"Large result ({size}). Narrow it first: a shorter time range, a "
+            "smaller bbox, fewer variables, time_resolution downsampling, or "
+            f"aggregation. {cost}"
+        )
     else:
         detail = (
             "query_data will return only a lazy structure summary; shrink the "
@@ -837,7 +883,9 @@ def export_query(
       URL out-of-band — it needs no credential, so treat it as a secret.
     - Local (stdio): writes the result to the local file `path` (required) and
       returns that path. Gridded datasets stream to NetCDF; tabular results
-      write Parquet or CSV.
+      write Parquet or CSV, as do datasets small enough to flatten into a
+      table (e.g. point time series). Refused up front if the result exceeds
+      the local export cap or the destination's free disk space.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -890,12 +938,29 @@ def export_query(
                 }
             )
 
-        if stage.container == Container.Dataset:
+        is_dataset = stage.container == Container.Dataset
+        if is_dataset:
             fmt = format or "netcdf"
-            if fmt != "netcdf":
+            # A point series (or any small dataset) flattens to a table via
+            # to_dataframe(), which materializes it in memory: hold it to the
+            # same ceiling as a tabular export.
+            if fmt != "netcdf" and stage.size > MAX_EXPORT_FRAME_BYTES:
                 raise ToolError(
-                    "This query returns a gridded dataset; only format='netcdf' "
-                    "is supported."
+                    f"This query returns a gridded dataset of "
+                    f"{human_bytes(stage.size)}, too large to flatten to "
+                    f"{fmt} (limit {human_bytes(MAX_EXPORT_FRAME_BYTES)}). Use "
+                    "format='netcdf', or narrow the query (e.g. a point "
+                    "geofilter_feature, fewer variables, a shorter time range)."
+                )
+            if stage.size > MAX_EXPORT_DATASET_BYTES:
+                return _refusal(
+                    stage,
+                    f"Dataset result is {human_bytes(stage.size)}, above the "
+                    f"local export limit of "
+                    f"{human_bytes(MAX_EXPORT_DATASET_BYTES)}. Narrow the "
+                    "query: a shorter time range, a smaller bbox, fewer "
+                    "variables, time_resolution downsampling, or aggregation.",
+                    query=_query_echo(query),
                 )
         else:
             fmt = format or "parquet"
@@ -912,9 +977,27 @@ def export_query(
                     query=_query_echo(query),
                 )
 
+        # Check free space before writing a byte: a local export cannot be
+        # cancelled once it starts (OCE-296). Probe the nearest existing
+        # ancestor, since the destination directory may not exist yet.
+        probe = dest.parent
+        while not probe.exists():
+            probe = probe.parent
+        free = shutil.disk_usage(probe).free
+        needed = int(stage.size * _EXPORT_DISK_FACTOR[fmt])
+        if needed > free:
+            return _refusal(
+                stage,
+                f"Not enough disk space: writing this as {fmt} needs about "
+                f"{human_bytes(needed)}, but {probe} has {human_bytes(free)} "
+                "free. Narrow the query or choose a path on a larger disk.",
+                free_bytes=free,
+                query=_query_echo(query),
+            )
+
         with _captured_warnings(warnings):
             # Datasets stream chunk-wise from lazy zarr; frames download fully.
-            data = conn.query(query, use_dask=stage.container == Container.Dataset)
+            data = conn.query(query, use_dask=is_dataset)
     except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
@@ -929,7 +1012,16 @@ def export_query(
             }
         )
 
+    if is_dataset and fmt != "netcdf":
+        # Flatten before touching dest, so a failed fetch here cannot remove
+        # an existing file the caller asked to overwrite.
+        try:
+            data = data.to_dataframe().reset_index()
+        except _DATAMESH_ERRORS as exc:
+            return to_json({"error": str(exc), "query": _query_echo(query)})
+
     dest.parent.mkdir(parents=True, exist_ok=True)
+    written = False
     try:
         if fmt == "netcdf":
             data.to_netcdf(dest)
@@ -937,15 +1029,21 @@ def export_query(
             data.to_parquet(dest)
         else:
             data.to_csv(dest, index=False)
+        written = True
     except (*_DATAMESH_ERRORS, OSError) as exc:
-        # A mid-stream failure (zarr chunk fetch, disk) leaves a partial file.
-        dest.unlink(missing_ok=True)
         return to_json(
             {
                 "error": f"Export failed while writing {dest}: {exc}",
                 "query": _query_echo(query),
             }
         )
+    finally:
+        if not written:
+            # Any failure mid-write (zarr chunk fetch, disk, an unexpected
+            # exception, KeyboardInterrupt) leaves a partial file. Suppress
+            # unlink errors so they never mask the original failure.
+            with suppress(OSError):
+                dest.unlink(missing_ok=True)
 
     summary = summarize_data(data, max_rows=0, warnings=warnings)
     return to_json(
@@ -981,7 +1079,7 @@ query_data.__doc__ = f"""{query_data.__doc__}
 export_query.__doc__ = f"""{export_query.__doc__}
     Args:
         path: Local (stdio) destination file path (required on stdio; parent directories are created; confined to OCEANUM_MCP_EXPORT_DIR when set). Ignored on hosted servers, which return a download URL.
-        format: Output format: netcdf (datasets), parquet or csv (tabular). Defaults by container: dataset -> netcdf, tabular -> parquet.
+        format: Output format: netcdf (datasets), parquet or csv (tabular, or datasets small enough to flatten into a table such as point time series). Defaults by container: dataset -> netcdf, tabular -> parquet.
         overwrite: Overwrite an existing local file (default false). Local export only.
 {_QUERY_PARAM_DOCS}
 
