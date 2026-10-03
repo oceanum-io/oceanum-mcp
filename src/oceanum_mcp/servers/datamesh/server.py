@@ -86,9 +86,18 @@ LARGE_EXPORT_BYTES = 1_000_000_000
 _EXPORT_DISK_FACTOR = {"netcdf": 1.1, "parquet": 1.1, "csv": 3.0}
 
 # Above this staged size the hosted download link is flagged as a large
-# transfer. Not a refusal: the URL streams from the gateway at no cost to this
-# server, and exporting large results is the whole point of the download path.
+# transfer. Not a refusal (that is MAX_HOSTED_EXPORT_BYTES): the URL streams
+# from the gateway at no cost to this server, and exporting large results is
+# the whole point of the download path.
 LARGE_DOWNLOAD_BYTES = 2_000_000_000
+
+# Above this staged size hosted export refuses to return a download link
+# (OCE-299). The link is a bearer URL: anyone holding it can fetch the data
+# with no credential until it expires, so until the gateway issues scoped
+# links (OCE-317) this bounds what one leaked link, or one runaway agent call,
+# can pull. Equal to the local dataset cap (MAX_EXPORT_DATASET_BYTES) so an
+# export that works on stdio also works hosted; 2-10 GB stays warn-and-allow.
+MAX_HOSTED_EXPORT_BYTES = 10_000_000_000
 
 # The tool's format names mapped to the gateway's `&f=` download tokens.
 _GATEWAY_FORMAT = {"netcdf": "nc", "parquet": "parquet", "csv": "csv"}
@@ -220,6 +229,30 @@ def _resamples_or_aggregates(query: Query) -> bool:
         "native",
     )
     return resamples or query.aggregate is not None
+
+
+def _split_limit(query: Query) -> tuple[Query, int | None]:
+    """The query to send to Datamesh, and any limit to apply to its result.
+
+    OCE-298: Datamesh applies `limit` to native records BEFORE time_resolution
+    resampling or aggregation, so with those the limit is stripped from the
+    query sent (and from the size check, which then sees the full
+    resampled/aggregated result) and applied afterwards via _limit_result.
+    Responses keep echoing the caller's query, limit included.
+    """
+    if query.limit is not None and _resamples_or_aggregates(query):
+        return query.model_copy(update={"limit": None}), query.limit
+    return query, None
+
+
+# Hosted export cannot apply limit itself (the gateway streams the file), and
+# sending it would apply it before resampling/aggregation (OCE-319).
+_HOSTED_LIMIT_UNSUPPORTED = (
+    "limit with time_resolution/aggregate_operations is not supported for "
+    "hosted export until the Datamesh engine fix ships: Datamesh would apply "
+    "limit to the native records before resampling/aggregating, so the file "
+    "would be wrong. To proceed, drop limit or narrow the time range instead."
+)
 
 
 def _record_count(data: Any) -> int | None:
@@ -438,7 +471,7 @@ _QUERY_PARAM_DOCS = """\
         aggregate_operations: Aggregations to apply after filtering: mean, min, max, std, sum.
         aggregate_spatial: Aggregate over spatial dimensions (default true).
         aggregate_temporal: Aggregate over the temporal dimension (default true).
-        limit: Maximum number of rows/records to return."""
+        limit: Keep only the last N records (Datamesh semantics: the last N steps along time/ensemble). Combined with time_resolution or aggregate_operations it is applied AFTER resampling/aggregation (by this server, not sent to Datamesh), so stage_query sizes the unlimited result as an upper bound; hosted export_query refuses that combination."""
 
 
 # ---------------------------------------------------------------------------
@@ -553,7 +586,9 @@ def stage_query(
 
     Always stage before retrieving data you have not sized. The response says
     whether the result is small enough for query_data to return inline, and
-    echoes the canonical query.
+    echoes the canonical query. With limit plus time_resolution or
+    aggregate_operations the reported size is that of the unlimited result
+    (limit is applied after resampling), so it is an upper bound.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -579,8 +614,9 @@ def stage_query(
         aggregate_temporal=aggregate_temporal,
         limit=limit,
     )
+    sent, client_limit = _split_limit(query)
     try:
-        stage = _stage(conn, query)
+        stage = _stage(conn, sent)
     except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
@@ -607,10 +643,16 @@ def stage_query(
             else MAX_EXPORT_FRAME_BYTES
         )
         if is_network_transport():
-            cost = (
-                f"Exporting as-is makes export_query return a {size} download; "
-                "ask the user before exporting."
-            )
+            if stage.size > MAX_HOSTED_EXPORT_BYTES:
+                cost = (
+                    "export_query will refuse it: hosted downloads are capped "
+                    f"at {human_bytes(MAX_HOSTED_EXPORT_BYTES)}."
+                )
+            else:
+                cost = (
+                    f"Exporting as-is makes export_query return a {size} "
+                    "download; ask the user before exporting."
+                )
         elif stage.size > local_cap:
             cost = (
                 f"export_query will refuse it: local exports are capped at "
@@ -646,6 +688,19 @@ def stage_query(
             f"Datamesh caps tabular results at {DATAMESH_ROW_CAP} rows; this "
             "result would be truncated. Narrow the query."
         ]
+    if client_limit is not None:
+        limit_note = (
+            f"limit={client_limit} is applied AFTER time_resolution resampling / "
+            "aggregation (by this server, not sent to Datamesh), so size_bytes "
+            "is the unlimited result: an upper bound on what is returned."
+        )
+        if is_network_transport():
+            limit_note += (
+                " export_query refuses this combination on this hosted server "
+                "(not supported until the Datamesh engine fix ships): drop "
+                "limit or narrow the time range to export."
+            )
+        out["limit_note"] = limit_note
     out["query"] = _query_echo(query)
     return to_json(out)
 
@@ -682,14 +737,9 @@ def query_data(
 
     Inline values are a preview when `preview` is true (`returned` of `total`
     records): never compute statistics from a preview; use
-    aggregate_operations or time_resolution instead.
-
-    limit keeps the last N records (Datamesh semantics: the last N steps along
-    time/ensemble). Combined with time_resolution or aggregate_operations,
-    limit is applied by this server AFTER resampling/aggregation (to the last
-    N resampled steps, or the last N rows of a table) rather than sent to
-    Datamesh. A limited result is a subset of the requested range, so it is
-    flagged as a preview, with a limit_note.
+    aggregate_operations or time_resolution instead. A limited result is a
+    subset of the requested range, so it is flagged as a preview, with a
+    limit_note.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -715,16 +765,7 @@ def query_data(
         aggregate_temporal=aggregate_temporal,
         limit=limit,
     )
-    # OCE-298: Datamesh applies limit to native records BEFORE resampling or
-    # aggregation, so with those it is stripped from the query sent and
-    # applied to the returned result instead (the size check therefore sees
-    # the full resampled/aggregated result that is actually downloaded).
-    # Responses keep echoing the caller's query, limit included.
-    sent = query
-    client_limit = None
-    if query.limit is not None and _resamples_or_aggregates(query):
-        client_limit = query.limit
-        sent = query.model_copy(update={"limit": None})
+    sent, client_limit = _split_limit(query)
     warnings: list[str] = []
     try:
         stage = _stage(conn, sent)
@@ -835,9 +876,32 @@ def _export_download_url(
         )
 
     try:
-        size = int(stage.get("size") or 0)
-    except (TypeError, ValueError):
-        size = 0
+        size = int(stage["size"])
+    except (KeyError, TypeError, ValueError):
+        # Fail closed: without a size the hosted cap cannot be enforced.
+        return to_json(
+            {
+                "error": "The gateway did not report the download size, so "
+                "the hosted export limit cannot be checked; no link returned.",
+                "query": _query_echo(query),
+            }
+        )
+    if size > MAX_HOSTED_EXPORT_BYTES:
+        # Same shape as _refusal; the gateway's download stage has no dlen.
+        # The signed URL is withheld: it is a bearer credential (OCE-299).
+        return to_json(
+            {
+                "refused": True,
+                "container": stage.get("container"),
+                "size_bytes": size,
+                "size_human": human_bytes(size),
+                "message": f"Result is {human_bytes(size)}, above the hosted "
+                f"export limit of {human_bytes(MAX_HOSTED_EXPORT_BYTES)}. "
+                "Narrow the query: a shorter time range, a smaller bbox, fewer "
+                "variables, time_resolution downsampling, or aggregation.",
+                "query": _query_echo(query),
+            }
+        )
     # The signed URL is a capability: append the format token, keeping the
     # signature intact. Use '?' if the URL has no query string yet, else '&'.
     url = stage["url"]
@@ -961,12 +1025,18 @@ def export_query(
     - Hosted (http/sse): returns a time-limited, self-authenticating gateway
       download_url (choose format via `format`); `path` is ignored. Fetch the
       URL out-of-band — it needs no credential, so treat it as a secret.
+      Refused above the hosted export cap, and for limit combined with
+      time_resolution/aggregate_operations.
     - Local (stdio): writes the result to the local file `path` (required) and
       returns that path. Gridded datasets stream to NetCDF; tabular results
       write Parquet or CSV, as do datasets small enough to flatten into a
       table (e.g. point time series). Refused up front if the result exceeds
-      the local export cap or the destination's free disk space.
+      the local export cap or the destination's free disk space. With limit
+      plus time_resolution/aggregate_operations, the last N resampled steps
+      are written.
     """
+    # Some MCP clients send "null"/"" for an omitted path (never a file name).
+    path = _unset_sentinel(path)
     conn = get_datamesh_connector()
     query = _build_query(
         datasource_id,
@@ -995,6 +1065,8 @@ def export_query(
     if is_network_transport():
         # Hosted: broker a gateway download link; there is no client-visible
         # local filesystem. path/overwrite do not apply.
+        if _split_limit(query)[1] is not None:
+            raise ToolError(_HOSTED_LIMIT_UNSUPPORTED)
         return _export_download_url(conn, query, format, requested_path=path)
 
     if path is None:
@@ -1006,9 +1078,10 @@ def export_query(
         if not overwrite:
             raise ToolError(f"File exists: {dest}. Pass overwrite=true to replace it.")
 
+    sent, client_limit = _split_limit(query)
     warnings: list[str] = []
     try:
-        stage = _stage(conn, query)
+        stage = _stage(conn, sent)
         if stage is None:
             return to_json(
                 {
@@ -1059,7 +1132,7 @@ def export_query(
 
         with _captured_warnings(warnings):
             # Datasets stream chunk-wise from lazy zarr; frames download fully.
-            data = conn.query(query, use_dask=is_dataset)
+            data = conn.query(sent, use_dask=is_dataset)
     except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
@@ -1073,6 +1146,11 @@ def export_query(
                 "query": _query_echo(query),
             }
         )
+
+    limit_note = None
+    if client_limit is not None:
+        # Lazy datasets are sliced before any chunk is fetched.
+        data, limit_note = _limit_result(data, client_limit, stage.coordkeys)
 
     if is_dataset and fmt != "netcdf":
         # Size the flattened table from the lazy structure (no data fetched
@@ -1120,14 +1198,15 @@ def export_query(
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
     summary = summarize_data(data, max_rows=0, warnings=warnings)
-    return to_json(
-        {
-            "path": str(dest),
-            "format": fmt,
-            "bytes_written": dest.stat().st_size,
-            "summary": summary,
-        }
-    )
+    out: dict[str, Any] = {
+        "path": str(dest),
+        "format": fmt,
+        "bytes_written": dest.stat().st_size,
+        "summary": summary,
+    }
+    if limit_note:
+        out["limit_note"] = limit_note
+    return to_json(out)
 
 
 # Assemble the shared Args docs into each query tool's docstring BEFORE
@@ -1159,8 +1238,9 @@ export_query.__doc__ = f"""{export_query.__doc__}
 
     Returns:
         Hosted: JSON with a signed download_url, format, size, container, and
-        available_formats. Local: JSON with the written path, format,
-        bytes_written, and a structure summary. Neither returns inline values.
+        available_formats (or a refused object, with no URL, above the hosted
+        cap). Local: JSON with the written path, format, bytes_written, a
+        structure summary, and any limit_note. Neither returns inline values.
     """
 
 stage_query = mcp.tool(annotations=READ_TOOL)(stage_query)

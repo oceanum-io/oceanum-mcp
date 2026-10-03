@@ -6,6 +6,7 @@ limit to the returned (resampled/aggregated) result instead.
 """
 
 import json
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -253,3 +254,215 @@ class TestLimitWithResampling:
             limit=2,
         )
         assert _sent_query().limit == 2
+
+
+class TestStageQueryLimit:
+    """OCE-319: stage_query sizes what query_data/export_query actually fetch."""
+
+    def test_limit_not_staged_with_time_resolution(self, mock_conn, mock_stage):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+
+        parsed = json.loads(
+            server.stage_query(
+                datasource_id="test-ds",
+                time_start="2024-01-01",
+                time_end="2024-01-07",
+                time_resolution="1D",
+                limit=2,
+            )
+        )
+        assert mock_stage.call_args.args[1].limit is None
+        assert mock_stage.call_args.args[1].timefilter.resolution == "1D"
+        assert "upper bound" in parsed["limit_note"]
+        assert "after" in parsed["limit_note"].lower()
+        # The echoed query keeps the caller's limit.
+        assert parsed["query"]["limit"] == 2
+
+    def test_limit_not_staged_with_aggregation(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+
+        parsed = json.loads(
+            server.stage_query(
+                datasource_id="test-ds", aggregate_operations=["mean"], limit=3
+            )
+        )
+        assert mock_stage.call_args.args[1].limit is None
+        assert "limit_note" in parsed
+
+    def test_plain_limit_still_staged(self, mock_conn, mock_stage):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds", limit=5))
+        assert mock_stage.call_args.args[1].limit == 5
+        assert "limit_note" not in parsed
+
+    def test_hosted_note_says_export_refuses_combination(self, mock_conn, mock_stage):
+        from oceanum_mcp.common.config import set_transport
+
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        try:
+            set_transport("http")
+            parsed = json.loads(
+                server.stage_query(
+                    datasource_id="test-ds",
+                    time_start="2024-01-01",
+                    time_end="2024-01-07",
+                    time_resolution="1D",
+                    limit=2,
+                )
+            )
+        finally:
+            set_transport("stdio")
+        assert "export_query" in parsed["limit_note"]
+        assert "not supported" in parsed["limit_note"]
+
+
+class TestExportQueryLimit:
+    """OCE-319: export_query applies limit after resampling, never before."""
+
+    def test_local_export_does_not_send_limit(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6)
+
+        server.export_query(
+            datasource_id="test-ds",
+            path=str(tmp_path / "out.nc"),
+            time_start="2024-01-01",
+            time_end="2024-01-07",
+            time_resolution="1D",
+            limit=2,
+        )
+        assert _sent_query().limit is None
+        assert _sent_query().timefilter.resolution == "1D"
+        assert mock_stage.call_args.args[1].limit is None
+
+    def test_local_export_writes_last_n_resampled_steps(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6)
+        dest = tmp_path / "out.nc"
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds",
+                path=str(dest),
+                time_start="2024-01-01",
+                time_end="2024-01-07",
+                time_resolution="1D",
+                limit=2,
+            )
+        )
+        with xr.open_dataset(dest) as ds:
+            assert ds["hs"].values.tolist() == [4.0, 5.0]
+        assert parsed["summary"]["dims"] == {"time": 2}
+        assert "after" in parsed["limit_note"].lower()
+
+    def test_local_export_limits_aggregated_frame(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"x": range(10)})
+        dest = tmp_path / "out.csv"
+
+        server.export_query(
+            datasource_id="test-ds",
+            path=str(dest),
+            format="csv",
+            aggregate_operations=["mean"],
+            limit=3,
+        )
+        assert _sent_query().limit is None
+        assert pd.read_csv(dest)["x"].tolist() == [7, 8, 9]
+
+    def test_local_export_limits_before_flattening(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6)
+        dest = tmp_path / "out.csv"
+
+        server.export_query(
+            datasource_id="test-ds",
+            path=str(dest),
+            format="csv",
+            time_start="2024-01-01",
+            time_end="2024-01-07",
+            time_resolution="1D",
+            limit=2,
+        )
+        assert pd.read_csv(dest)["hs"].tolist() == [4.0, 5.0]
+
+    def test_plain_limit_still_sent_on_export(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6)
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds", path=str(tmp_path / "out.nc"), limit=5
+            )
+        )
+        assert _sent_query().limit == 5
+        assert "limit_note" not in parsed
+
+    def test_hosted_export_refuses_limit_with_resampling(self, mock_conn):
+        from oceanum_mcp.common.config import set_transport
+
+        try:
+            set_transport("http")
+            with patch.object(server, "_download_stage") as dl:
+                with pytest.raises(ToolError, match="drop limit"):
+                    server.export_query(
+                        datasource_id="test-ds",
+                        time_start="2024-01-01",
+                        time_end="2024-01-07",
+                        time_resolution="1D",
+                        limit=2,
+                    )
+                with pytest.raises(ToolError, match="not supported for hosted"):
+                    server.export_query(
+                        datasource_id="test-ds",
+                        aggregate_operations=["mean"],
+                        limit=2,
+                    )
+        finally:
+            set_transport("stdio")
+        # Refused before any gateway download link is minted.
+        dl.assert_not_called()
+
+    def test_hosted_export_plain_limit_still_allowed(self, mock_conn):
+        from oceanum_mcp.common.config import set_transport
+
+        stage = {
+            "container": "dataframe",
+            "size": 10,
+            "formats": ["parquet"],
+            "url": "https://gw.test/x?sig=1",
+        }
+        try:
+            set_transport("http")
+            with patch.object(server, "_download_stage", return_value=stage) as dl:
+                parsed = json.loads(
+                    server.export_query(datasource_id="test-ds", limit=2)
+                )
+        finally:
+            set_transport("stdio")
+        assert "download_url" in parsed
+        assert dl.call_args.args[1].limit == 2
+
+    async def test_all_query_tools_document_same_limit_semantics(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        # FastMCP keeps the Args section in the tool description.
+        docs = [
+            next(
+                line.strip()
+                for line in tools[name].description.splitlines()
+                if line.strip().startswith("limit:")
+            )
+            for name in ("stage_query", "query_data", "export_query")
+        ]
+        assert docs[0] == docs[1] == docs[2]
+        desc = docs[0].lower()
+        assert "last" in desc and "after" in desc
+        assert "time_resolution" in desc and "aggregate_operations" in desc
+        assert "hosted" in desc

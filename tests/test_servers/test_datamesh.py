@@ -20,6 +20,7 @@ from oceanum.datamesh.exceptions import (
 from oceanum.datamesh.query import Container, CoordSelector, GeoFilter, Query
 
 import oceanum_mcp.servers.datamesh.server as server
+from oceanum_mcp.common.formatting import human_bytes
 from tests.conftest import make_stage
 
 
@@ -263,6 +264,24 @@ class TestStageQuery:
     ):
         from oceanum_mcp.common.config import set_transport
 
+        mock_stage.return_value = make_stage(Container.Dataset, size=7_300_000_000)
+        try:
+            set_transport("http")
+            rec = json.loads(server.stage_query(datasource_id="test-ds"))[
+                "recommendation"
+            ]
+        finally:
+            set_transport("stdio")
+        assert "7.3 GB download" in rec
+        assert "ask the user before exporting" in rec
+        assert "disk" not in rec
+        assert "refuse" not in rec
+
+    def test_large_result_above_hosted_cap_says_export_refused(
+        self, mock_conn, mock_stage
+    ):
+        from oceanum_mcp.common.config import set_transport
+
         mock_stage.return_value = make_stage(Container.Dataset, size=73_000_000_000)
         try:
             set_transport("http")
@@ -271,9 +290,11 @@ class TestStageQuery:
             ]
         finally:
             set_transport("stdio")
-        assert "73.0 GB download" in rec
-        assert "ask the user before exporting" in rec
-        assert "refuse" not in rec
+        assert "73.0 GB" in rec
+        assert "refuse" in rec
+        assert human_bytes(server.MAX_HOSTED_EXPORT_BYTES) in rec
+        assert "disk" not in rec
+        assert rec.index("Narrow") < rec.index("export_query")
 
     def test_row_cap_warning(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(
@@ -617,6 +638,19 @@ class TestExportQuery:
         with pytest.raises(ToolError, match="path is required"):
             server.export_query(datasource_id="test-ds")
 
+    @pytest.mark.parametrize("sentinel", ["null", ""])
+    def test_sentinel_path_treated_as_omitted(
+        self, mock_conn, mock_stage, tmp_path, monkeypatch, sentinel
+    ):
+        # Some MCP clients send "null" for an omitted optional param; it must
+        # not become a file literally named "null" in the working directory.
+        monkeypatch.chdir(tmp_path)
+        mock_conn.query.return_value = _small_dataset()
+        with pytest.raises(ToolError, match="path is required"):
+            server.export_query(datasource_id="test-ds", path=sentinel)
+        assert list(tmp_path.iterdir()) == []
+        mock_conn.query.assert_not_called()
+
     def test_refuses_overwrite(self, mock_conn, mock_stage, tmp_path):
         dest = tmp_path / "exists.nc"
         dest.write_text("data")
@@ -864,6 +898,55 @@ class TestExportQueryHosted:
             parsed = json.loads(server.export_query(datasource_id="test-ds"))
         assert "download_url" in parsed
         assert "warning" in parsed and "Large download" in parsed["warning"]
+
+    def test_download_at_hosted_cap_still_returned(self, mock_conn):
+        at_cap = self._stage(size=server.MAX_HOSTED_EXPORT_BYTES)
+        with patch.object(server, "_download_stage", return_value=at_cap):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "download_url" in parsed
+        assert "refused" not in parsed
+        assert "Large download" in parsed["warning"]
+
+    def test_small_download_has_no_warning(self, mock_conn):
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "download_url" in parsed
+        assert "warning" not in parsed
+        assert "refused" not in parsed
+
+    def test_download_above_hosted_cap_refused_without_url(self, mock_conn):
+        size = server.MAX_HOSTED_EXPORT_BYTES + 1
+        huge = self._stage(container="dataset", size=size)
+        with patch.object(server, "_download_stage", return_value=huge):
+            raw = server.export_query(datasource_id="test-ds")
+        parsed = json.loads(raw)
+        assert parsed["refused"] is True
+        assert parsed["size_bytes"] == size
+        assert parsed["container"] == "dataset"
+        assert "Narrow" in parsed["message"]
+        assert human_bytes(server.MAX_HOSTED_EXPORT_BYTES) in parsed["message"]
+        assert parsed["query"]["datasource"] == "test-ds"
+        # The signed (bearer) URL must not leak in any field.
+        assert "download_url" not in parsed
+        assert "sig=xyz" not in raw and "oceanql" not in raw
+
+    @pytest.mark.parametrize("size", [None, "n/a"])
+    def test_unknown_size_fails_closed(self, mock_conn, size):
+        stage = self._stage()
+        stage["size"] = size
+        with patch.object(server, "_download_stage", return_value=stage):
+            raw = server.export_query(datasource_id="test-ds")
+        parsed = json.loads(raw)
+        assert "download size" in parsed["error"]
+        assert "download_url" not in parsed
+        assert "sig=xyz" not in raw
+
+    def test_null_path_does_not_claim_path_ignored(self, mock_conn):
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            parsed = json.loads(
+                server.export_query(datasource_id="test-ds", path="null")
+            )
+        assert "ignored on hosted" not in parsed["note"]
 
     def test_no_data(self, mock_conn):
         with patch.object(server, "_download_stage", return_value=None):
