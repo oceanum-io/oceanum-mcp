@@ -737,9 +737,14 @@ def query_data(
 
     Inline values are a preview when `preview` is true (`returned` of `total`
     records): never compute statistics from a preview; use
-    aggregate_operations or time_resolution instead. A limited result is a
-    subset of the requested range, so it is flagged as a preview, with a
-    limit_note.
+    aggregate_operations or time_resolution instead.
+
+    limit keeps the last N records (Datamesh semantics: the last N steps along
+    time/ensemble). Combined with time_resolution or aggregate_operations,
+    limit is applied by this server AFTER resampling/aggregation (to the last
+    N resampled steps, or the last N rows of a table) rather than sent to
+    Datamesh. A limited result is a subset of the requested range, so it is
+    flagged as a preview, with a limit_note.
     """
     conn = get_datamesh_connector()
     query = _build_query(

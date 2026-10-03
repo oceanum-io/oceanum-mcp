@@ -452,13 +452,21 @@ class TestExportQueryLimit:
 
     async def test_all_query_tools_document_same_limit_semantics(self):
         tools = {t.name: t for t in await server.mcp.list_tools()}
-        # FastMCP keeps the Args section in the tool description.
-        docs = [
-            next(
-                line.strip()
-                for line in tools[name].description.splitlines()
+
+        def limit_doc(tool) -> str:
+            # FastMCP moves Args into the parameter schema when it can parse
+            # them (Python < 3.13); otherwise they stay in the description.
+            param = tool.parameters["properties"]["limit"].get("description")
+            if param:
+                return param
+            return next(
+                line.strip().removeprefix("limit:").strip()
+                for line in tool.description.splitlines()
                 if line.strip().startswith("limit:")
             )
+
+        docs = [
+            limit_doc(tools[name])
             for name in ("stage_query", "query_data", "export_query")
         ]
         assert docs[0] == docs[1] == docs[2]
