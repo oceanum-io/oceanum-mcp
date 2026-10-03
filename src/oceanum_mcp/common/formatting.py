@@ -13,6 +13,7 @@ import math
 import sys
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -113,28 +114,40 @@ def _coord_summary(coord: xr.DataArray) -> dict[str, Any]:
     return out
 
 
-def _scalar_records(ds: xr.Dataset) -> list[dict[str, Any]]:
-    """One record per variable of a 0-d Dataset: name, value, units/long_name.
+def _scalar_value(var: xr.DataArray) -> Any:
+    """JSON-safe value of a 0-d variable, at full precision.
 
-    Values go through a one-row frame so they get the same JSON conversion as
-    every other record (NaN -> null, numpy scalars -> numbers, ISO datetimes).
+    Datetimes/timedeltas use the records conversion (ISO strings, NaT ->
+    null) to match other records; numbers skip it because DataFrame.to_json
+    rounds floats to 10 decimals, which would erase small aggregates.
     """
-    names = {name: str(name) for name in ds.data_vars}
-    rows = _records(
-        pd.DataFrame({names[n]: [var.values[()]] for n, var in ds.data_vars.items()})
-    )
-    row = rows[0] if rows else {}
+    value = var.values[()]
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return _records(pd.DataFrame({"v": [value]}))[0]["v"]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _scalar_records(ds: xr.Dataset) -> list[dict[str, Any]]:
+    """One record per variable of a 0-d Dataset: name, value, units/long_name."""
     out = []
     for name, var in ds.data_vars.items():
-        rec: dict[str, Any] = {"name": names[name], "value": row[names[name]]}
+        rec: dict[str, Any] = {"name": str(name), "value": _scalar_value(var)}
         for key in ("units", "long_name"):
-            if key in var.attrs:
+            if var.attrs.get(key) not in (None, ""):
                 rec[key] = str(var.attrs[key])
         out.append(rec)
     return out
 
 
 def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
+    if not ds.sizes and max_rows > 0:
+        # A 0-d result is one value per variable: compute it even if lazy
+        # (use_dask is chosen from the staged size, not the result's).
+        ds = ds.compute()
     lazy = any(ds[v].chunks is not None for v in ds.data_vars)
     out: dict[str, Any] = {
         "container": "dataset",
@@ -172,8 +185,8 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
         # still go through to_dataframe, which broadcasts 0-d variables.
         out["data"] = _scalar_records(ds)
         out["truncated"] = False
-        count = 1 if out["data"] else 0
-        out.update(_preview_fields(count, count))
+        # One record, as counted elsewhere (prod of no dims = 1).
+        out.update(_preview_fields(1, 1))
     elif max_rows > 0:
         # Eager data is already in memory — always include a preview of
         # coordinate-attributed values.

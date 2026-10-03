@@ -4,6 +4,7 @@ import json
 import os
 from unittest.mock import patch
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
@@ -245,3 +246,67 @@ def test_mixed_zero_d_and_dimensioned_variables_broadcast():
     out = summarize_data(ds)
     assert [r["hs_mean"] for r in out["data"]] == [1.5, 1.5]
     assert out["returned"] == out["total"] == 2
+
+
+def test_zero_d_values_keep_full_precision():
+    # DataFrame.to_json rounds to 10 decimals: a tiny mean must not become 0.0.
+    ds = xr.Dataset(
+        {
+            "small": ((), 5e-12),
+            "precise": ((), 1.23456789012345),
+            "inf": ((), np.inf),
+            "flag": ((), np.bool_(True)),
+            "missing": ((), np.datetime64("NaT", "ns")),
+        }
+    )
+    values = {r["name"]: r["value"] for r in summarize_data(ds)["data"]}
+    assert values == {
+        "small": 5e-12,
+        "precise": 1.23456789012345,
+        "inf": None,
+        "flag": True,
+        "missing": None,
+    }
+
+
+def test_zero_d_empty_or_none_attrs_omitted():
+    ds = xr.Dataset({"x": ((), 1.0, {"units": None, "long_name": ""})})
+    assert summarize_data(ds)["data"] == [{"name": "x", "value": 1.0}]
+
+
+def _lazy_zero_d_dataset() -> xr.Dataset:
+    # Dataset.chunk() is a no-op without dims, so wrap the values in dask.
+    ds = _zero_d_dataset()
+    for name in ds.data_vars:
+        ds[name] = ds[name].copy(data=da.from_array(ds[name].values))
+    assert ds["hs"].chunks is not None
+    return ds
+
+
+def test_lazy_zero_d_dataset_is_computed():
+    # query_data picks use_dask from the staged size, so an aggregate can come
+    # back dask-backed; a 0-d result is tiny and is returned as values.
+    ds = _lazy_zero_d_dataset()
+    out = summarize_data(ds)
+    assert out["lazy"] is False
+    assert out["data"][0] == {
+        "name": "hs",
+        "value": 1.5,
+        "units": "m",
+        "long_name": "Hs",
+    }
+    assert (out["preview"], out["returned"], out["total"]) == (False, 1, 1)
+    # The caller's dataset is not loaded in place.
+    assert ds["hs"].chunks is not None
+
+
+def test_lazy_zero_d_structure_only_not_computed():
+    out = summarize_data(_lazy_zero_d_dataset(), max_rows=0)
+    assert out["lazy"] is True
+    assert "data" not in out
+
+
+def test_zero_d_dataset_without_variables():
+    out = summarize_data(xr.Dataset(coords={"time": pd.Timestamp("2024-01-01")}))
+    assert out["data"] == []
+    assert (out["preview"], out["returned"], out["total"]) == (False, 1, 1)
