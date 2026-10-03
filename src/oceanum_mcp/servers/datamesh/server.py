@@ -440,7 +440,12 @@ def _run_bounded(fn: Callable[[], Any], datasource_id: str) -> Any:
             _SUGGEST_SLOTS.release()
 
     thread = threading.Thread(target=target, name="datamesh-suggest", daemon=True)
-    thread.start()
+    try:
+        thread.start()
+    except RuntimeError:  # e.g. "can't start new thread"
+        _SUGGEST_SLOTS.release()
+        logger.warning("Suggestions for %r skipped", datasource_id, exc_info=True)
+        return None
     thread.join(SUGGEST_TIMEOUT)
     if thread.is_alive():
         logger.warning(
@@ -568,15 +573,25 @@ def _engine_missing_fields(
     return None  # visible to the caller: keep the engine's own error
 
 
+def _best_effort(fn: Callable[[], Any], datasource_id: str) -> Any:
+    """fn() (in-memory work, no I/O), or None, logging a warning, if it
+    raised: a bug in building suggestions must not replace the error."""
+    try:
+        return fn()
+    except Exception:
+        logger.warning("Suggestions for %r failed", datasource_id, exc_info=True)
+        return None
+
+
 def _datasource_schema(conn: Connector, datasource_id: str, exc: Exception) -> Any:
     """The caller's own get_datasource record for datasource_id, fetched at
     most once per error (cached on exc) and bounded by _run_bounded; None if
     the lookup failed."""
-    if not hasattr(exc, "_oce303_datasource"):
-        exc._oce303_datasource = _run_bounded(  # type: ignore[attr-defined]
+    if not hasattr(exc, "_datamesh_schema_lookup"):
+        exc._datamesh_schema_lookup = _run_bounded(  # type: ignore[attr-defined]
             partial(conn.get_datasource, datasource_id), datasource_id
         )
-    return exc._oce303_datasource  # type: ignore[attr-defined]
+    return exc._datamesh_schema_lookup  # type: ignore[attr-defined]
 
 
 def _unknown_variables(datasource: Any, variables: list[str]) -> list[str]:
@@ -662,8 +677,11 @@ def _stage_resolving(
     succeeded, in which case the caller must apply _substituted(query,
     aliases) to the query it goes on to use. Only the caller's own
     get_datasource record is consulted (one bounded fetch, reused by
-    _error_json on failure). If nothing resolves, or the retry fails too,
-    the ORIGINAL error is raised.
+    _error_json on failure). If nothing resolves, or the retry still reports
+    a missing variable, the ORIGINAL error is raised; any other retry error
+    (e.g. GatewayTimeout) is raised as is. The retry is a second stage with
+    its own OCEANUM_MCP_STAGE_TIMEOUT, so this error path can take up to
+    twice the stage timeout plus SUGGEST_TIMEOUT.
     """
     try:
         return stage_fn(conn, query), {}
@@ -676,7 +694,7 @@ def _stage_resolving(
             raise
         datasource = _datasource_schema(conn, query.datasource, exc)
         aliases = (
-            _run_bounded(
+            _best_effort(
                 partial(_standard_name_aliases, datasource, query.variables),
                 query.datasource,
             )
@@ -687,8 +705,12 @@ def _stage_resolving(
             raise
         try:
             result = stage_fn(conn, _substituted(query, aliases))
-        except _DATAMESH_ERRORS:
-            raise exc from None
+        except _DATAMESH_ERRORS as retry_exc:
+            if _VARIABLE_MISSING_RE.search(str(retry_exc)):
+                raise exc from None
+            # Anything else (a timeout, a 5xx) is the real problem now: the
+            # variables did resolve, so do not report them as missing.
+            raise
     recorder = _RESOLVED_VARIABLES.get()
     if recorder is not None:
         recorder.update(aliases)
@@ -710,7 +732,13 @@ def _reporting_resolved_variables(tool: Callable[..., str]) -> Callable[..., str
             _RESOLVED_VARIABLES.reset(token)
         if not resolved:
             return out
-        return to_json({**json.loads(out), "resolved_variables": resolved})
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            return out
+        if not isinstance(payload, dict):
+            return out
+        return to_json({**payload, "resolved_variables": resolved})
 
     return wrapper
 
@@ -752,7 +780,7 @@ def _error_json(
     elif variables and _VARIABLE_MISSING_RE.search(message):
         datasource = _datasource_schema(conn, datasource_id, exc)
         if datasource is not None:
-            fields = _run_bounded(
+            fields = _best_effort(
                 partial(_variable_fields, datasource_id, datasource, variables),
                 datasource_id,
             )
@@ -1341,6 +1369,11 @@ def stage_query(
     echoes the canonical query. With limit plus time_resolution or
     aggregate_operations the reported size is that of the unlimited result
     (limit is applied after resampling), so it is an upper bound.
+
+    A variable given as the exact CF standard_name of exactly one of the
+    datasource's variables (e.g. "sea_surface_wave_significant_height" for
+    "hs") is resolved to that variable; the response then includes
+    resolved_variables ({requested: used}) and echoes the resolved names.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -1521,6 +1554,11 @@ def query_data(
     N resampled steps, or the last N rows of a table) rather than sent to
     Datamesh. A limited result is a subset of the requested range, so it is
     flagged as a preview, with a limit_note.
+
+    A variable given as the exact CF standard_name of exactly one of the
+    datasource's variables (e.g. "sea_surface_wave_significant_height" for
+    "hs") is resolved to that variable; the response then includes
+    resolved_variables ({requested: used}) and echoes the resolved names.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -1846,6 +1884,11 @@ def export_query(
       the local export cap or the destination's free disk space. With limit
       plus time_resolution/aggregate_operations, the last N resampled steps
       are written.
+
+    A variable given as the exact CF standard_name of exactly one of the
+    datasource's variables (e.g. "sea_surface_wave_significant_height" for
+    "hs") is resolved to that variable; the response then includes
+    resolved_variables ({requested: used}) and echoes the resolved names.
     """
     # Some MCP clients send "null"/"" for an omitted path (never a file name).
     path = _unset_sentinel(path)

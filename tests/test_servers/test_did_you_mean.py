@@ -538,9 +538,11 @@ class TestStandardNameResolution:
         assert mock_stage.call_count == 1
 
     def test_failed_retry_returns_original_error(self, mock_conn, mock_stage):
+        # The retry reports a missing variable again (e.g. the engine still
+        # rejects the resolved name): the original error stands.
         mock_stage.side_effect = [
             _stage_bad_variable(ALIAS),
-            DatameshConnectError("Datamesh server error: retry blew up"),
+            _stage_bad_variable("hs (retry)"),
         ]
         mock_conn.get_datasource.return_value = _wave_datasource()
 
@@ -548,13 +550,27 @@ class TestStandardNameResolution:
             server.stage_query(datasource_id="era5_wave_global", variables=[ALIAS])
         )
 
-        assert "retry blew up" not in parsed["error"]
+        assert "retry" not in parsed["error"]
         assert ALIAS in parsed["error"]
         assert parsed["suggestions"][0]["did_you_mean"][0] == "hs"
         assert parsed["query"]["variables"] == [ALIAS]
         assert "resolved_variables" not in parsed
         # The schema fetched for the resolution is reused for the suggestions.
         mock_conn.get_datasource.assert_called_once()
+
+    def test_retry_timeout_is_not_masked(self, mock_conn, mock_stage):
+        # The alias resolved; a timeout on the retry is the real problem and
+        # must not be reported as a missing variable.
+        timeout = server.GatewayTimeout("Datamesh staging timed out after 60s.")
+        mock_stage.side_effect = [_stage_bad_variable(ALIAS), timeout]
+        mock_conn.get_datasource.return_value = _wave_datasource()
+
+        parsed = json.loads(
+            server.stage_query(datasource_id="era5_wave_global", variables=[ALIAS])
+        )
+
+        assert parsed["error"] == str(timeout)
+        assert "suggestions" not in parsed
 
     def test_local_export_resolves(self, mock_conn, mock_stage, tmp_path):
         mock_stage.side_effect = [_stage_bad_variable(ALIAS), make_stage()]
@@ -631,3 +647,18 @@ class TestLookupThreads:
 
         assert parsed["error"] == "Datasource era5_wave_glob not found"
         mock_conn.get_catalog.assert_not_called()
+
+    def test_thread_start_failure_releases_the_slot(self, mock_conn):
+        mock_conn.get_datasource.side_effect = _not_found("era5_wave_glob")
+        slots = threading.BoundedSemaphore(1)
+
+        with (
+            patch.object(server, "_SUGGEST_SLOTS", slots),
+            patch.object(
+                threading.Thread, "start", side_effect=RuntimeError("no threads")
+            ),
+        ):
+            parsed = json.loads(server.get_datasource_info("era5_wave_glob"))
+
+        assert parsed["error"] == "Datasource era5_wave_glob not found"
+        assert slots.acquire(blocking=False)  # the slot was given back
