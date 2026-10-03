@@ -767,7 +767,7 @@ class TestExportQuery:
         mock_stage.return_value = make_stage(Container.Dataset, size=100)
         dest = tmp_path / "out.nc"
 
-        def _partial_write(path):
+        def _partial_write(path, **kwargs):
             path.write_bytes(b"partial")
             raise exc_type("interrupted")
 
@@ -787,7 +787,7 @@ class TestExportQuery:
         dest = tmp_path / "out.nc"
         dest.write_bytes(b"original")
 
-        def _partial_write(path):
+        def _partial_write(path, **kwargs):
             path.write_bytes(b"partial")
             raise KeyboardInterrupt
 

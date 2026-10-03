@@ -13,6 +13,7 @@ Error conventions:
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 import re
@@ -21,16 +22,22 @@ import threading
 import time
 import uuid
 import warnings as _warnings
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
 from pathlib import Path
+from types import FrameType, TracebackType
 from typing import Any, Iterator, Literal
 
+import dask
+import dask.array
 import numpy as np
 import pandas as pd
 import requests
 import xarray as xr
+from anyio import from_thread
+from dask.system import CPU_COUNT
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pandas.tseries.frequencies import to_offset
@@ -77,9 +84,9 @@ DATAMESH_ROW_CAP = 2_000_000
 # Ceiling on bytes loaded into memory for a tabular export (local/stdio path).
 MAX_EXPORT_FRAME_BYTES = 2_000_000_000
 
-# Ceiling on a local (stdio) dataset export. Real cancellation of an
-# in-flight write is not possible yet (the to_netcdf call runs to completion in
-# a worker thread), so this bounds the damage of a runaway export: at the
+# Ceiling on a local (stdio) dataset export. A cancelled NetCDF export stops
+# between chunks (OCE-323), but a client that never cancels does not, so this
+# still bounds the damage of a runaway export: at the
 # ~145 MB/s observed in OCE-296 it is ~70 s of disk writing, versus the 36.5 GB
 # written before that export was killed. 10x the "ask the user" threshold, so
 # multi-GB exports the user has agreed to still work; anything larger belongs
@@ -1343,8 +1350,8 @@ def _disk_refusal(
 ) -> str | None:
     """Refusal JSON if dest's filesystem lacks room for nbytes as fmt.
 
-    Checked before writing a byte: a local export cannot be cancelled once it
-    starts (OCE-296). Probes the nearest existing ancestor, since the
+    Checked before writing a byte, so a runaway export never starts
+    (OCE-296). Probes the nearest existing ancestor, since the
     destination directory may not exist yet. An existing file being
     overwritten is not credited: the new file is written alongside it first.
     Returns error JSON if free space cannot be determined.
@@ -1372,6 +1379,122 @@ def _disk_refusal(
         free_bytes=free,
         query=_query_echo(query),
     )
+
+
+def _cancel_requested() -> bool:
+    """Whether the MCP client cancelled the request this tool call serves.
+
+    FastMCP runs a sync tool via anyio.to_thread.run_sync, so the
+    notifications/cancelled that cancels the request's scope cannot interrupt
+    this worker thread, but anyio lets the thread see it (OCE-323). False for
+    a direct call (not in an anyio worker thread).
+    """
+    try:
+        from_thread.check_cancelled()
+    except RuntimeError:  # anyio.NoEventLoopError: not an anyio worker thread
+        return False
+    except BaseException:  # the event loop's cancellation exception
+        return True
+    return False
+
+
+def _raise_if_cancelled() -> None:
+    """Raise the event loop's cancellation exception if cancelled.
+
+    It must propagate out of the tool: the SDK has already answered the
+    request "cancelled", and a result or ToolError returned afterwards fails
+    its respond() assertion, which takes the stdio server down.
+    """
+    if _cancel_requested():
+        from_thread.check_cancelled()
+
+
+class _ExportCancelled(Exception):
+    """Stops a NetCDF export's dask compute between chunks (OCE-323)."""
+
+
+def _stop_if_cancelled(key: Any, dsk: Any, state: Any) -> None:
+    """dask pretask callback: refuse to start another chunk once cancelled."""
+    if _cancel_requested():
+        raise _ExportCancelled
+
+
+def _write_netcdf(data: xr.Dataset, path: Path) -> None:
+    """Write data to path as NetCDF, stopping between chunks on cancellation.
+
+    The lazy (dask) dataset is computed chunk by chunk on a pool owned by this
+    call, with a callback that checks for cancellation before each chunk task
+    starts. On cancellation or any failure it waits for the chunks already in
+    flight (dask's scheduler stops on an error without waiting for them) and
+    closes the file, so nothing is still writing to or holding the partial
+    file when the caller removes it, then raises the request's cancellation
+    (or the failure).
+    """
+    # Store each lazy variable in HDF5 chunks matching its dask chunks. The
+    # default contiguous layout makes the first chunk write allocate the whole
+    # variable and pre-fill it with fill values, one uninterruptible write as
+    # large as the export itself.
+    lazy = [
+        name
+        for name, var in data.variables.items()
+        if isinstance(var.data, dask.array.Array)
+        and var.size
+        and not {"chunksizes", "contiguous"} & var.encoding.keys()
+        and math.prod(var.data.chunksize) * var.dtype.itemsize < 2**32  # HDF5 cap
+    ]
+    if lazy:
+        data = data.copy(deep=False)  # own encoding dicts; the caller's untouched
+        for name in lazy:
+            var = data.variables[name]
+            var.encoding["chunksizes"] = var.data.chunksize
+    # Writes the header (and any in-memory variables) now; returns the chunk
+    # writes plus a final store close as a dask graph.
+    pending = data.to_netcdf(path, compute=False)
+    pool = ThreadPoolExecutor(dask.config.get("num_workers", None) or CPU_COUNT)
+    try:
+        pending.compute(
+            scheduler="threads",
+            pool=pool,
+            callbacks=[(None, None, _stop_if_cancelled, None, None)],
+        )
+        return
+    except _ExportCancelled:
+        failure = None  # not kept: its frames reference the graph
+    except BaseException as exc:
+        failure = exc
+    finally:
+        pool.shutdown(wait=True)
+    # The graph's final store close never ran, and the store stays open until
+    # the (cyclic) graph is collected. Drop the graph, and the failure's
+    # frames that reference it, and collect, so the file is closed before the
+    # caller deletes it (Windows cannot delete an open file).
+    del pending
+    if failure is not None:
+        _release_frames(failure.__traceback__)
+    gc.collect()
+    if failure is not None:
+        raise failure
+    _raise_if_cancelled()  # raises: a cancelled scope stays cancelled
+    raise _ExportCancelled("export cancelled")
+
+
+def _release_frames(tb: TracebackType | None) -> None:
+    """traceback.clear_frames, extended to each frame's callers.
+
+    A dask chunk task's exception keeps the worker thread's frames alive
+    through f_back, and those frames' locals reference the write graph. The
+    traceback keeps its file and line entries; only locals are dropped.
+    Frames still executing (this thread's callers) are skipped.
+    """
+    while tb is not None:
+        frame: FrameType | None = tb.tb_frame
+        while frame is not None:
+            try:
+                frame.clear()
+            except RuntimeError:  # still executing
+                pass
+            frame = frame.f_back
+        tb = tb.tb_next
 
 
 def export_query(
@@ -1565,6 +1688,9 @@ def export_query(
         except (*_DATAMESH_ERRORS, OSError) as exc:
             return to_json({"error": str(exc), "query": _query_echo(query)})
 
+    # Cancelled while staging or downloading (OCE-323): write nothing.
+    _raise_if_cancelled()
+
     # Write into a private sibling directory under dest's own file name, then
     # rename into place on success: a failure never leaves a partial file at
     # dest nor destroys a file being overwritten, and pandas/xarray still see
@@ -1576,11 +1702,15 @@ def export_query(
         dest.parent.mkdir(parents=True, exist_ok=True)
         tmp_dir.mkdir()
         if fmt == "netcdf":
-            data.to_netcdf(tmp)
+            _write_netcdf(data, tmp)
         elif fmt == "parquet":
             data.to_parquet(tmp)
         else:
             data.to_csv(tmp, index=False)
+        # A cancelled request is already answered: never move its file into
+        # place. (Tabular writes are in-memory frames, capped at
+        # MAX_EXPORT_FRAME_BYTES, and are not interrupted mid-write.)
+        _raise_if_cancelled()
         os.replace(tmp, dest)
     except (*_DATAMESH_ERRORS, OSError) as exc:
         return to_json(
