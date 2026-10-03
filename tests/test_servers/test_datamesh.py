@@ -356,6 +356,35 @@ class TestQueryData:
         assert len(parsed["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
         assert parsed["truncated"] is True
 
+    def test_full_aggregate_returns_scalars(self, mock_conn, mock_stage):
+        # OCE-320: aggregating over space and time yields a 0-d Dataset.
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = xr.Dataset(
+            {
+                "hs": ((), np.float32(2.25), {"units": "m"}),
+                "tp": ((), np.float64(9.5)),
+            }
+        )
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds",
+                variables=["hs", "tp"],
+                aggregate_operations=["mean"],
+                aggregate_spatial=True,
+                aggregate_temporal=True,
+            )
+        )
+        assert "error" not in parsed
+        assert mock_conn.query.call_args.args[0].aggregate is not None
+        assert parsed["data"] == [
+            {"name": "hs", "value": 2.25, "units": "m"},
+            {"name": "tp", "value": 9.5},
+        ]
+        assert parsed["preview"] is False
+        assert parsed["returned"] == 1
+        assert parsed["total"] == 1
+
 
 class TestExportQuery:
     def test_frame_to_parquet(self, mock_conn, mock_stage, tmp_path):

@@ -113,6 +113,27 @@ def _coord_summary(coord: xr.DataArray) -> dict[str, Any]:
     return out
 
 
+def _scalar_records(ds: xr.Dataset) -> list[dict[str, Any]]:
+    """One record per variable of a 0-d Dataset: name, value, units/long_name.
+
+    Values go through a one-row frame so they get the same JSON conversion as
+    every other record (NaN -> null, numpy scalars -> numbers, ISO datetimes).
+    """
+    names = {name: str(name) for name in ds.data_vars}
+    rows = _records(
+        pd.DataFrame({names[n]: [var.values[()]] for n, var in ds.data_vars.items()})
+    )
+    row = rows[0] if rows else {}
+    out = []
+    for name, var in ds.data_vars.items():
+        rec: dict[str, Any] = {"name": names[name], "value": row[names[name]]}
+        for key in ("units", "long_name"):
+            if key in var.attrs:
+                rec[key] = str(var.attrs[key])
+        out.append(rec)
+    return out
+
+
 def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
     lazy = any(ds[v].chunks is not None for v in ds.data_vars)
     out: dict[str, Any] = {
@@ -144,6 +165,15 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
             "with filters, aggregation, or time_resolution downsampling to see "
             "values inline" + export_clause() + "."
         )
+    elif max_rows > 0 and not ds.sizes:
+        # A 0-d result (e.g. aggregate_operations over space and time) has no
+        # index for to_dataframe (OCE-320): it is one record of scalars,
+        # returned as one scalar entry per variable. Datasets with any dim
+        # still go through to_dataframe, which broadcasts 0-d variables.
+        out["data"] = _scalar_records(ds)
+        out["truncated"] = False
+        count = 1 if out["data"] else 0
+        out.update(_preview_fields(count, count))
     elif max_rows > 0:
         # Eager data is already in memory — always include a preview of
         # coordinate-attributed values.
