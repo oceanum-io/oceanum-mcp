@@ -16,6 +16,7 @@ Error conventions:
 from __future__ import annotations
 
 import difflib
+import logging
 import math
 import os
 import re
@@ -24,11 +25,14 @@ import threading
 import time
 import uuid
 import warnings as _warnings
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FuturesTimeout
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 import numpy as np
 import pandas as pd
@@ -372,24 +376,41 @@ def _query_echo(query: Query) -> dict[str, Any]:
 SUGGEST_CATALOG_LIMIT = 20
 # Suggestions returned per unknown datasource id or variable.
 MAX_SUGGESTIONS = 5
+# Seconds a tool call waits for its suggestions before returning the original
+# error. The lookups are SDK metadata requests (10 s read timeout, up to 8
+# retries, 30 s back-off after a 502), so without this cap a degraded metadata
+# server could hold an already-failed tool call for minutes.
+SUGGEST_TIMEOUT = 10.0
 # Minimum similarity (0-1) for a candidate to be suggested.
-_SUGGEST_CUTOFF = 0.6
+_SUGGEST_CUTOFF = 0.7
+# Score of a candidate containing every word of the requested name (e.g.
+# "significant_wave_height" in "sea_surface_wave_significant_height"): above
+# the cutoff, below a close typo.
+_CONTAINS_ALL_WORDS_SCORE = 0.8
+# Words the catalog's keyword search (Postgres websearch_to_tsquery) treats as
+# operators or stop words; dropped from the suggestion search.
+_SEARCH_OPERATOR_WORDS = frozenset({"or", "and", "not"})
 
-# The SDK's get_datasource raises these strings (DatameshConnectError) for the
-# metadata server's 404 ("Datasource <id> not found") and 403 (the datasource
-# exists but is not shared with the caller: "You do not have permission to
-# access this datasource"). A 401 ("not Authorized") is a credential problem,
-# deliberately matched by neither.
-_FORBIDDEN_RE = re.compile(r"permission|forbidden", re.IGNORECASE)
-_NOT_FOUND_RE = re.compile(r"\bnot found\b", re.IGNORECASE)
+# The SDK's get_datasource raises DatameshConnectError with exactly
+# "Datasource <id> not found" for a metadata-server 404, and with the server's
+# detail for a 403 (the datasource exists but is not shared with the caller):
+# "You do not have permission to access this datasource". A 401 ("not
+# Authorized") is a credential problem and 5xx bodies are server faults:
+# neither is matched.
+_FORBIDDEN_RE = re.compile(r"You do not have permission\b")
 # The query engine reports a requested variable missing from the datasource as
 # "Invalid variable selection - variable not found: '<name>'".
 _VARIABLE_MISSING_RE = re.compile(
     r"variables? not found|no variable named", re.IGNORECASE
 )
 
+_SUGGEST_EXECUTOR = ThreadPoolExecutor(
+    max_workers=4, thread_name_prefix="datamesh-suggest"
+)
+logger = logging.getLogger(__name__)
 
-def _datasource_missing_re(datasource_id: str) -> re.Pattern[str]:
+
+def _engine_missing_re(datasource_id: str) -> re.Pattern[str]:
     """The query engine's 404 for a datasource id, which it returns both for a
     missing datasource and for one not shared with the caller ("Datasource
     <id> not found or not authorized")."""
@@ -404,21 +425,22 @@ def _norm(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
-def _similarity(wanted: str, candidate: str) -> float:
-    """0-1 similarity of a requested name to a candidate name or label.
+def _similarity(wanted: str, candidate: str) -> tuple[float, float]:
+    """(score, ratio) of a requested name against a candidate name or label.
 
-    The larger of the character-sequence ratio (catches typos) and the share
-    of the requested words present in the candidate (catches reordered or
-    longer names, e.g. "significant_wave_height" against the standard_name
-    "sea_surface_wave_significant_height").
+    ratio is difflib's character-sequence ratio (catches typos). score is
+    ratio, raised to _CONTAINS_ALL_WORDS_SCORE when the candidate contains
+    every word of the request (catches reordered or longer names). A partial
+    word overlap does not count: "sea_surface_temperature" must not suggest
+    "sea_surface_salinity".
     """
     a, b = _norm(wanted), _norm(candidate)
     if not a or not b:
-        return 0.0
+        return 0.0, 0.0
     ratio = difflib.SequenceMatcher(None, a, b).ratio()
-    words = set(a.split("_"))
-    overlap = len(words & set(b.split("_"))) / len(words)
-    return max(ratio, overlap)
+    if set(a.split("_")) <= set(b.split("_")):
+        return max(ratio, _CONTAINS_ALL_WORDS_SCORE), ratio
+    return ratio, ratio
 
 
 def _best_matches(wanted: str, candidates: dict[str, list[str]]) -> list[str]:
@@ -426,15 +448,17 @@ def _best_matches(wanted: str, candidates: dict[str, list[str]]) -> list[str]:
 
     candidates maps each key to the labels it is matched on (the key itself
     plus e.g. a datasource name or a variable's standard_name/long_name).
+    Ranked by score, then by character similarity, then by key.
     """
     scored = []
     for key, labels in candidates.items():
-        score = max(
-            (_similarity(wanted, label) for label in labels if label), default=0.0
+        score, ratio = max(
+            (_similarity(wanted, label) for label in labels if label),
+            default=(0.0, 0.0),
         )
         if score >= _SUGGEST_CUTOFF:
-            scored.append((-score, key))
-    return [key for _, key in sorted(scored)[:MAX_SUGGESTIONS]]
+            scored.append((-score, -ratio, key))
+    return [key for *_, key in sorted(scored)[:MAX_SUGGESTIONS]]
 
 
 def _datasource_suggestions(
@@ -446,7 +470,9 @@ def _datasource_suggestions(
     word does not empty a keyword search); the catalog only lists datasources
     shared with the caller, so entitlement is respected.
     """
-    words = [w for w in _norm(datasource_id).split("_") if w]
+    words = [
+        w for w in _norm(datasource_id).split("_") if w not in _SEARCH_OPERATOR_WORDS
+    ]
     if not words:
         return []
     catalog = conn.get_catalog(search=" or ".join(words), limit=SUGGEST_CATALOG_LIMIT)
@@ -458,20 +484,19 @@ def _datasource_suggestions(
     return [{"id": i, "name": names[i]} for i in ranked]
 
 
-def _missing_datasource(
-    conn: Connector, datasource_id: str, exc: Exception
+def _metadata_error_fields(
+    conn: Connector, datasource_id: str, message: str
 ) -> dict[str, Any] | None:
-    """Error fields for a metadata-server failure on datasource_id: a "no
+    """Error fields for a get_datasource failure on datasource_id: a "no
     access" message for a 403, "did you mean" suggestions for a 404, and None
-    for anything else. Raises if the suggestion lookup fails."""
-    message = str(exc)
-    if _FORBIDDEN_RE.search(message):
+    for anything else."""
+    if _FORBIDDEN_RE.match(message):
         return {
             "error": f"You don't have access to datasource {datasource_id!r}: it "
             "exists but is not shared with your account. Ask its owner or "
             "your Oceanum administrator for access."
         }
-    if not _NOT_FOUND_RE.search(message):
+    if message != f"Datasource {datasource_id} not found":
         return None
     suggestions = _datasource_suggestions(conn, datasource_id)
     hint = (
@@ -485,12 +510,26 @@ def _missing_datasource(
     }
 
 
-def _variable_suggestions(
-    datasource_id: str, datasource: Any, variables: list[str]
+def _engine_missing_fields(
+    conn: Connector, datasource_id: str
 ) -> dict[str, Any] | None:
-    """Error fields for requested variables a datasource lacks, with the
+    """Error fields for the query engine's "not found or not authorized": the
+    metadata server tells a missing datasource (404) from one not shared with
+    the caller (403); the engine does not."""
+    try:
+        conn.get_datasource(datasource_id)
+    except _DATAMESH_ERRORS as exc:
+        return _metadata_error_fields(conn, datasource_id, str(exc))
+    return None  # visible to the caller: keep the engine's own error
+
+
+def _variable_fields(
+    conn: Connector, datasource_id: str, variables: list[str]
+) -> dict[str, Any] | None:
+    """Error fields for requested variables the datasource lacks, with the
     closest variable names (matched on name, standard_name and long_name).
     None if every requested variable exists, or the schema is unknown."""
+    datasource = conn.get_datasource(datasource_id)
     data_vars = datasource.variables or {}
     coords = getattr(datasource.dataschema, "coords", None) or {}
     unknown = [v for v in variables if v not in data_vars and v not in coords]
@@ -515,43 +554,51 @@ def _variable_suggestions(
     }
 
 
-def _query_error(
+def _error_json(
     conn: Connector,
     datasource_id: str,
-    variables: list[str] | None,
     exc: Exception,
     context: dict[str, Any],
+    *,
+    variables: list[str] | None = None,
+    from_metadata: bool = False,
 ) -> str:
-    """JSON for a Datamesh error raised while staging/querying datasource_id.
+    """JSON for a Datamesh error on datasource_id, plus context (the echoed
+    query, or the datasource_id).
 
     If the error says the datasource or a requested variable does not exist,
-    the error is restated with "did you mean" suggestions, at the cost of at
-    most one metadata request (get_datasource) and one bounded catalog search,
-    made only on that error path. Any failure while building suggestions
-    returns the original error unchanged. context (the echoed query, or the
-    datasource_id) is appended to the response.
+    it is restated with "did you mean" suggestions; a datasource that exists
+    but is not shared with the caller is reported as such, without
+    suggestions. from_metadata marks exc as raised by get_datasource itself;
+    otherwise it is a query-engine error. The lookups (at most one
+    get_datasource and one bounded catalog search) run only on those error
+    paths and are given SUGGEST_TIMEOUT seconds; if they fail or time out
+    the original error is returned unchanged.
     """
-    original = {"error": str(exc), **context}
-    if isinstance(exc, GatewayTimeout):
-        return to_json(original)
     message = str(exc)
-    enriched: dict[str, Any] | None = None
-    # Best-effort enrichment of an error already being reported: no failure
-    # in it may replace the original error.
-    try:
-        if _datasource_missing_re(datasource_id).search(message):
-            try:
-                conn.get_datasource(datasource_id)
-            except _DATAMESH_ERRORS as meta_exc:
-                # The metadata server tells a missing datasource (404) from
-                # one not shared with the caller (403); the engine does not.
-                enriched = _missing_datasource(conn, datasource_id, meta_exc)
-        elif variables and _VARIABLE_MISSING_RE.search(message):
-            datasource = conn.get_datasource(datasource_id)
-            enriched = _variable_suggestions(datasource_id, datasource, variables)
-    except Exception:
-        enriched = None
-    return to_json({**enriched, **context} if enriched else original)
+    lookup: Callable[[], dict[str, Any] | None] | None = None
+    if from_metadata:
+        lookup = partial(_metadata_error_fields, conn, datasource_id, message)
+    elif isinstance(exc, GatewayTimeout):
+        pass
+    elif _engine_missing_re(datasource_id).search(message):
+        lookup = partial(_engine_missing_fields, conn, datasource_id)
+    elif variables and _VARIABLE_MISSING_RE.search(message):
+        lookup = partial(_variable_fields, conn, datasource_id, variables)
+    fields = None
+    if lookup is not None:
+        future = _SUGGEST_EXECUTOR.submit(lookup)
+        try:
+            fields = future.result(timeout=SUGGEST_TIMEOUT)
+        except FuturesTimeout:
+            logger.warning(
+                "Suggestions for %r timed out after %ss", datasource_id, SUGGEST_TIMEOUT
+            )
+        except Exception:
+            # Best-effort enrichment of an error already being reported: no
+            # failure in it may replace the original error.
+            logger.warning("Suggestions for %r failed", datasource_id, exc_info=True)
+    return to_json({**(fields or {"error": message}), **context})
 
 
 # Coordinate keys Datamesh applies `limit` along (time, ensemble, quantile):
@@ -1080,18 +1127,20 @@ def get_datasource_info(
         detail: "summary" (default) returns the bounded view described above. "full" returns the complete record, including every attribute; it can be very large.
 
     Returns:
-        Datasource metadata as JSON.
+        Datasource metadata as JSON. On failure, JSON with an "error" (and
+        the datasource_id); an unknown id adds "suggestions", close matches
+        as [{id, name}].
     """
     conn = get_datamesh_connector()
     try:
         ds = conn.get_datasource(datasource_id)
     except _DATAMESH_ERRORS as exc:
-        try:
-            enriched = _missing_datasource(conn, datasource_id, exc)
-        except Exception:  # suggestions are best-effort
-            enriched = None
-        return to_json(
-            {**(enriched or {"error": str(exc)}), "datasource_id": datasource_id}
+        return _error_json(
+            conn,
+            datasource_id,
+            exc,
+            {"datasource_id": datasource_id},
+            from_metadata=True,
         )
     if detail == "full":
         return to_json(format_datasource(ds))
@@ -1163,8 +1212,12 @@ def stage_query(
     try:
         stage = _stage(conn, sent)
     except _DATAMESH_ERRORS as exc:
-        return _query_error(
-            conn, query.datasource, query.variables, exc, {"query": _query_echo(query)}
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
         )
 
     if stage is None:
@@ -1381,8 +1434,12 @@ def query_data(
                     # it comes back inline rather than as a lazy summary.
                     data = data.load()
     except _DATAMESH_ERRORS as exc:
-        return _query_error(
-            conn, query.datasource, query.variables, exc, {"query": _query_echo(query)}
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
         )
 
     out = summarize_data(data, warnings=warnings)
@@ -1425,8 +1482,12 @@ def _export_download_url(
     try:
         stage = _download_stage(conn, query)
     except _DATAMESH_ERRORS as exc:
-        return _query_error(
-            conn, query.datasource, query.variables, exc, {"query": _query_echo(query)}
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
         )
     if stage is None or not stage.get("url"):
         return to_json(
@@ -1729,8 +1790,12 @@ def export_query(
             # Datasets stream chunk-wise from lazy zarr; frames download fully.
             data = conn.query(sent, use_dask=is_dataset)
     except _DATAMESH_ERRORS as exc:
-        return _query_error(
-            conn, query.datasource, query.variables, exc, {"query": _query_echo(query)}
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
         )
 
     if data is None:
@@ -1916,9 +1981,7 @@ def load_datasource(datasource_id: str) -> str:
         with bound, _captured_warnings(warnings):
             data = conn.load_datasource(datasource_id)
     except _DATAMESH_ERRORS as exc:
-        return _query_error(
-            conn, datasource_id, None, exc, {"datasource_id": datasource_id}
-        )
+        return _error_json(conn, datasource_id, exc, {"datasource_id": datasource_id})
     return to_json(summarize_data(data, warnings=warnings))
 
 

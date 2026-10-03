@@ -11,6 +11,8 @@ The SDK/gateway error strings mocked here are the real ones:
 """
 
 import json
+import logging
+import time
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -269,7 +271,9 @@ class TestQueryToolsUnknownVariable:
 
     def test_matches_standard_name(self, mock_conn, mock_stage):
         mock_stage.side_effect = _stage_bad_variable("significant_wave_height")
-        mock_conn.get_datasource.return_value = _wave_datasource()
+        ds = _wave_datasource()
+        del ds.variables["hs"]["attrs"]["long_name"]  # standard_name only
+        mock_conn.get_datasource.return_value = ds
 
         parsed = json.loads(
             server.stage_query(
@@ -347,6 +351,21 @@ class TestQueryToolsUnknownVariable:
         assert parsed["error"] == str(exc)
         assert "suggestions" not in parsed
 
+    def test_different_quantity_not_suggested(self, mock_conn, mock_stage):
+        # Sharing some words is not enough: temperature is not salinity.
+        mock_stage.side_effect = _stage_bad_variable("sea_surface_temperature")
+        ds = _wave_datasource()
+        ds.variables = {"sss": {"attrs": {"standard_name": "sea_surface_salinity"}}}
+        mock_conn.get_datasource.return_value = ds
+
+        parsed = json.loads(
+            server.stage_query(
+                datasource_id="era5_wave_global", variables=["sea_surface_temperature"]
+            )
+        )
+
+        assert parsed["suggestions"][0]["did_you_mean"] == []
+
 
 class TestNoExtraCallsForOtherErrors:
     @pytest.mark.parametrize(
@@ -368,3 +387,52 @@ class TestNoExtraCallsForOtherErrors:
         assert "suggestions" not in parsed
         mock_conn.get_datasource.assert_not_called()
         mock_conn.get_catalog.assert_not_called()
+
+
+class TestSuggestionRobustness:
+    @pytest.mark.parametrize(
+        "message",
+        [
+            "Datamesh server error: 500 permission check failed upstream",
+            "Datamesh server error: index not found",
+            "Datasource era5_wave_glob not Authorized",
+        ],
+    )
+    def test_metadata_errors_matched_exactly(self, mock_conn, message):
+        mock_conn.get_datasource.side_effect = DatameshConnectError(message)
+
+        parsed = json.loads(server.get_datasource_info("era5_wave_glob"))
+
+        assert parsed == {"error": message, "datasource_id": "era5_wave_glob"}
+        mock_conn.get_catalog.assert_not_called()
+
+    def test_search_operator_words_dropped(self, mock_conn):
+        mock_conn.get_datasource.side_effect = _not_found("wave_or_wind_and_not")
+        mock_conn.get_catalog.return_value = _catalog()
+
+        server.get_datasource_info("wave_or_wind_and_not")
+
+        assert mock_conn.get_catalog.call_args.kwargs["search"] == "wave or wind"
+
+    def test_slow_lookup_returns_original_error(self, mock_conn, mock_stage):
+        exc = _stage_not_found("era5_wave_glob")
+        mock_stage.side_effect = exc
+        mock_conn.get_datasource.side_effect = _not_found("era5_wave_glob")
+        mock_conn.get_catalog.side_effect = lambda **_: time.sleep(1)
+
+        start = time.monotonic()
+        with patch.object(server, "SUGGEST_TIMEOUT", 0.05):
+            parsed = json.loads(server.query_data(datasource_id="era5_wave_glob"))
+
+        assert time.monotonic() - start < 0.5
+        assert parsed["error"] == str(exc)
+        assert "suggestions" not in parsed
+
+    def test_lookup_failure_is_logged(self, mock_conn, caplog):
+        mock_conn.get_datasource.side_effect = _not_found("era5_wave_glob")
+        mock_conn.get_catalog.side_effect = RuntimeError("boom")
+
+        with caplog.at_level(logging.WARNING, logger=server.__name__):
+            server.get_datasource_info("era5_wave_glob")
+
+        assert any("Suggestions" in r.getMessage() for r in caplog.records)
