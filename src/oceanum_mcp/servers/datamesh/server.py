@@ -9,6 +9,8 @@ Error conventions:
   canonical query echoed back, so the caller can self-correct. An unknown
   datasource id or variable adds a "suggestions" list of close matches; a
   datasource that exists but is not shared with the caller says so instead.
+  A query variable named by the exact CF standard_name of exactly one of the
+  datasource's variables is resolved to it, reported in "resolved_variables".
 - Results that are too large to return inline return a JSON object with a
   "refused" key, the staged size, and concrete alternatives.
 """
@@ -16,6 +18,7 @@ Error conventions:
 from __future__ import annotations
 
 import difflib
+import json
 import logging
 import math
 import os
@@ -25,14 +28,13 @@ import threading
 import time
 import uuid
 import warnings as _warnings
-from concurrent.futures import ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FuturesTimeout
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
-from functools import partial
+from functools import partial, wraps
 from pathlib import Path
-from typing import Any, Callable, Iterator, Literal
+from typing import Any, Iterator, Literal
 
 import numpy as np
 import pandas as pd
@@ -404,10 +406,53 @@ _VARIABLE_MISSING_RE = re.compile(
     r"variables? not found|no variable named", re.IGNORECASE
 )
 
-_SUGGEST_EXECUTOR = ThreadPoolExecutor(
-    max_workers=4, thread_name_prefix="datamesh-suggest"
-)
+# Lookups run in daemon threads, at most this many at once: a lookup that
+# times out keeps its thread until the SDK gives up, and must neither delay
+# interpreter exit nor pile up. With every slot busy, lookups are skipped.
+_SUGGEST_SLOTS = threading.BoundedSemaphore(4)
 logger = logging.getLogger(__name__)
+
+# Variables substituted by exact CF standard_name in the current tool call
+# (see _stage_resolving), reported by _reporting_resolved_variables.
+_RESOLVED_VARIABLES: ContextVar[dict[str, str] | None] = ContextVar(
+    "_RESOLVED_VARIABLES", default=None
+)
+
+
+def _run_bounded(fn: Callable[[], Any], datasource_id: str) -> Any:
+    """fn() run in a daemon thread for at most SUGGEST_TIMEOUT seconds.
+
+    Returns None, logging a warning, if fn raised, timed out, or no lookup
+    slot was free: a best-effort lookup must never replace the error it
+    enriches, nor hold the tool call or interpreter exit.
+    """
+    if not _SUGGEST_SLOTS.acquire(blocking=False):
+        logger.warning("Suggestions for %r skipped: lookups busy", datasource_id)
+        return None
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            _SUGGEST_SLOTS.release()
+
+    thread = threading.Thread(target=target, name="datamesh-suggest", daemon=True)
+    thread.start()
+    thread.join(SUGGEST_TIMEOUT)
+    if thread.is_alive():
+        logger.warning(
+            "Suggestions for %r timed out after %ss", datasource_id, SUGGEST_TIMEOUT
+        )
+        return None
+    if "error" in box:
+        logger.warning(
+            "Suggestions for %r failed", datasource_id, exc_info=box["error"]
+        )
+        return None
+    return box.get("result")
 
 
 def _engine_missing_re(datasource_id: str) -> re.Pattern[str]:
@@ -523,21 +568,43 @@ def _engine_missing_fields(
     return None  # visible to the caller: keep the engine's own error
 
 
+def _datasource_schema(conn: Connector, datasource_id: str, exc: Exception) -> Any:
+    """The caller's own get_datasource record for datasource_id, fetched at
+    most once per error (cached on exc) and bounded by _run_bounded; None if
+    the lookup failed."""
+    if not hasattr(exc, "_oce303_datasource"):
+        exc._oce303_datasource = _run_bounded(  # type: ignore[attr-defined]
+            partial(conn.get_datasource, datasource_id), datasource_id
+        )
+    return exc._oce303_datasource  # type: ignore[attr-defined]
+
+
+def _unknown_variables(datasource: Any, variables: list[str]) -> list[str]:
+    """Requested variables that are neither data variables nor coordinates of
+    datasource; empty if its schema is unknown."""
+    data_vars = datasource.variables or {}
+    if not data_vars:
+        return []
+    coords = getattr(datasource.dataschema, "coords", None) or {}
+    return [v for v in variables if v not in data_vars and v not in coords]
+
+
+def _variable_attrs(schema: Any) -> dict[str, Any]:
+    return (schema or {}).get("attrs") or {}
+
+
 def _variable_fields(
-    conn: Connector, datasource_id: str, variables: list[str]
+    datasource_id: str, datasource: Any, variables: list[str]
 ) -> dict[str, Any] | None:
     """Error fields for requested variables the datasource lacks, with the
     closest variable names (matched on name, standard_name and long_name).
     None if every requested variable exists, or the schema is unknown."""
-    datasource = conn.get_datasource(datasource_id)
-    data_vars = datasource.variables or {}
-    coords = getattr(datasource.dataschema, "coords", None) or {}
-    unknown = [v for v in variables if v not in data_vars and v not in coords]
-    if not data_vars or not unknown:
+    unknown = _unknown_variables(datasource, variables)
+    if not unknown:
         return None
     candidates: dict[str, list[str]] = {}
-    for name, schema in data_vars.items():
-        attrs = (schema or {}).get("attrs") or {}
+    for name, schema in datasource.variables.items():
+        attrs = _variable_attrs(schema)
         labels = [str(name)]
         labels += [
             str(attrs[k]) for k in ("standard_name", "long_name") if attrs.get(k)
@@ -552,6 +619,100 @@ def _variable_fields(
             for v in unknown
         ],
     }
+
+
+def _standard_name_aliases(
+    datasource: Any, variables: list[str]
+) -> dict[str, str] | None:
+    """{requested: variable} for every unknown requested variable that
+    EXACTLY equals the CF standard_name of exactly one of the datasource's
+    variables. None if any unknown variable has no such unique match: an
+    ambiguous or fuzzy alias is never resolved."""
+    unknown = _unknown_variables(datasource, variables)
+    if not unknown:
+        return None
+    aliases: dict[str, str] = {}
+    for wanted in unknown:
+        matches = [
+            str(name)
+            for name, schema in datasource.variables.items()
+            if _variable_attrs(schema).get("standard_name") == wanted
+        ]
+        if len(matches) != 1:
+            return None
+        aliases[wanted] = matches[0]
+    return aliases
+
+
+def _substituted(query: Query, aliases: dict[str, str]) -> Query:
+    """query with its variables renamed per aliases (duplicates dropped)."""
+    if not aliases or not query.variables:
+        return query
+    variables = list(dict.fromkeys(aliases.get(v, v) for v in query.variables))
+    return query.model_copy(update={"variables": variables})
+
+
+def _stage_resolving(
+    conn: Connector, query: Query, stage_fn: Callable[[Connector, Query], Any]
+) -> tuple[Any, dict[str, str]]:
+    """stage_fn(conn, query), retried once with variables resolved by CF
+    standard_name if the engine reports a requested variable missing.
+
+    Returns (result, aliases); aliases is empty unless the retry ran and
+    succeeded, in which case the caller must apply _substituted(query,
+    aliases) to the query it goes on to use. Only the caller's own
+    get_datasource record is consulted (one bounded fetch, reused by
+    _error_json on failure). If nothing resolves, or the retry fails too,
+    the ORIGINAL error is raised.
+    """
+    try:
+        return stage_fn(conn, query), {}
+    except _DATAMESH_ERRORS as exc:
+        if (
+            isinstance(exc, GatewayTimeout)
+            or not query.variables
+            or not _VARIABLE_MISSING_RE.search(str(exc))
+        ):
+            raise
+        datasource = _datasource_schema(conn, query.datasource, exc)
+        aliases = (
+            _run_bounded(
+                partial(_standard_name_aliases, datasource, query.variables),
+                query.datasource,
+            )
+            if datasource is not None
+            else None
+        )
+        if not aliases:
+            raise
+        try:
+            result = stage_fn(conn, _substituted(query, aliases))
+        except _DATAMESH_ERRORS:
+            raise exc from None
+    recorder = _RESOLVED_VARIABLES.get()
+    if recorder is not None:
+        recorder.update(aliases)
+    return result, aliases
+
+
+def _reporting_resolved_variables(tool: Callable[..., str]) -> Callable[..., str]:
+    """Wrap a query tool so a response whose variables were resolved by
+    _stage_resolving reports them as "resolved_variables" ({requested:
+    used}); responses without a resolution are returned unchanged."""
+
+    @wraps(tool)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        resolved: dict[str, str] = {}
+        token = _RESOLVED_VARIABLES.set(resolved)
+        try:
+            out = tool(*args, **kwargs)
+        finally:
+            _RESOLVED_VARIABLES.reset(token)
+        if not resolved:
+            return out
+        return to_json({**json.loads(out), "resolved_variables": resolved})
+
+    return wrapper
 
 
 def _error_json(
@@ -572,32 +733,29 @@ def _error_json(
     suggestions. from_metadata marks exc as raised by get_datasource itself;
     otherwise it is a query-engine error. The lookups (at most one
     get_datasource and one bounded catalog search) run only on those error
-    paths and are given SUGGEST_TIMEOUT seconds; if they fail or time out
-    the original error is returned unchanged.
+    paths, each bounded by _run_bounded; if they fail or time out the
+    original error is returned unchanged.
     """
     message = str(exc)
-    lookup: Callable[[], dict[str, Any] | None] | None = None
+    fields = None
     if from_metadata:
-        lookup = partial(_metadata_error_fields, conn, datasource_id, message)
+        fields = _run_bounded(
+            partial(_metadata_error_fields, conn, datasource_id, message),
+            datasource_id,
+        )
     elif isinstance(exc, GatewayTimeout):
         pass
     elif _engine_missing_re(datasource_id).search(message):
-        lookup = partial(_engine_missing_fields, conn, datasource_id)
+        fields = _run_bounded(
+            partial(_engine_missing_fields, conn, datasource_id), datasource_id
+        )
     elif variables and _VARIABLE_MISSING_RE.search(message):
-        lookup = partial(_variable_fields, conn, datasource_id, variables)
-    fields = None
-    if lookup is not None:
-        future = _SUGGEST_EXECUTOR.submit(lookup)
-        try:
-            fields = future.result(timeout=SUGGEST_TIMEOUT)
-        except FuturesTimeout:
-            logger.warning(
-                "Suggestions for %r timed out after %ss", datasource_id, SUGGEST_TIMEOUT
+        datasource = _datasource_schema(conn, datasource_id, exc)
+        if datasource is not None:
+            fields = _run_bounded(
+                partial(_variable_fields, datasource_id, datasource, variables),
+                datasource_id,
             )
-        except Exception:
-            # Best-effort enrichment of an error already being reported: no
-            # failure in it may replace the original error.
-            logger.warning("Suggestions for %r failed", datasource_id, exc_info=True)
     return to_json({**(fields or {"error": message}), **context})
 
 
@@ -1210,7 +1368,8 @@ def stage_query(
     )
     sent, client_limit = _split_limit(query)
     try:
-        stage = _stage(conn, sent)
+        stage, aliases = _stage_resolving(conn, sent, _stage)
+        sent, query = _substituted(sent, aliases), _substituted(query, aliases)
     except _DATAMESH_ERRORS as exc:
         return _error_json(
             conn,
@@ -1390,7 +1549,8 @@ def query_data(
     sent, client_limit = _split_limit(query)
     warnings: list[str] = []
     try:
-        stage = _stage(conn, sent)
+        stage, aliases = _stage_resolving(conn, sent, _stage)
+        sent, query = _substituted(sent, aliases), _substituted(query, aliases)
         if stage is None:
             return to_json(
                 {
@@ -1480,7 +1640,8 @@ def _export_download_url(
     their code) fetches the URL out-of-band.
     """
     try:
-        stage = _download_stage(conn, query)
+        stage, aliases = _stage_resolving(conn, query, _download_stage)
+        query = _substituted(query, aliases)
     except _DATAMESH_ERRORS as exc:
         return _error_json(
             conn,
@@ -1732,7 +1893,8 @@ def export_query(
     sent, client_limit = _split_limit(query)
     warnings: list[str] = []
     try:
-        stage = _stage(conn, sent)
+        stage, aliases = _stage_resolving(conn, sent, _stage)
+        sent, query = _substituted(sent, aliases), _substituted(query, aliases)
         if stage is None:
             return to_json(
                 {
@@ -1916,8 +2078,12 @@ export_query.__doc__ = f"""{export_query.__doc__}
         structure summary, and any limit_note. Neither returns inline values.
     """
 
-stage_query = mcp.tool(annotations=READ_TOOL)(stage_query)
-query_data = mcp.tool(annotations=READ_TOOL)(query_data)
+# Wrapped so a response reports variables resolved by CF standard_name
+# (OCE-303); functools.wraps keeps the signature and docstring FastMCP parses.
+stage_query = mcp.tool(annotations=READ_TOOL)(
+    _reporting_resolved_variables(stage_query)
+)
+query_data = mcp.tool(annotations=READ_TOOL)(_reporting_resolved_variables(query_data))
 export_query = mcp.tool(
     annotations={
         "readOnlyHint": False,
@@ -1925,7 +2091,7 @@ export_query = mcp.tool(
         "idempotentHint": True,
         "openWorldHint": True,
     }
-)(export_query)
+)(_reporting_resolved_variables(export_query))
 
 
 @mcp.tool(annotations=READ_TOOL)

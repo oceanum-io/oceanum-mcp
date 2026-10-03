@@ -12,14 +12,19 @@ The SDK/gateway error strings mocked here are the real ones:
 
 import json
 import logging
+import threading
 import time
 from unittest.mock import MagicMock, patch
 
+import numpy as np
+import pandas as pd
 import pytest
+import xarray as xr
 
 from oceanum.datamesh.exceptions import DatameshConnectError, DatameshQueryError
 
 import oceanum_mcp.servers.datamesh.server as server
+from tests.conftest import make_stage
 
 FORBIDDEN = "You do not have permission to access this datasource"
 
@@ -436,3 +441,193 @@ class TestSuggestionRobustness:
             server.get_datasource_info("era5_wave_glob")
 
         assert any("Suggestions" in r.getMessage() for r in caplog.records)
+
+
+ALIAS = "sea_surface_wave_significant_height"
+
+
+def _hs_dataset() -> xr.Dataset:
+    return xr.Dataset(
+        {"hs": (("time",), np.array([1.0, 2.0, 3.0]))},
+        coords={"time": pd.date_range("2024-01-01", periods=3, freq="h")},
+    )
+
+
+class TestStandardNameResolution:
+    """OCE-303 criterion 2: a variable named by the exact CF standard_name of
+    exactly one variable is resolved to it, and the response says so."""
+
+    def test_stage_query_resolves(self, mock_conn, mock_stage):
+        mock_stage.side_effect = [_stage_bad_variable(ALIAS), make_stage()]
+        mock_conn.get_datasource.return_value = _wave_datasource()
+
+        parsed = json.loads(
+            server.stage_query(datasource_id="era5_wave_global", variables=[ALIAS])
+        )
+
+        assert parsed["staged"] is True
+        assert parsed["resolved_variables"] == {ALIAS: "hs"}
+        assert parsed["query"]["variables"] == ["hs"]
+        assert mock_stage.call_count == 2
+        assert mock_stage.call_args_list[1].args[1].variables == ["hs"]
+        mock_conn.get_datasource.assert_called_once_with("era5_wave_global")
+
+    def test_query_data_resolves_and_queries_resolved_name(self, mock_conn, mock_stage):
+        mock_stage.side_effect = [_stage_bad_variable(ALIAS), make_stage()]
+        mock_conn.get_datasource.return_value = _wave_datasource()
+        mock_conn.query.return_value = _hs_dataset()
+
+        parsed = json.loads(
+            server.query_data(datasource_id="era5_wave_global", variables=[ALIAS])
+        )
+
+        assert "error" not in parsed
+        assert parsed["resolved_variables"] == {ALIAS: "hs"}
+        assert mock_conn.query.call_args.args[0].variables == ["hs"]
+
+    def test_mixed_real_and_alias(self, mock_conn, mock_stage):
+        mock_stage.side_effect = [_stage_bad_variable(ALIAS), make_stage()]
+        mock_conn.get_datasource.return_value = _wave_datasource()
+
+        parsed = json.loads(
+            server.stage_query(
+                datasource_id="era5_wave_global", variables=["tp", ALIAS, "hs"]
+            )
+        )
+
+        assert parsed["resolved_variables"] == {ALIAS: "hs"}
+        # The alias and the real name it resolves to are not sent twice.
+        assert parsed["query"]["variables"] == ["tp", "hs"]
+
+    def test_ambiguous_alias_is_not_resolved(self, mock_conn, mock_stage):
+        exc = _stage_bad_variable(ALIAS)
+        mock_stage.side_effect = exc
+        ds = _wave_datasource()
+        ds.variables["hs_total"] = {"attrs": {"standard_name": ALIAS}}
+        mock_conn.get_datasource.return_value = ds
+
+        parsed = json.loads(
+            server.stage_query(datasource_id="era5_wave_global", variables=[ALIAS])
+        )
+
+        assert "resolved_variables" not in parsed
+        assert set(parsed["suggestions"][0]["did_you_mean"][:2]) == {"hs", "hs_total"}
+        assert mock_stage.call_count == 1
+
+    @pytest.mark.parametrize(
+        "variables",
+        [
+            ["significant_wave_height"],  # close, but not an exact standard_name
+            ["SEA_SURFACE_WAVE_SIGNIFICANT_HEIGHT"],  # exact match only
+            [ALIAS, "chlorophyll"],  # one resolvable, one not: no partial retry
+        ],
+    )
+    def test_no_exact_match_keeps_error_and_suggestions(
+        self, mock_conn, mock_stage, variables
+    ):
+        mock_stage.side_effect = _stage_bad_variable(variables[-1])
+        mock_conn.get_datasource.return_value = _wave_datasource()
+
+        parsed = json.loads(
+            server.stage_query(datasource_id="era5_wave_global", variables=variables)
+        )
+
+        assert "Variable(s) not in datasource" in parsed["error"]
+        assert "suggestions" in parsed
+        assert "resolved_variables" not in parsed
+        assert mock_stage.call_count == 1
+
+    def test_failed_retry_returns_original_error(self, mock_conn, mock_stage):
+        mock_stage.side_effect = [
+            _stage_bad_variable(ALIAS),
+            DatameshConnectError("Datamesh server error: retry blew up"),
+        ]
+        mock_conn.get_datasource.return_value = _wave_datasource()
+
+        parsed = json.loads(
+            server.stage_query(datasource_id="era5_wave_global", variables=[ALIAS])
+        )
+
+        assert "retry blew up" not in parsed["error"]
+        assert ALIAS in parsed["error"]
+        assert parsed["suggestions"][0]["did_you_mean"][0] == "hs"
+        assert parsed["query"]["variables"] == [ALIAS]
+        assert "resolved_variables" not in parsed
+        # The schema fetched for the resolution is reused for the suggestions.
+        mock_conn.get_datasource.assert_called_once()
+
+    def test_local_export_resolves(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.side_effect = [_stage_bad_variable(ALIAS), make_stage()]
+        mock_conn.get_datasource.return_value = _wave_datasource()
+        mock_conn.query.return_value = _hs_dataset()
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="era5_wave_global",
+                variables=[ALIAS],
+                path=str(tmp_path / "out.nc"),
+            )
+        )
+
+        assert parsed["resolved_variables"] == {ALIAS: "hs"}
+        assert (tmp_path / "out.nc").exists()
+        assert mock_conn.query.call_args.args[0].variables == ["hs"]
+
+    def test_hosted_export_resolves(self, mock_conn):
+        from oceanum_mcp.common.config import set_transport
+
+        mock_conn.get_datasource.return_value = _wave_datasource()
+        stage = {
+            "container": "dataset",
+            "size": 1234,
+            "formats": ["nc"],
+            "url": "https://datamesh.oceanum.io/oceanql/abc?sig=xyz",
+        }
+        bad = DatameshQueryError(
+            f"Invalid variable selection - variable not found: '{ALIAS}'"
+        )
+        set_transport("http")
+        try:
+            with patch.object(
+                server, "_download_stage", side_effect=[bad, stage]
+            ) as download:
+                parsed = json.loads(
+                    server.export_query(
+                        datasource_id="era5_wave_global", variables=[ALIAS]
+                    )
+                )
+        finally:
+            set_transport("stdio")
+
+        assert parsed["download_url"].endswith("&f=nc")
+        assert parsed["resolved_variables"] == {ALIAS: "hs"}
+        assert parsed["query"]["variables"] == ["hs"]
+        assert download.call_args.args[1].variables == ["hs"]
+
+
+class TestLookupThreads:
+    def test_timed_out_lookup_runs_in_a_daemon_thread(self, mock_conn):
+        release = threading.Event()
+        mock_conn.get_datasource.side_effect = _not_found("era5_wave_glob")
+        mock_conn.get_catalog.side_effect = lambda **_: release.wait(5)
+
+        try:
+            with patch.object(server, "SUGGEST_TIMEOUT", 0.05):
+                parsed = json.loads(server.get_datasource_info("era5_wave_glob"))
+            lookups = [t for t in threading.enumerate() if t.name == "datamesh-suggest"]
+            assert lookups
+            # A daemon thread never delays interpreter exit.
+            assert all(t.daemon for t in lookups)
+        finally:
+            release.set()
+        assert parsed["error"] == "Datasource era5_wave_glob not found"
+
+    def test_lookups_skipped_when_all_slots_busy(self, mock_conn):
+        mock_conn.get_datasource.side_effect = _not_found("era5_wave_glob")
+
+        with patch.object(server, "_SUGGEST_SLOTS", threading.BoundedSemaphore(1)):
+            server._SUGGEST_SLOTS.acquire()
+            parsed = json.loads(server.get_datasource_info("era5_wave_glob"))
+
+        assert parsed["error"] == "Datasource era5_wave_glob not found"
+        mock_conn.get_catalog.assert_not_called()
