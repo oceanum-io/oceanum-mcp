@@ -331,16 +331,13 @@ def test_frame_records_keep_full_float_precision():
 
 
 def test_dataset_records_keep_full_float_precision():
-    n = len(_PRECISE)
-    ds = xr.Dataset(
-        {"v": (("x",), np.array(_PRECISE))},
-        coords={"x": np.array(_PRECISE[::-1])},
-    )
+    # Distinct values per column, so a misaligned column cannot pass.
+    coord = [1e-13, 2.000000000000001, 3.5, 98765.43210987654]
+    ds = xr.Dataset({"v": (("x",), np.array(_PRECISE))}, coords={"x": coord})
     data = summarize_data(ds)["data"]
     assert [r["v"] for r in data] == _PRECISE
     # Float coordinates are record columns too.
-    assert [r["x"] for r in data] == _PRECISE[::-1]
-    assert len(data) == n
+    assert [r["x"] for r in data] == coord
 
 
 def test_float32_records_use_shortest_float32_repr():
@@ -362,9 +359,52 @@ def test_zero_d_float32_uses_shortest_float32_repr():
     assert summarize_data(ds)["data"] == [{"name": "v", "value": 0.1}]
 
 
-def test_nullable_float_records_keep_full_precision():
-    df = pd.DataFrame({"v": pd.array([5e-12, None], dtype="Float64")})
+@pytest.mark.parametrize(
+    "values",
+    [
+        pd.array([5e-12, None], dtype="Float64"),
+        pd.arrays.SparseArray([5e-12, np.nan]),
+    ],
+    ids=["Float64", "sparse"],
+)
+def test_extension_float_records_keep_full_precision(values):
+    df = pd.DataFrame({"v": values})
     assert [r["v"] for r in summarize_data(df)["data"]] == [5e-12, None]
+
+
+def test_arrow_float_records_keep_full_precision():
+    pytest.importorskip("pyarrow")
+    df = pd.DataFrame({"v": pd.array([5e-12, None], dtype="double[pyarrow]")})
+    assert [r["v"] for r in summarize_data(df)["data"]] == [5e-12, None]
+
+
+def test_narrow_extension_and_float16_use_shortest_repr():
+    df = pd.DataFrame(
+        {
+            "f32": pd.array([0.1, None], dtype="Float32"),
+            "f16": np.array([0.1, np.inf], dtype=np.float16),
+            "s32": pd.arrays.SparseArray(np.array([0.1, np.nan], dtype=np.float32)),
+        }
+    )
+    assert summarize_data(df)["data"] == [
+        {"f32": 0.1, "f16": 0.1, "s32": 0.1},
+        {"f32": None, "f16": None, "s32": None},
+    ]
+
+
+def test_object_column_floats_keep_full_precision():
+    # Mixed object columns: float cells are exact, the rest keep to_json's
+    # conversion.
+    df = pd.DataFrame({"o": pd.Series([5e-12, "x", None, np.nan, 7], dtype=object)})
+    assert [r["o"] for r in summarize_data(df)["data"]] == [5e-12, "x", None, None, 7]
+
+
+def test_non_string_column_labels():
+    # Keys are str(label), as in the summary's column list.
+    df = pd.DataFrame({0: [5e-12], 1.5: [123456.123456789012], "a": [1]})
+    out = summarize_data(df)
+    assert out["data"] == [{"0": 5e-12, "1.5": 123456.123456789012, "a": 1}]
+    assert [c["name"] for c in out["columns"]] == list(out["data"][0])
 
 
 def test_non_float_records_unchanged():

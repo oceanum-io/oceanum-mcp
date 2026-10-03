@@ -69,38 +69,63 @@ def human_bytes(n: int | float) -> str:
     raise AssertionError("unreachable")
 
 
-def _float_value(value: np.floating) -> float | None:
+def _float_value(value: float | np.floating) -> float | None:
     """A JSON-safe float at full precision; NaN/inf -> None.
 
     float64 converts exactly (json.dumps then writes its shortest round-trip
-    repr). Narrower floats (float32/float16) go through numpy's shortest repr
-    in their own precision: widening 0.1f to float64 directly would print as
-    0.10000000149011612, digits the source data never had.
+    repr). Narrower floats (float32/float16) take the shortest repr that
+    round-trips in their own precision: widening 0.1f to float64 directly
+    would print as 0.10000000149011612, digits the source data never had.
     """
-    if not np.isfinite(value):
+    if not math.isfinite(value):
         return None
-    if value.dtype.itemsize < 8:
-        return float(str(value))
+    if isinstance(value, np.floating) and value.dtype.itemsize < 8:
+        return float(np.format_float_scientific(value, unique=True))
     return float(value)
 
 
+# Marks object-column cells that are not floats: they keep to_json's value.
+_KEEP = object()
+
+
+def _exact_floats(col: pd.Series) -> list[Any] | None:
+    """Full-precision values for a column's float cells, or None if it has none.
+
+    Float dtypes (numpy, nullable, sparse, Arrow) convert every cell. Object
+    columns convert their float cells and mark the rest _KEEP.
+    """
+    dtype = col.dtype
+    if isinstance(dtype, np.dtype) and dtype.kind == "O":
+        return [
+            _float_value(v) if isinstance(v, (float, np.floating)) else _KEEP
+            for v in col
+        ]
+    if not pd.api.types.is_float_dtype(dtype):
+        return None
+    if not isinstance(dtype, np.dtype):
+        # Nullable/Arrow dtypes expose numpy_dtype; SparseDtype has subtype.
+        dtype = getattr(dtype, "numpy_dtype", None) or dtype.subtype
+    return [_float_value(v) for v in col.to_numpy(dtype=dtype, na_value=np.nan)]
+
+
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    records = json.loads(df.to_json(orient="records", date_format="iso"))
     # to_json rounds floats to 10 decimal places (5e-12 -> 0.0), and its
     # maximum double_precision=15 is still decimal places, not significant
     # digits (OCE-325). Keep to_json for every other dtype (ISO datetimes and
-    # durations, NaT -> null) and replace float columns with exact values.
-    # Keys are matched by position, as to_json stringifies column labels;
-    # records orient requires unique columns, so the counts match.
-    if records and len(records[0]) == df.shape[1]:
-        for key, (_, col) in zip(list(records[0]), df.items()):
-            if not pd.api.types.is_float_dtype(col.dtype):
-                continue
-            dtype = getattr(col.dtype, "numpy_dtype", col.dtype)
-            values = col.to_numpy(dtype=dtype, na_value=np.nan)
-            for rec, value in zip(records, values):
-                rec[key] = _float_value(value)
-    return records
+    # durations, NaT -> null) and replace float cells with exact values.
+    # Serializing under positional labels keeps every column addressable;
+    # keys are then str(label), as in the summary's column list.
+    positional = df.set_axis(range(df.shape[1]), axis=1)
+    rows = json.loads(positional.to_json(orient="records", date_format="iso"))
+    for i, (_, col) in enumerate(df.items()):
+        floats = _exact_floats(col)
+        if floats is None:
+            continue
+        for row, value in zip(rows, floats):
+            if value is not _KEEP:
+                row[str(i)] = value
+    keys = [str(label) for label in df.columns]
+    return [{key: row[str(i)] for i, key in enumerate(keys)} for row in rows]
 
 
 def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
