@@ -90,6 +90,35 @@ class TestTimeResolutionGuard:
         query = server._build_query("test-ds", time_resolution=resolution, **RANGE)
         assert query.timefilter.resolution == resolution
 
+    # Legacy aliases pandas 3 no longer parses (so they used to be passed
+    # through on pandas-3 hosts) are refused for the same reason on every
+    # pandas version.
+    @pytest.mark.parametrize(
+        "resolution",
+        ["1M", "1m", "1Y", "1y", "1A", "1AS", "1as", "1Q", "1q", "Q-DEC"]
+        + ["A-JAN", "2BQ", "1BA", "1SM", "1MS", "1Ms", "1ME", "1QS", "1YS"],
+    )
+    def test_legacy_calendar_aliases_denied_on_any_pandas(self, resolution):
+        with pytest.raises(ToolError, match="not supported yet") as exc:
+            server._build_query("test-ds", time_resolution=resolution, **RANGE)
+        assert '"30D"' in str(exc.value)
+
+    @pytest.mark.parametrize(
+        "resolution",
+        ["1L", "1l", "1U", "1u", "1N", "1n", "1S", "5S", "1ms", "500ms", "1NS"],
+    )
+    def test_legacy_sub_minute_aliases_denied_on_any_pandas(self, resolution):
+        with pytest.raises(ToolError, match="finer than one minute"):
+            server._build_query("test-ds", time_resolution=resolution, **RANGE)
+
+    def test_surrounding_whitespace_stripped(self):
+        query = server._build_query("test-ds", time_resolution=" 1D ", **RANGE)
+        assert query.timefilter.resolution == "1D"
+        with pytest.raises(ToolError, match="not supported yet"):
+            server._build_query("test-ds", time_resolution=" 1MS ", **RANGE)
+        with pytest.raises(ToolError, match="finer than one minute"):
+            server._build_query("test-ds", time_resolution="\t1L\n", **RANGE)
+
     @pytest.mark.parametrize("resolution", ["0D", "-1D", "0h"])
     def test_rejects_non_positive(self, resolution):
         with pytest.raises(ToolError, match="positive"):
@@ -203,6 +232,8 @@ class TestStageTimeout:
         assert time.monotonic() - start < 1  # no SDK backoff/retries
         assert "staging timed out after 0.5s" in out["error"]
         assert "coarser time_resolution" in out["error"]
+        assert "retrying once may succeed" in out["error"]
+        assert "OCEANUM_MCP_STAGE_TIMEOUT" in out["error"]
         assert out["query"]["datasource"] == "test-ds"
         # One attempt, its 900 s SDK read timeout capped at the 0.5 s budget.
         assert len(http.timeouts) == 1

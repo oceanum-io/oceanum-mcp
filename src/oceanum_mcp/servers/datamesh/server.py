@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import os
+import re
 import shutil
 import threading
 import time
@@ -243,8 +244,9 @@ class _CappedHTTPSession:
 def _gateway_timeout(
     conn: Connector,
     what: str,
-    hint: str = "narrow the query (shorter time range, smaller bbox, fewer "
-    "variables) or use a coarser time_resolution",
+    hint: str = "The stage may be cold or slow: retrying once may succeed. If "
+    "it times out again, narrow the query (shorter time range, smaller bbox, "
+    "fewer variables) or use a coarser time_resolution",
 ) -> Iterator[None]:
     """Bound the long gateway requests `conn` makes in this block (OCE-294).
 
@@ -258,9 +260,11 @@ def _gateway_timeout(
     by the read timeout, so a response that keeps trickling bytes is only
     bounded by inactivity. Whatever the gateway was computing is not
     cancelled by this server: whether it stops when the client disconnects
-    is up to the gateway. Session acquire/close go through the same session
-    but keep their shorter SDK timeouts; lazy zarr chunk reads use their own
-    session and are not bounded here.
+    is up to the gateway. Session acquire/close go through the same session:
+    while the timeout is above their SDK read timeout (DATAMESH_READ_TIMEOUT,
+    10 s by default) they pass through untouched; with a lower timeout they
+    are capped and count against the deadline like any other request. Lazy
+    zarr chunk reads use their own session and are not bounded here.
     """
     cap = stage_timeout()
     with _CAP_INSTALL_LOCK:
@@ -270,8 +274,8 @@ def _gateway_timeout(
     budget = _TimeoutBudget(
         cap=cap,
         deadline=time.monotonic() + cap,
-        message=f"Datamesh {what} timed out after {cap:g}s "
-        f"(OCEANUM_MCP_STAGE_TIMEOUT); {hint}.",
+        message=f"Datamesh {what} timed out after {cap:g}s. {hint}. (Server "
+        "operators can raise this limit with OCEANUM_MCP_STAGE_TIMEOUT.)",
     )
     token = _TIMEOUT_BUDGET.set(budget)
     try:
@@ -515,6 +519,56 @@ def _quiet_pandas_aliases() -> Iterator[None]:
         _WARNINGS_LOCK.release()
 
 
+# Legacy pandas aliases, matched on the alias tokens of a time_resolution
+# independently of the local pandas version (OCE-294 gate). pandas 3 removed
+# them, so they no longer parse here and would otherwise be passed through;
+# the engine lower-cases them and, on its pandas, may still parse them, e.g.
+# "1L" -> "1l" = one millisecond, the same hang as "1MS".
+# Sub-minute units, compared lower-cased: L/ms, U/us, N/ns, S/s.
+_SUB_MINUTE_ALIASES = frozenset({"l", "ms", "u", "us", "n", "ns", "s"})
+# Calendar month/quarter/year aliases, incl. legacy A/AS/Y/M/Q, anchored
+# forms (the anchor is a separate token), and business (B, CB) and
+# semi-month variants. Compared upper-cased, except that "ms" written in
+# lower case is milliseconds (handled above), not month start.
+_CALENDAR_ALIAS_RE = re.compile(r"(C?B)?[MQYA][SE]?|SM[SE]?")
+_ALIAS_TOKEN_RE = re.compile(r"[A-Za-z]+")
+
+
+def _resolution_error(
+    resolution: str, reason: Literal["calendar", "fine"]
+) -> ToolError:
+    if reason == "calendar":
+        return ToolError(
+            f"time_resolution {resolution!r} is not supported yet: Datamesh "
+            "currently lower-cases time_resolution, which changes the meaning "
+            'of calendar aliases (e.g. "1MS", month start, becomes "1ms", one '
+            "millisecond, and the query hangs). Monthly, quarterly and yearly "
+            "aliases (MS, ME, QS, YS, M, Q, Y, A, ...) are not supported until "
+            'that engine fix ships: use a fixed length instead, e.g. "30D" '
+            '(about monthly), "90D" (about quarterly) or "365D" (about yearly).'
+        )
+    return ToolError(
+        f"time_resolution {resolution!r} is finer than one minute, which "
+        "makes an enormous number of time bins over any real range. Use "
+        '"1min" or coarser (e.g. "1h", "1D"), or omit time_resolution to '
+        "get the data at its native resolution."
+    )
+
+
+def _denied_alias(resolution: str) -> Literal["calendar", "fine"] | None:
+    """Why a time_resolution uses a denylisted alias, or None.
+
+    Pandas-version independent: looks only at the alias tokens (the letters
+    after the multiplier; an anchor such as "-DEC" is a separate token).
+    """
+    for token in _ALIAS_TOKEN_RE.findall(resolution):
+        if token != "ms" and _CALENDAR_ALIAS_RE.fullmatch(token.upper()):
+            return "calendar"
+        if token.lower() in _SUB_MINUTE_ALIASES:
+            return "fine"
+    return None
+
+
 def _check_time_resolution(resolution: str) -> None:
     """Reject time_resolution values the current Datamesh engine mishandles.
 
@@ -525,10 +579,17 @@ def _check_time_resolution(resolution: str) -> None:
     depending on the engine's pandas version. Until the engine fix (OCE-324)
     is deployed, only offsets whose meaning is case-insensitive are allowed,
     and none finer than a minute. Relax this guard once OCE-324 ships.
-    Values pandas cannot parse here are left for the engine to validate.
+
+    Legacy aliases are denylisted first (_denied_alias), so the result does
+    not depend on whether this host's pandas still parses them. Any other
+    value pandas cannot parse here is left for the engine to validate.
     """
-    if resolution.strip().lower() == "native":
+    resolution = resolution.strip()
+    if resolution.lower() == "native":
         return
+    denied = _denied_alias(resolution)
+    if denied is not None:
+        raise _resolution_error(resolution, denied)
     with _quiet_pandas_aliases():
         try:
             offset = to_offset(resolution)
@@ -548,25 +609,12 @@ def _check_time_resolution(resolution: str) -> None:
     if (offset is not None and offset != engine_offset) or not isinstance(
         engine_offset, _ENGINE_SAFE_OFFSETS
     ):
-        raise ToolError(
-            f"time_resolution {resolution!r} is not supported yet: Datamesh "
-            "currently lower-cases time_resolution, which changes the meaning "
-            'of calendar aliases (e.g. "1MS", month start, becomes "1ms", one '
-            "millisecond, and the query hangs). Monthly, quarterly and yearly "
-            "aliases (MS, ME, QS, YS, ...) are not supported until that engine "
-            'fix ships: use a fixed length instead, e.g. "30D" (about monthly), '
-            '"90D" (about quarterly) or "365D" (about yearly).'
-        )
+        raise _resolution_error(resolution, "calendar")
     if (
         isinstance(engine_offset, pd.offsets.Tick)
         and pd.Timedelta(engine_offset) < _MIN_TIME_RESOLUTION
     ):
-        raise ToolError(
-            f"time_resolution {resolution!r} is finer than one minute, which "
-            "makes an enormous number of time bins over any real range. Use "
-            '"1min" or coarser (e.g. "1h", "1D"), or omit time_resolution to '
-            "get the data at its native resolution."
-        )
+        raise _resolution_error(resolution, "fine")
 
 
 def _build_query(
@@ -598,6 +646,9 @@ def _build_query(
     time_start = _unset_sentinel(time_start)
     time_end = _unset_sentinel(time_end)
     time_resolution = _unset_sentinel(time_resolution)
+    if isinstance(time_resolution, str):
+        # Surrounding whitespace never belongs in a pandas frequency string.
+        time_resolution = time_resolution.strip() or None
     crs = _unset_sentinel(crs)
     q: dict[str, Any] = {"datasource": datasource_id}
 
@@ -1586,7 +1637,9 @@ def load_datasource(datasource_id: str) -> str:
         bound = _gateway_timeout(
             conn,
             "load",
-            hint="use query_data with time/space filters to fetch a subset",
+            hint="The datasource may be cold or slow: retrying once may "
+            "succeed. If it times out again, use query_data with time/space "
+            "filters to fetch a subset",
         )
         with bound, _captured_warnings(warnings):
             data = conn.load_datasource(datasource_id)
