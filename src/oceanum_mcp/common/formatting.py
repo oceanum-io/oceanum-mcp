@@ -114,10 +114,16 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     # digits (OCE-325). Keep to_json for every other dtype (ISO datetimes and
     # durations, NaT -> null) and replace float cells with exact values.
     # Rows are serialized as positional lists and keyed by str(label), as in
-    # the summary's column list; labels must stay distinct as keys.
-    keys = [str(label) for label in df.columns]
-    if len(set(keys)) != len(keys):
-        raise ValueError(f"DataFrame column labels must be unique as keys: {keys}")
+    # the summary's column list. Labels that repeat as keys (duplicates, or
+    # 1 and "1") get a ".N" suffix so no column is dropped.
+    keys: list[str] = []
+    for label in df.columns:
+        key = base = str(label)
+        n = 0
+        while key in keys:
+            n += 1
+            key = f"{base}.{n}"
+        keys.append(key)
     rows = json.loads(df.to_json(orient="values", date_format="iso"))
     for i, (_, col) in enumerate(df.items()):
         floats = _exact_floats(col)

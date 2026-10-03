@@ -407,13 +407,17 @@ def test_non_string_column_labels():
     assert [c["name"] for c in out["columns"]] == list(out["data"][0])
 
 
-@pytest.mark.parametrize("labels", [["a", "a"], [1, "1"]], ids=["dup", "str-collision"])
-def test_colliding_column_labels_raise(labels):
-    # Duplicate labels already made to_json raise; labels that collide only
-    # as JSON keys must not silently drop a column either.
-    df = pd.DataFrame([[5e-12, 2.0]], columns=labels)
-    with pytest.raises(ValueError, match="unique"):
-        summarize_data(df)
+@pytest.mark.parametrize(
+    ("labels", "keys"),
+    [(["a", "a", "a"], ["a", "a.1", "a.2"]), ([1, "1", "1.1"], ["1", "1.1", "1.1.1"])],
+    ids=["dup", "str-collision"],
+)
+def test_colliding_column_labels_keep_every_column(labels, keys):
+    # Duplicate labels made to_json raise, and labels that collide only as
+    # JSON keys dropped a column; suffixed keys keep every value instead.
+    df = pd.DataFrame([[5e-12, 2.0, 123456.123456789012]], columns=labels)
+    out = summarize_data(df)
+    assert out["data"] == [dict(zip(keys, [5e-12, 2.0, 123456.123456789012]))]
 
 
 def test_non_float_records_unchanged():
