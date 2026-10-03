@@ -118,6 +118,7 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_AUTH0_DOMAIN`    | No       | Auth0 tenant domain for `auth0` mode (default: `auth.oceanum.io`)               |
 | `OCEANUM_MCP_AUTH0_AUDIENCE`  | No       | Auth0 API audience for `auth0` mode (default: `https://api.oceanum.io`)         |
 | `OCEANUM_MCP_PUBLIC_URL`      | No       | Externally visible base URL (e.g. `https://mcp.oceanum.io`); enables OAuth discovery metadata for claude.ai connectors |
+| `OCEANUM_MCP_CORS_ORIGINS`    | No       | Comma-separated browser origins allowed by CORS on http (default: `https://*.oceanum.io,https://*.oceanum.tech,https://vscode.dev`; empty string disables) |
 
 `DATAMESH_TOKEN` is required for the stdio transport (and for `--transport http`
 with `OCEANUM_MCP_AUTH=none`); in authenticated http mode each request carries
@@ -189,6 +190,30 @@ uvicorn --factory oceanum_mcp.app:create_http_app --host 0.0.0.0 --port 8000
 Requests on a network transport never fall back to the server's
 `DATAMESH_TOKEN`: an unauthenticated request fails unless
 `OCEANUM_MCP_AUTH=none` was set explicitly.
+
+### Browser clients (CORS)
+
+Browser-based MCP clients send a CORS preflight (`OPTIONS`) before every
+cross-origin request. The http app answers preflights for an allowlist of
+origins, ahead of authentication (a preflight never carries a credential);
+all other requests still require one. Configure the allowlist with
+`OCEANUM_MCP_CORS_ORIGINS`, comma-separated:
+
+```bash
+OCEANUM_MCP_CORS_ORIGINS="https://*.oceanum.io,https://vscode.dev,http://localhost:6274"
+```
+
+- Unset: `https://*.oceanum.io`, `https://*.oceanum.tech` and
+  `https://vscode.dev`.
+- Empty string: CORS disabled — no CORS headers, preflights are not answered.
+- Each entry is an exact origin (`scheme://host[:port]`, no path). A leading
+  `*.` matches exactly one subdomain label: `https://*.oceanum.io` allows
+  `https://app.oceanum.io` but not `https://oceanum.io`,
+  `https://a.b.oceanum.io` or `https://oceanum.io.evil.com`. Bare `*` and
+  whole-TLD wildcards (`https://*.io`) are rejected at startup.
+- Credentials travel in `Authorization` / `X-DATAMESH-TOKEN` headers, never
+  cookies, so `Access-Control-Allow-Credentials` is never sent.
+  `Mcp-Session-Id` and `WWW-Authenticate` are exposed to browser scripts.
 
 ### claude.ai custom connectors
 
