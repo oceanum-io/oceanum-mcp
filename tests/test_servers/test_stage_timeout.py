@@ -90,6 +90,26 @@ class TestTimeResolutionGuard:
         query = server._build_query("test-ds", time_resolution=resolution, **RANGE)
         assert query.timefilter.resolution == resolution
 
+    @pytest.mark.parametrize("resolution", ["0D", "-1D", "0h"])
+    def test_rejects_non_positive(self, resolution):
+        with pytest.raises(ToolError, match="positive"):
+            server._build_query("test-ds", time_resolution=resolution, **RANGE)
+
+    def test_does_not_wait_behind_a_query_holding_the_warnings_lock(self):
+        # _captured_warnings holds _WARNINGS_LOCK for a whole query; parameter
+        # validation in another call must not block on it.
+        result: list[Any] = []
+        with server._WARNINGS_LOCK:
+            worker = threading.Thread(
+                target=lambda: result.append(
+                    server._build_query("test-ds", time_resolution="1D", **RANGE)
+                ),
+                daemon=True,
+            )
+            worker.start()
+            worker.join(5)
+        assert result, "time_resolution validation blocked on _WARNINGS_LOCK"
+
     def test_unparsable_left_to_the_engine(self):
         # Not a pandas alias here: the engine validates it, as before.
         query = server._build_query("test-ds", time_resolution="bogus", **RANGE)
@@ -184,9 +204,9 @@ class TestStageTimeout:
         assert "staging timed out after 0.5s" in out["error"]
         assert "coarser time_resolution" in out["error"]
         assert out["query"]["datasource"] == "test-ds"
-        # One attempt, its 900 s SDK read timeout capped at 0.5 s.
+        # One attempt, its 900 s SDK read timeout capped at the 0.5 s budget.
         assert len(http.timeouts) == 1
-        assert http.timeouts[0][1] == 0.5
+        assert 0 < http.timeouts[0][1] <= 0.5
 
     def test_body_read_timeout_also_converted(self, sdk_conn, monkeypatch):
         # requests raises a ConnectionError wrapping urllib3's
@@ -216,7 +236,7 @@ class TestStageTimeout:
         http = _RecordingSession()
         conn = sdk_conn(http)
         server.stage_query(datasource_id="test-ds")
-        assert http.timeouts[-1][1] == 0.5
+        assert 0 < http.timeouts[-1][1] <= 0.5
         # The wrapped connector is shared: outside a call nothing is capped.
         conn._retried_request("http://gateway/x", timeout=(3.05, 900))
         assert http.timeouts[-1] == (3.05, 900)
@@ -228,6 +248,37 @@ class TestStageTimeout:
         with server._gateway_timeout(conn, "staging"):
             conn._retried_request("http://gateway/x", timeout=(3.05, 10))
         assert http.timeouts == [(3.05, 10)]
+
+    def test_bad_gateway_retries_stop_at_the_deadline(self, sdk_conn, monkeypatch):
+        # The SDK sleeps 30 s after each 502 and retries, up to 8 times; no
+        # read timeout ever fires. The shared deadline still ends the call.
+        monkeypatch.setenv("OCEANUM_MCP_STAGE_TIMEOUT", "0.3")
+        bad_gateway = MagicMock(status_code=502)
+
+        class _BadGateway(_RecordingSession):
+            def request(self, method: str, url: str, *a: Any, **kw: Any) -> Any:
+                super().request(method, url, *a, **kw)
+                return bad_gateway
+
+        http = _BadGateway()
+        sdk_conn(http)
+        with patch(
+            "oceanum.datamesh.utils.sleep", side_effect=lambda s: time.sleep(0.1)
+        ):
+            start = time.monotonic()
+            out = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert "staging timed out after 0.3s" in out["error"]
+        assert time.monotonic() - start < 2
+        assert 1 <= len(http.timeouts) < 8
+
+    def test_wrapped_session_survives_copy_and_pickle(self):
+        import copy
+        import pickle
+
+        wrapped = server._CappedHTTPSession(HTTPSession(headers={"a": "b"}))
+        for clone in (copy.copy(wrapped), pickle.loads(pickle.dumps(wrapped))):
+            assert isinstance(clone, server._CappedHTTPSession)
+            assert clone._headers == {"a": "b"}
 
     def test_connector_wrapped_once(self, sdk_conn):
         conn = sdk_conn(_RecordingSession())
@@ -329,12 +380,13 @@ class TestQueryAndLoadBounded:
         self._timeout_on_request(mock_conn)
         out = json.loads(server.load_datasource(datasource_id="test-ds"))
         assert "load timed out after 0.5s" in out["error"]
+        assert "query_data" in out["error"]
 
     def _cap_during_query(self, conn: MagicMock, data: Any) -> list[Any]:
         seen: list[Any] = []
 
         def query(*args: Any, **kwargs: Any) -> Any:
-            seen.append(server._TIMEOUT_CAP.get())
+            seen.append(server._TIMEOUT_BUDGET.get())
             return data
 
         conn.query.side_effect = query
@@ -345,7 +397,7 @@ class TestQueryAndLoadBounded:
         ds = xr.Dataset({"hs": ("time", np.arange(3.0))})
         seen = self._cap_during_query(mock_conn, ds)
         server.export_query(datasource_id="test-ds", path=str(tmp_path / "o.nc"))
-        assert seen and seen[0] is not None and seen[0][1] == "query"
+        assert seen and seen[0] is not None and "query timed out" in seen[0].message
 
     def test_local_frame_export_download_not_capped(
         self, mock_conn, mock_stage, tmp_path
@@ -380,7 +432,7 @@ class TestStdioRecommendationHonoursLimit:
         )
         rec = out["recommendation"]
         assert "refuse" not in rec
-        assert "last 2 steps" in rec
+        assert "last 2 time/ensemble steps" in rec
         assert "73.0 GB" in rec
         assert rec.index("Narrow") < rec.index("export_query")
 

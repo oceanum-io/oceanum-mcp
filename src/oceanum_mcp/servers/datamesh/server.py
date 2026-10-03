@@ -17,10 +17,12 @@ import math
 import os
 import shutil
 import threading
+import time
 import uuid
 import warnings as _warnings
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator, Literal
 
@@ -163,12 +165,20 @@ class GatewayTimeout(DatameshConnectError):
     """
 
 
-# Read-timeout cap (seconds) and what is being waited on, for gateway
-# requests made by the current tool call. FastMCP runs each sync tool call in
-# its own worker thread, so the context variable scopes the cap to one call
-# even though connectors are shared between concurrent calls.
-_TIMEOUT_CAP: ContextVar[tuple[float, str] | None] = ContextVar(
-    "_TIMEOUT_CAP", default=None
+@dataclass(frozen=True)
+class _TimeoutBudget:
+    """The OCEANUM_MCP_STAGE_TIMEOUT budget of one bounded block."""
+
+    cap: float
+    deadline: float  # time.monotonic() value
+    message: str
+
+
+# Budget for gateway requests made by the current tool call. FastMCP runs each
+# sync tool call in its own worker thread, so the context variable scopes the
+# budget to one call even though connectors are shared between calls.
+_TIMEOUT_BUDGET: ContextVar[_TimeoutBudget | None] = ContextVar(
+    "_TIMEOUT_BUDGET", default=None
 )
 _CAP_INSTALL_LOCK = threading.Lock()
 
@@ -183,67 +193,91 @@ def _is_read_timeout(exc: requests.RequestException) -> bool:
 
 
 class _CappedHTTPSession:
-    """Wraps a Connector's HTTPSession to cap read timeouts inside
+    """Wraps a Connector's HTTPSession to bound long requests inside
     _gateway_timeout().
 
     The oceanum SDK sends stage and query requests with a 900 s read timeout
-    and retries a timed-out request up to 8 times. Inside _gateway_timeout()
-    this lowers the read timeout to the cap (requests then closes the socket
-    when it fires) and turns the timeout into GatewayTimeout, which the SDK
-    does not retry. Outside it, requests pass through untouched.
+    and retries a failed request up to 8 times (sleeping 30 s after each 502).
+    Inside _gateway_timeout(), a request whose SDK read timeout exceeds the
+    cap gets the time left before the block's deadline as its read timeout
+    (requests closes the socket when it fires), and the timeout, or a retry
+    attempted after the deadline, raises GatewayTimeout, which the SDK does
+    not retry. Requests with a shorter SDK timeout (session acquire/close)
+    and requests outside the block pass through untouched.
     """
 
     def __init__(self, inner: Any) -> None:
         self._inner = inner
 
     def __getattr__(self, name: str) -> Any:
-        return getattr(self._inner, name)
+        # Read _inner via __dict__: during copy/unpickle it is not set yet,
+        # and self._inner would recurse back into __getattr__.
+        inner = self.__dict__.get("_inner")
+        if inner is None:
+            raise AttributeError(name)
+        return getattr(inner, name)
 
     def request(self, method: str, url: str, *args: Any, **kwargs: Any) -> Any:
-        active = _TIMEOUT_CAP.get()
-        if active is None:
+        budget = _TIMEOUT_BUDGET.get()
+        if budget is None:
             return self._inner.request(method, url, *args, **kwargs)
-        cap, what = active
         timeout = kwargs.get("timeout")
         connect, read = timeout if isinstance(timeout, tuple) else (timeout, timeout)
-        if read is not None and read < cap:
-            # Already tighter than the cap: keep the SDK's own handling.
+        if read is not None and read < budget.cap:
+            # A short request (e.g. session acquire/close): the SDK's own
+            # timeout and retries already bound it.
             return self._inner.request(method, url, *args, **kwargs)
-        kwargs["timeout"] = (connect, cap)
+        remaining = budget.deadline - time.monotonic()
+        if remaining <= 0:
+            raise GatewayTimeout(budget.message)
+        kwargs["timeout"] = (connect, remaining)
         try:
             return self._inner.request(method, url, *args, **kwargs)
         except requests.RequestException as exc:
             if not _is_read_timeout(exc):
                 raise
-            raise GatewayTimeout(
-                f"Datamesh {what} timed out after {cap:g}s "
-                "(OCEANUM_MCP_STAGE_TIMEOUT); narrow the query (shorter time "
-                "range, smaller bbox, fewer variables) or use a coarser "
-                "time_resolution."
-            ) from exc
+            raise GatewayTimeout(budget.message) from exc
 
 
 @contextmanager
-def _gateway_timeout(conn: Connector, what: str) -> Iterator[None]:
-    """Bound every gateway request `conn` makes in this block (OCE-294).
+def _gateway_timeout(
+    conn: Connector,
+    what: str,
+    hint: str = "narrow the query (shorter time range, smaller bbox, fewer "
+    "variables) or use a coarser time_resolution",
+) -> Iterator[None]:
+    """Bound the long gateway requests `conn` makes in this block (OCE-294).
 
-    Each request's read timeout is capped at OCEANUM_MCP_STAGE_TIMEOUT; on
-    expiry the HTTP socket is closed and GatewayTimeout raised, freeing this
-    worker thread. Whatever the gateway was computing for the request is not
-    cancelled by this server: whether it stops when the client disconnects is
-    up to the gateway. Session.acquire/close and lazy zarr chunk reads use
-    their own HTTP sessions and keep the SDK's (short) timeouts.
+    Requests the SDK sends with a read timeout at or above
+    OCEANUM_MCP_STAGE_TIMEOUT (stage, download stage, query, load) share a
+    deadline of that many seconds from entering the block: each waits at most
+    the time left, and the SDK's retries stop once it has passed. On expiry
+    the HTTP socket is closed and GatewayTimeout raised, freeing this worker
+    thread within about the timeout (plus at most one in-flight 30 s SDK
+    back-off after a 502). The deadline is checked when a request starts and
+    by the read timeout, so a response that keeps trickling bytes is only
+    bounded by inactivity. Whatever the gateway was computing is not
+    cancelled by this server: whether it stops when the client disconnects
+    is up to the gateway. Session acquire/close go through the same session
+    but keep their shorter SDK timeouts; lazy zarr chunk reads use their own
+    session and are not bounded here.
     """
     cap = stage_timeout()
     with _CAP_INSTALL_LOCK:
         # Connectors are cached and shared across calls: wrap each one once.
         if not isinstance(conn.http_session, _CappedHTTPSession):
             conn.http_session = _CappedHTTPSession(conn.http_session)
-    token = _TIMEOUT_CAP.set((cap, what))
+    budget = _TimeoutBudget(
+        cap=cap,
+        deadline=time.monotonic() + cap,
+        message=f"Datamesh {what} timed out after {cap:g}s "
+        f"(OCEANUM_MCP_STAGE_TIMEOUT); {hint}.",
+    )
+    token = _TIMEOUT_BUDGET.set(budget)
     try:
         yield
     finally:
-        _TIMEOUT_CAP.reset(token)
+        _TIMEOUT_BUDGET.reset(token)
 
 
 def _stage(conn: Connector, query: Query) -> Stage | None:
@@ -459,6 +493,28 @@ _ENGINE_SAFE_OFFSETS = (pd.offsets.Tick, pd.offsets.Day, pd.offsets.Week)
 _MIN_TIME_RESOLUTION = pd.Timedelta(minutes=1)
 
 
+@contextmanager
+def _quiet_pandas_aliases() -> Iterator[None]:
+    """Silence pandas' alias-deprecation FutureWarnings (e.g. "'d' is
+    deprecated" on pandas 3) while parsing a time_resolution.
+
+    catch_warnings mutates process-global state, so it is only used when
+    _WARNINGS_LOCK is free. The lock is held by _captured_warnings for a
+    whole query, and validating a parameter must not wait behind one; when
+    it is busy the parse runs unsuppressed (a stray deprecation message is
+    harmless).
+    """
+    if not _WARNINGS_LOCK.acquire(blocking=False):
+        yield
+        return
+    try:
+        with _warnings.catch_warnings():
+            _warnings.simplefilter("ignore")
+            yield
+    finally:
+        _WARNINGS_LOCK.release()
+
+
 def _check_time_resolution(resolution: str) -> None:
     """Reject time_resolution values the current Datamesh engine mishandles.
 
@@ -473,9 +529,7 @@ def _check_time_resolution(resolution: str) -> None:
     """
     if resolution.strip().lower() == "native":
         return
-    with _WARNINGS_LOCK, _warnings.catch_warnings():
-        # pandas 2.2+ warns on deprecated aliases such as "H".
-        _warnings.simplefilter("ignore")
+    with _quiet_pandas_aliases():
         try:
             offset = to_offset(resolution)
         except ValueError:
@@ -486,6 +540,11 @@ def _check_time_resolution(resolution: str) -> None:
             engine_offset = None
     if offset is None and engine_offset is None:
         return
+    if engine_offset is not None and engine_offset.n <= 0:
+        raise ToolError(
+            f"time_resolution {resolution!r} must be a positive duration, "
+            'e.g. "1h", "1D" or "30D".'
+        )
     if (offset is not None and offset != engine_offset) or not isinstance(
         engine_offset, _ENGINE_SAFE_OFFSETS
     ):
@@ -833,11 +892,13 @@ def stage_query(
             # OCE-326: export_query sizes a limited dataset on the sliced
             # result, not on this unlimited stage, so it may well export it.
             cost = (
-                f"With limit={client_limit}, export_query writes only the last "
-                f"{client_limit} steps (after resampling) and applies the local export "
-                f"cap ({human_bytes(local_cap)}) and the disk-space check to "
-                f"that slice, which can be far smaller than {size}; ask the "
-                "user before exporting if it is still large."
+                f"With limit={client_limit}, export_query keeps only the last "
+                f"{client_limit} time/ensemble steps of the resampled or "
+                "aggregated result and applies the local export cap "
+                f"({human_bytes(local_cap)}) and the disk-space check to that "
+                f"slice, which can be far smaller than {size} (if the result "
+                "has no time/ensemble dimension, limit cannot shrink it); ask "
+                "the user before exporting if it is still large."
             )
         elif stage.size > local_cap:
             cost = (
@@ -1522,7 +1583,12 @@ def load_datasource(datasource_id: str) -> str:
                 f"filters{export_clause()}.",
                 datasource_id=datasource_id,
             )
-        with _gateway_timeout(conn, "load"), _captured_warnings(warnings):
+        bound = _gateway_timeout(
+            conn,
+            "load",
+            hint="use query_data with time/space filters to fetch a subset",
+        )
+        with bound, _captured_warnings(warnings):
             data = conn.load_datasource(datasource_id)
     except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "datasource_id": datasource_id})
