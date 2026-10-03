@@ -13,6 +13,7 @@ import math
 import sys
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -113,7 +114,40 @@ def _coord_summary(coord: xr.DataArray) -> dict[str, Any]:
     return out
 
 
+def _scalar_value(var: xr.DataArray) -> Any:
+    """JSON-safe value of a 0-d variable, at full precision.
+
+    Datetimes/timedeltas use the records conversion (ISO strings, NaT ->
+    null) to match other records; numbers skip it because DataFrame.to_json
+    rounds floats to 10 decimals, which would erase small aggregates.
+    """
+    value = var.values[()]
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return _records(pd.DataFrame({"v": [value]}))[0]["v"]
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _scalar_records(ds: xr.Dataset) -> list[dict[str, Any]]:
+    """One record per variable of a 0-d Dataset: name, value, units/long_name."""
+    out = []
+    for name, var in ds.data_vars.items():
+        rec: dict[str, Any] = {"name": str(name), "value": _scalar_value(var)}
+        for key in ("units", "long_name"):
+            if var.attrs.get(key) not in (None, ""):
+                rec[key] = str(var.attrs[key])
+        out.append(rec)
+    return out
+
+
 def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
+    if not ds.sizes and max_rows > 0:
+        # A 0-d result is one value per variable: compute it even if lazy
+        # (use_dask is chosen from the staged size, not the result's).
+        ds = ds.compute()
     lazy = any(ds[v].chunks is not None for v in ds.data_vars)
     out: dict[str, Any] = {
         "container": "dataset",
@@ -144,6 +178,15 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
             "with filters, aggregation, or time_resolution downsampling to see "
             "values inline" + export_clause() + "."
         )
+    elif max_rows > 0 and not ds.sizes:
+        # A 0-d result (e.g. aggregate_operations over space and time) has no
+        # index for to_dataframe (OCE-320): it is one record of scalars,
+        # returned as one scalar entry per variable. Datasets with any dim
+        # still go through to_dataframe, which broadcasts 0-d variables.
+        out["data"] = _scalar_records(ds)
+        out["truncated"] = False
+        # One record, as counted elsewhere (prod of no dims = 1).
+        out.update(_preview_fields(1, 1))
     elif max_rows > 0:
         # Eager data is already in memory — always include a preview of
         # coordinate-attributed values.

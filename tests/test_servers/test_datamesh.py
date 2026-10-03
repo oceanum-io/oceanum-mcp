@@ -6,6 +6,7 @@ import warnings
 import zipfile
 from unittest.mock import MagicMock, patch
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
@@ -405,6 +406,72 @@ class TestQueryData:
         assert parsed["lazy"] is False
         assert len(parsed["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
         assert parsed["truncated"] is True
+
+    def test_full_aggregate_returns_scalars(self, mock_conn, mock_stage):
+        # OCE-320: aggregating over space and time yields a 0-d Dataset.
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = xr.Dataset(
+            {
+                "hs": ((), np.float32(2.25), {"units": "m"}),
+                "tp": ((), np.float64(9.5)),
+            }
+        )
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds",
+                variables=["hs", "tp"],
+                aggregate_operations=["mean"],
+                aggregate_spatial=True,
+                aggregate_temporal=True,
+            )
+        )
+        assert "error" not in parsed
+        assert mock_conn.query.call_args.args[0].aggregate is not None
+        assert parsed["data"] == [
+            {"name": "hs", "value": 2.25, "units": "m"},
+            {"name": "tp", "value": 9.5},
+        ]
+        assert parsed["preview"] is False
+        assert parsed["returned"] == 1
+        assert parsed["total"] == 1
+
+    def test_full_aggregate_over_inline_limit_returns_scalars(
+        self, mock_conn, mock_stage
+    ):
+        # A large staged size switches to use_dask; the 0-d result is still
+        # tiny and must come back as values, not a lazy summary.
+        mock_stage.return_value = make_stage(Container.Dataset, size=10**9)
+        mock_conn.query.return_value = xr.Dataset(
+            {"hs": ((), da.from_array(np.array(2.25)))}
+        )
+
+        parsed = json.loads(
+            server.query_data(datasource_id="test-ds", aggregate_operations=["max"])
+        )
+        assert mock_conn.query.call_args.kwargs["use_dask"] is True
+        assert parsed["lazy"] is False
+        assert parsed["data"] == [{"name": "hs", "value": 2.25}]
+        assert (parsed["preview"], parsed["returned"], parsed["total"]) == (
+            False,
+            1,
+            1,
+        )
+
+    def test_full_aggregate_with_limit_returns_scalars(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = xr.Dataset({"hs": ((), 2.25)})
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds", aggregate_operations=["mean"], limit=3
+            )
+        )
+        assert mock_conn.query.call_args.args[0].limit is None
+        assert parsed["data"] == [{"name": "hs", "value": 2.25}]
+        # Nothing was cut: the single aggregate record is the full result.
+        assert parsed["preview"] is False
+        assert "no effect" in parsed["limit_note"]
 
 
 class TestExportQuery:
