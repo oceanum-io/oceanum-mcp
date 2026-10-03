@@ -113,19 +113,20 @@ def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
     # maximum double_precision=15 is still decimal places, not significant
     # digits (OCE-325). Keep to_json for every other dtype (ISO datetimes and
     # durations, NaT -> null) and replace float cells with exact values.
-    # Serializing under positional labels keeps every column addressable;
-    # keys are then str(label), as in the summary's column list.
-    positional = df.set_axis(range(df.shape[1]), axis=1)
-    rows = json.loads(positional.to_json(orient="records", date_format="iso"))
+    # Rows are serialized as positional lists and keyed by str(label), as in
+    # the summary's column list; labels must stay distinct as keys.
+    keys = [str(label) for label in df.columns]
+    if len(set(keys)) != len(keys):
+        raise ValueError(f"DataFrame column labels must be unique as keys: {keys}")
+    rows = json.loads(df.to_json(orient="values", date_format="iso"))
     for i, (_, col) in enumerate(df.items()):
         floats = _exact_floats(col)
         if floats is None:
             continue
-        for row, value in zip(rows, floats):
+        for row, value in zip(rows, floats, strict=True):
             if value is not _KEEP:
-                row[str(i)] = value
-    keys = [str(label) for label in df.columns]
-    return [{key: row[str(i)] for i, key in enumerate(keys)} for row in rows]
+                row[i] = value
+    return [dict(zip(keys, row, strict=True)) for row in rows]
 
 
 def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
