@@ -13,6 +13,7 @@ Error conventions:
 
 from __future__ import annotations
 
+import math
 import threading
 import warnings as _warnings
 from contextlib import contextmanager
@@ -190,6 +191,25 @@ def _query_echo(query: Query) -> dict[str, Any]:
 _LIMIT_COORD_KEYS = ("t", "e", "q")
 
 
+def _resamples_or_aggregates(query: Query) -> bool:
+    """True if Datamesh resamples (time_resolution) or aggregates this query."""
+    tf = query.timefilter
+    resamples = tf is not None and getattr(tf, "resolution", None) not in (
+        None,
+        "native",
+    )
+    return resamples or query.aggregate is not None
+
+
+def _record_count(data: Any) -> int | None:
+    """Records in a result, counted as summarize_data counts them."""
+    if isinstance(data, pd.DataFrame):
+        return int(data.shape[0])
+    if isinstance(data, xr.Dataset):
+        return math.prod(int(n) for n in data.sizes.values())
+    return None
+
+
 def _limit_result(data: Any, limit: int, coordkeys: dict[str, str]) -> tuple[Any, str]:
     """Apply Datamesh `limit` semantics (keep the last N) to a returned result.
 
@@ -203,7 +223,7 @@ def _limit_result(data: Any, limit: int, coordkeys: dict[str, str]) -> tuple[Any
         "which would apply it to the native records first)"
     )
     if isinstance(data, pd.DataFrame):
-        return data.tail(limit), f"{lead}: kept the last {limit} rows."
+        return data.tail(limit), f"{lead}: kept the last {limit} rows as returned."
     if isinstance(data, xr.Dataset):
         dims = []
         for key in _LIMIT_COORD_KEYS:
@@ -603,7 +623,8 @@ def query_data(
     time/ensemble). Combined with time_resolution or aggregate_operations,
     limit is applied by this server AFTER resampling/aggregation (to the last
     N resampled steps, or the last N rows of a table) rather than sent to
-    Datamesh, and the result carries a limit_note saying so.
+    Datamesh. A limited result is a subset of the requested range, so it is
+    flagged as a preview, with a limit_note.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -630,16 +651,18 @@ def query_data(
         limit=limit,
     )
     # OCE-298: Datamesh applies limit to native records BEFORE resampling or
-    # aggregation, so with those it is stripped here and applied to the
-    # returned result instead (after staging, so the size check sees the
-    # full resampled/aggregated result that will actually be downloaded).
+    # aggregation, so with those it is stripped from the query sent and
+    # applied to the returned result instead (the size check therefore sees
+    # the full resampled/aggregated result that is actually downloaded).
+    # Responses keep echoing the caller's query, limit included.
+    sent = query
     client_limit = None
-    if limit is not None and (time_resolution or aggregate_operations):
-        client_limit = limit
-        query = query.model_copy(update={"limit": None})
+    if query.limit is not None and _resamples_or_aggregates(query):
+        client_limit = query.limit
+        sent = query.model_copy(update={"limit": None})
     warnings: list[str] = []
     try:
-        stage = _stage(conn, query)
+        stage = _stage(conn, sent)
         if stage is None:
             return to_json(
                 {
@@ -655,23 +678,54 @@ def query_data(
                 # Lazy zarr access: structure only, no data download.
                 use_dask = True
             else:
+                extra: dict[str, Any] = {}
+                if client_limit is not None:
+                    extra["limit_note"] = (
+                        f"limit={client_limit} cannot shrink this download: with "
+                        "time_resolution/aggregate_operations it is applied "
+                        "after the full result is fetched."
+                    )
                 return _refusal(
                     stage,
                     f"Result is {human_bytes(stage.size)}, above the inline "
                     f"limit of {human_bytes(inline_limit)}. Narrow the query "
                     f"with filters or aggregation{export_clause()}.",
                     query=_query_echo(query),
+                    **extra,
                 )
         with _captured_warnings(warnings):
-            data = conn.query(query, use_dask=use_dask)
+            data = conn.query(sent, use_dask=use_dask)
+            full_records = _record_count(data)
+            limit_note = None
+            if client_limit is not None and data is not None:
+                data, limit_note = _limit_result(data, client_limit, stage.coordkeys)
+                if use_dask and data.nbytes <= inline_limit:
+                    # The limited slice is small: fetch just its chunks so
+                    # it comes back inline rather than as a lazy summary.
+                    data = data.load()
     except _DATAMESH_ERRORS as exc:
         return to_json({"error": str(exc), "query": _query_echo(query)})
 
-    limit_note = None
-    if client_limit is not None and data is not None:
-        data, limit_note = _limit_result(data, client_limit, stage.coordkeys)
     out = summarize_data(data, warnings=warnings)
     out["staged_size_bytes"] = stage.size
+    if query.limit is not None and "preview" in out:
+        # A limited result is a subset of what the query selects, so it is a
+        # preview too: never let it pass as the full range (OCE-306).
+        if client_limit is None:
+            # Datamesh applied it; the unlimited size is unknown.
+            out["preview"], out["total"] = True, None
+            limit_note = (
+                f"limit={query.limit} was applied by Datamesh (it keeps the "
+                "last N steps); the full result may be larger."
+            )
+        elif full_records is not None and _record_count(data) < full_records:
+            out["preview"], out["total"] = True, full_records
+        if out["preview"]:
+            limit_note += (
+                " This limited result is a subset of the requested range: NOT "
+                "suitable for statistics over that range; use "
+                "aggregate_operations or time_resolution instead."
+            )
     if limit_note:
         out["limit_note"] = limit_note
     return to_json(out)

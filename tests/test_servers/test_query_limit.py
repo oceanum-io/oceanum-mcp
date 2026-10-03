@@ -12,6 +12,7 @@ import pandas as pd
 import pytest
 import xarray as xr
 from fastmcp.exceptions import ToolError
+from oceanum.datamesh.exceptions import DatameshConnectError
 from oceanum.datamesh.query import Container
 
 from oceanum_mcp.servers.datamesh import server
@@ -124,9 +125,13 @@ class TestLimitWithResampling:
         parsed = json.loads(server.query_data(datasource_id="test-ds", limit=5))
         assert _sent_query().limit == 5
         assert mock_stage.call_args.args[1].limit == 5
-        # The backend applied it; the result is passed through untouched.
+        # The backend applied it; the result is passed through untouched,
+        # but flagged as a subset whose full size is unknown.
         assert parsed["dims"] == {"time": 6}
-        assert "limit_note" not in parsed
+        assert parsed["preview"] is True
+        assert parsed["total"] is None
+        assert "Datamesh" in parsed["limit_note"]
+        assert "NOT suitable for statistics" in parsed["limit_note"]
 
     def test_no_limit_no_note(self, mock_conn, mock_stage):
         mock_stage.return_value = _dataset_stage({"t": "time"})
@@ -154,3 +159,97 @@ class TestLimitWithResampling:
         desc = tools["query_data"].description.lower()
         assert "time_resolution" in desc and "aggregate_operations" in desc
         assert "after" in desc and "last" in desc
+
+    def test_client_limited_result_flagged_as_preview(self, mock_conn, mock_stage):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6)
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds",
+                time_start="2024-01-01",
+                time_end="2024-01-07",
+                time_resolution="1D",
+                limit=2,
+            )
+        )
+        assert parsed["preview"] is True
+        assert parsed["returned"] == 2
+        assert parsed["total"] == 6  # the resampled result before limiting
+        assert "NOT suitable for statistics" in parsed["limit_note"]
+
+    def test_limit_not_cutting_anything_is_not_a_preview(self, mock_conn, mock_stage):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(3)
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds",
+                time_start="2024-01-01",
+                time_end="2024-01-04",
+                time_resolution="1D",
+                limit=10,
+            )
+        )
+        assert parsed["preview"] is False
+        assert parsed["total"] == 3
+
+    def test_echoed_query_keeps_callers_limit(self, mock_conn, mock_stage):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.side_effect = DatameshConnectError("server error: 500")
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds",
+                time_start="2024-01-01",
+                time_end="2024-01-07",
+                time_resolution="1D",
+                limit=2,
+            )
+        )
+        assert "error" in parsed
+        assert parsed["query"]["limit"] == 2
+
+    def test_large_lazy_dataset_loaded_once_limited_small(self, mock_conn, mock_stage):
+        stage = make_stage(Container.Dataset, size=10**9)
+        mock_stage.return_value = stage.model_copy(update={"coordkeys": {"t": "time"}})
+        mock_conn.query.return_value = _hourly(6).chunk({"time": 1})
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds",
+                time_start="2024-01-01",
+                time_end="2024-01-07",
+                time_resolution="1D",
+                limit=2,
+            )
+        )
+        assert mock_conn.query.call_args.kwargs["use_dask"] is True
+        assert parsed["lazy"] is False
+        assert [r["hs"] for r in parsed["data"]] == [4.0, 5.0]
+
+    def test_large_frame_refusal_explains_limit(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=10**9)
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds", aggregate_operations=["mean"], limit=3
+            )
+        )
+        assert parsed["refused"] is True
+        assert "cannot shrink" in parsed["limit_note"]
+        assert parsed["query"]["limit"] == 3
+        mock_conn.query.assert_not_called()
+
+    def test_native_time_resolution_keeps_backend_limit(self, mock_conn, mock_stage):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6)
+
+        server.query_data(
+            datasource_id="test-ds",
+            time_start="2024-01-01",
+            time_end="2024-01-07",
+            time_resolution="native",
+            limit=2,
+        )
+        assert _sent_query().limit == 2
