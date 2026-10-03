@@ -97,7 +97,7 @@ LARGE_DOWNLOAD_BYTES = 2_000_000_000
 # links (OCE-317) this bounds what one leaked link, or one runaway agent call,
 # can pull. Equal to the local dataset cap (MAX_EXPORT_DATASET_BYTES) so an
 # export that works on stdio also works hosted; 2-10 GB stays warn-and-allow.
-MAX_HOSTED_EXPORT_BYTES = 10_000_000_000
+MAX_HOSTED_EXPORT_BYTES = MAX_EXPORT_DATASET_BYTES
 
 # The tool's format names mapped to the gateway's `&f=` download tokens.
 _GATEWAY_FORMAT = {"netcdf": "nc", "parquet": "parquet", "csv": "csv"}
@@ -643,7 +643,12 @@ def stage_query(
             else MAX_EXPORT_FRAME_BYTES
         )
         if is_network_transport():
-            if stage.size > MAX_HOSTED_EXPORT_BYTES:
+            if client_limit is not None:
+                cost = (
+                    "export_query will refuse it with limit plus "
+                    "time_resolution/aggregate_operations (see limit_note)."
+                )
+            elif stage.size > MAX_HOSTED_EXPORT_BYTES:
                 cost = (
                     "export_query will refuse it: hosted downloads are capped "
                     f"at {human_bytes(MAX_HOSTED_EXPORT_BYTES)}."
@@ -891,17 +896,21 @@ def _export_download_url(
                 "query": _query_echo(query),
             }
         )
-    if size > MAX_HOSTED_EXPORT_BYTES:
+    # size is the staged (in-memory) size, which NetCDF/Parquet land at or
+    # below; CSV text runs well above it, so the cap applies to its estimate.
+    est = int(size * _EXPORT_DISK_FACTOR["csv"]) if fmt == "csv" else size
+    if est > MAX_HOSTED_EXPORT_BYTES:
         # Same shape as _refusal; the gateway's download stage has no dlen.
         # The signed URL is withheld: it is a bearer credential (OCE-299).
+        as_fmt = f" (about {human_bytes(est)} as {fmt})" if fmt == "csv" else ""
         return to_json(
             {
                 "refused": True,
                 "container": stage.get("container"),
                 "size_bytes": size,
                 "size_human": human_bytes(size),
-                "message": f"Result is {human_bytes(size)}, above the hosted "
-                f"export limit of {human_bytes(MAX_HOSTED_EXPORT_BYTES)}. "
+                "message": f"Result is {human_bytes(size)}{as_fmt}, above the "
+                f"hosted export limit of {human_bytes(MAX_HOSTED_EXPORT_BYTES)}. "
                 "Narrow the query: a shorter time range, a smaller bbox, fewer "
                 "variables, time_resolution downsampling, or aggregation.",
                 "query": _query_echo(query),
@@ -957,6 +966,17 @@ def _flatten_refusal(stage: Stage, nbytes: int, fmt: str, query: Query) -> str:
         f"{human_bytes(MAX_EXPORT_FRAME_BYTES)}). Use format='netcdf', or "
         "narrow the query (e.g. a point geofilter_feature, fewer variables, a "
         "shorter time range).",
+        query=_query_echo(query),
+    )
+
+
+def _dataset_cap_refusal(stage: Stage, nbytes: int, query: Query) -> str:
+    return _refusal(
+        stage,
+        f"Dataset result is {human_bytes(nbytes)}, above the local export "
+        f"limit of {human_bytes(MAX_EXPORT_DATASET_BYTES)}. Narrow the query: "
+        "a shorter time range, a smaller bbox, fewer variables, "
+        "time_resolution downsampling, or aggregation.",
         query=_query_echo(query),
     )
 
@@ -1070,7 +1090,7 @@ def export_query(
     if is_network_transport():
         # Hosted: broker a gateway download link; there is no client-visible
         # local filesystem. path/overwrite do not apply.
-        if _split_limit(query)[1] is not None:
+        if query.limit is not None and _resamples_or_aggregates(query):
             raise ToolError(_HOSTED_LIMIT_UNSUPPORTED)
         return _export_download_url(conn, query, format, requested_path=path)
 
@@ -1097,6 +1117,11 @@ def export_query(
             )
 
         is_dataset = stage.container == Container.Dataset
+        # stage.size is the unlimited result. A limited dataset is sliced
+        # lazily before any chunk is fetched, so its size checks run on the
+        # limited slice once it is open, below. (A frame downloads in full
+        # before the limit applies, so the unlimited size is the right bound.)
+        size_limited_slice = is_dataset and client_limit is not None
         if is_dataset:
             fmt = format or "netcdf"
             # A point series (or any small dataset) flattens to a table via
@@ -1104,18 +1129,11 @@ def export_query(
             # same ceiling as a tabular export.
             # Cheap pre-download bound; the flattened size is checked again
             # from the lazy structure once it is open.
-            if fmt != "netcdf" and stage.size > MAX_EXPORT_FRAME_BYTES:
-                return _flatten_refusal(stage, stage.size, fmt, query)
-            if stage.size > MAX_EXPORT_DATASET_BYTES:
-                return _refusal(
-                    stage,
-                    f"Dataset result is {human_bytes(stage.size)}, above the "
-                    f"local export limit of "
-                    f"{human_bytes(MAX_EXPORT_DATASET_BYTES)}. Narrow the "
-                    "query: a shorter time range, a smaller bbox, fewer "
-                    "variables, time_resolution downsampling, or aggregation.",
-                    query=_query_echo(query),
-                )
+            if not size_limited_slice:
+                if fmt != "netcdf" and stage.size > MAX_EXPORT_FRAME_BYTES:
+                    return _flatten_refusal(stage, stage.size, fmt, query)
+                if stage.size > MAX_EXPORT_DATASET_BYTES:
+                    return _dataset_cap_refusal(stage, stage.size, query)
         else:
             fmt = format or "parquet"
             if fmt not in ("parquet", "csv"):
@@ -1131,9 +1149,10 @@ def export_query(
                     query=_query_echo(query),
                 )
 
-        refusal = _disk_refusal(stage, dest, fmt, stage.size, query)
-        if refusal is not None:
-            return refusal
+        if not size_limited_slice:
+            refusal = _disk_refusal(stage, dest, fmt, stage.size, query)
+            if refusal is not None:
+                return refusal
 
         with _captured_warnings(warnings):
             # Datasets stream chunk-wise from lazy zarr; frames download fully.
@@ -1156,6 +1175,17 @@ def export_query(
     if client_limit is not None:
         # Lazy datasets are sliced before any chunk is fetched.
         data, limit_note = _limit_result(data, client_limit, stage.coordkeys)
+        if size_limited_slice:
+            # The checks skipped before download, on the limited lazy slice
+            # (nbytes comes from shape and dtype; nothing is fetched). The
+            # flatten path below checks the flattened size and disk itself.
+            nbytes = int(data.nbytes)
+            if nbytes > MAX_EXPORT_DATASET_BYTES:
+                return _dataset_cap_refusal(stage, nbytes, query)
+            if fmt == "netcdf":
+                refusal = _disk_refusal(stage, dest, fmt, nbytes, query)
+                if refusal is not None:
+                    return refusal
 
     if is_dataset and fmt != "netcdf":
         # Size the flattened table from the lazy structure (no data fetched

@@ -930,6 +930,19 @@ class TestExportQueryHosted:
         assert "download_url" not in parsed
         assert "sig=xyz" not in raw and "oceanql" not in raw
 
+    def test_csv_cap_applies_to_estimated_text_size(self, mock_conn):
+        # 4 GB staged is below the cap as parquet but ~12 GB as CSV text.
+        stage = self._stage(size=4 * 10**9)
+        with patch.object(server, "_download_stage", return_value=stage):
+            as_csv = json.loads(
+                server.export_query(datasource_id="test-ds", format="csv")
+            )
+            as_parquet = json.loads(server.export_query(datasource_id="test-ds"))
+        assert as_csv["refused"] is True
+        assert "as csv" in as_csv["message"]
+        assert "download_url" not in as_csv
+        assert "download_url" in as_parquet
+
     @pytest.mark.parametrize("size", [None, "n/a"])
     def test_unknown_size_fails_closed(self, mock_conn, size):
         stage = self._stage()

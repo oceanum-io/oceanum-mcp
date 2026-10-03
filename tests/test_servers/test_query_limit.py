@@ -6,7 +6,7 @@ limit to the returned (resampled/aggregated) result instead.
 """
 
 import json
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pandas as pd
@@ -316,6 +316,30 @@ class TestStageQueryLimit:
         assert "export_query" in parsed["limit_note"]
         assert "not supported" in parsed["limit_note"]
 
+    def test_hosted_large_recommendation_does_not_offer_download(
+        self, mock_conn, mock_stage
+    ):
+        from oceanum_mcp.common.config import set_transport
+
+        stage = make_stage(Container.Dataset, size=1_500_000_000)
+        mock_stage.return_value = stage.model_copy(update={"coordkeys": {"t": "time"}})
+        try:
+            set_transport("http")
+            parsed = json.loads(
+                server.stage_query(
+                    datasource_id="test-ds",
+                    time_start="2024-01-01",
+                    time_end="2024-01-07",
+                    time_resolution="1D",
+                    limit=2,
+                )
+            )
+        finally:
+            set_transport("stdio")
+        rec = parsed["recommendation"]
+        assert "refuse" in rec
+        assert "download" not in rec
+
 
 class TestExportQueryLimit:
     """OCE-319: export_query applies limit after resampling, never before."""
@@ -392,6 +416,76 @@ class TestExportQueryLimit:
             limit=2,
         )
         assert pd.read_csv(dest)["hs"].tolist() == [4.0, 5.0]
+
+    def test_local_dataset_caps_checked_on_limited_slice(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        # The unlimited resampled result is above the local cap, but only the
+        # limited slice is fetched and written, so the export proceeds.
+        stage = make_stage(Container.Dataset, size=server.MAX_EXPORT_DATASET_BYTES + 1)
+        mock_stage.return_value = stage.model_copy(update={"coordkeys": {"t": "time"}})
+        mock_conn.query.return_value = _hourly(6).chunk({"time": 1})
+        dest = tmp_path / "out.nc"
+
+        usage = MagicMock(free=10_000)  # far below the unlimited staged size
+        with patch.object(server.shutil, "disk_usage", return_value=usage):
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds",
+                    path=str(dest),
+                    time_start="2024-01-01",
+                    time_end="2024-01-07",
+                    time_resolution="1D",
+                    limit=2,
+                )
+            )
+        assert "refused" not in parsed
+        with xr.open_dataset(dest) as ds:
+            assert ds["hs"].values.tolist() == [4.0, 5.0]
+
+    def test_local_limited_slice_above_cap_still_refused(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6).chunk({"time": 1})
+        dest = tmp_path / "out.nc"
+
+        with patch.object(server, "MAX_EXPORT_DATASET_BYTES", 16):
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds",
+                    path=str(dest),
+                    time_start="2024-01-01",
+                    time_end="2024-01-07",
+                    time_resolution="1D",
+                    limit=5,
+                )
+            )
+        assert parsed["refused"] is True
+        # Sized on the limited slice: 5 steps x (hs + time) x 8 bytes.
+        assert "80 B" in parsed["message"]
+        assert not dest.exists()
+
+    def test_local_limited_slice_disk_check(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = _dataset_stage({"t": "time"})
+        mock_conn.query.return_value = _hourly(6).chunk({"time": 1})
+        dest = tmp_path / "out.nc"
+
+        usage = MagicMock(free=1)
+        with patch.object(server.shutil, "disk_usage", return_value=usage):
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds",
+                    path=str(dest),
+                    time_start="2024-01-01",
+                    time_end="2024-01-07",
+                    time_resolution="1D",
+                    limit=2,
+                )
+            )
+        assert parsed["refused"] is True
+        assert "disk space" in parsed["message"]
+        assert not dest.exists()
 
     def test_plain_limit_still_sent_on_export(self, mock_conn, mock_stage, tmp_path):
         mock_stage.return_value = _dataset_stage({"t": "time"})

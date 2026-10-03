@@ -317,8 +317,9 @@ large to return inline. Behaviour depends on transport:
   write Parquet or CSV.
 - **Hosted (http/sse):** returns a time-limited, self-authenticating gateway
   `download_url` (choose `format`; `path` is ignored). Fetch it out-of-band.
-  Results above 10 GB are refused (narrow the query); above 2 GB the link is
-  returned with a large-download warning.
+  Results above 10 GB (for CSV, the estimated text size, about 3x the staged
+  size) are refused (narrow the query); above 2 GB the link is returned with
+  a large-download warning.
 
 Accepts the same query parameters as `query_data` plus:
 
