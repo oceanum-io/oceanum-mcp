@@ -6,14 +6,21 @@ Error conventions:
 - Invalid parameter combinations raise ToolError (the caller should fix the
   tool call).
 - Datamesh runtime errors return a JSON object with an "error" key and the
-  canonical query echoed back, so the caller can self-correct.
+  canonical query echoed back, so the caller can self-correct. An unknown
+  datasource id or variable adds a "suggestions" list of close matches; a
+  datasource that exists but is not shared with the caller says so instead.
+  A query variable named by the exact CF standard_name of exactly one of the
+  datasource's variables is resolved to it, reported in "resolved_variables".
 - Results that are too large to return inline return a JSON object with a
   "refused" key, the staged size, and concrete alternatives.
 """
 
 from __future__ import annotations
 
+import difflib
 import inspect
+import json
+import logging
 import math
 import os
 import re
@@ -22,9 +29,11 @@ import threading
 import time
 import uuid
 import warnings as _warnings
+from collections.abc import Callable
 from contextlib import contextmanager, nullcontext
 from contextvars import ContextVar
 from dataclasses import dataclass
+from functools import partial, wraps
 from pathlib import Path
 from typing import Any, Callable, Iterator, Literal
 
@@ -360,6 +369,423 @@ def _download_stage(conn: Connector, query: Query) -> dict[str, Any] | None:
 def _query_echo(query: Query) -> dict[str, Any]:
     """Canonical JSON form of a query, for echoing in responses."""
     return query.model_dump(mode="json", exclude_none=True, warnings=False)
+
+
+# ---------------------------------------------------------------------------
+# "Did you mean" suggestions for unknown datasources and variables (OCE-303)
+# ---------------------------------------------------------------------------
+
+# Catalog entries fetched to rank datasource suggestions (one request).
+SUGGEST_CATALOG_LIMIT = 20
+# Suggestions returned per unknown datasource id or variable.
+MAX_SUGGESTIONS = 5
+# Seconds a tool call waits for its suggestions before returning the original
+# error. The lookups are SDK metadata requests (10 s read timeout, up to 8
+# retries, 30 s back-off after a 502), so without this cap a degraded metadata
+# server could hold an already-failed tool call for minutes.
+SUGGEST_TIMEOUT = 10.0
+# Minimum similarity (0-1) for a candidate to be suggested.
+_SUGGEST_CUTOFF = 0.7
+# Score of a candidate containing every word of the requested name (e.g.
+# "significant_wave_height" in "sea_surface_wave_significant_height"): above
+# the cutoff, below a close typo.
+_CONTAINS_ALL_WORDS_SCORE = 0.8
+# Words the catalog's keyword search (Postgres websearch_to_tsquery) treats as
+# operators or stop words; dropped from the suggestion search.
+_SEARCH_OPERATOR_WORDS = frozenset({"or", "and", "not"})
+
+# The SDK's get_datasource raises DatameshConnectError with exactly
+# "Datasource <id> not found" for a metadata-server 404, and with the server's
+# detail for a 403 (the datasource exists but is not shared with the caller):
+# "You do not have permission to access this datasource". A 401 ("not
+# Authorized") is a credential problem and 5xx bodies are server faults:
+# neither is matched.
+_FORBIDDEN_RE = re.compile(r"You do not have permission\b")
+# The query engine reports a requested variable missing from the datasource as
+# "Invalid variable selection - variable not found: '<name>'".
+_VARIABLE_MISSING_RE = re.compile(
+    r"variables? not found|no variable named", re.IGNORECASE
+)
+
+# Lookups run in daemon threads, at most this many at once: a lookup that
+# times out keeps its thread until the SDK gives up, and must neither delay
+# interpreter exit nor pile up. With every slot busy, lookups are skipped.
+_SUGGEST_SLOTS = threading.BoundedSemaphore(4)
+logger = logging.getLogger(__name__)
+
+# Variables substituted by exact CF standard_name in the current tool call
+# (see _stage_resolving), reported by _reporting_resolved_variables.
+_RESOLVED_VARIABLES: ContextVar[dict[str, str] | None] = ContextVar(
+    "_RESOLVED_VARIABLES", default=None
+)
+
+
+def _run_bounded(fn: Callable[[], Any], datasource_id: str) -> Any:
+    """fn() run in a daemon thread for at most SUGGEST_TIMEOUT seconds.
+
+    Returns None, logging a warning, if fn raised, timed out, or no lookup
+    slot was free: a best-effort lookup must never replace the error it
+    enriches, nor hold the tool call or interpreter exit.
+    """
+    if not _SUGGEST_SLOTS.acquire(blocking=False):
+        logger.warning("Suggestions for %r skipped: lookups busy", datasource_id)
+        return None
+    box: dict[str, Any] = {}
+
+    def target() -> None:
+        try:
+            box["result"] = fn()
+        except Exception as exc:
+            box["error"] = exc
+        finally:
+            _SUGGEST_SLOTS.release()
+
+    thread = threading.Thread(target=target, name="datamesh-suggest", daemon=True)
+    try:
+        thread.start()
+    except RuntimeError:  # e.g. "can't start new thread"
+        _SUGGEST_SLOTS.release()
+        logger.warning("Suggestions for %r skipped", datasource_id, exc_info=True)
+        return None
+    thread.join(SUGGEST_TIMEOUT)
+    if thread.is_alive():
+        logger.warning(
+            "Suggestions for %r timed out after %ss", datasource_id, SUGGEST_TIMEOUT
+        )
+        return None
+    if "error" in box:
+        logger.warning(
+            "Suggestions for %r failed", datasource_id, exc_info=box["error"]
+        )
+        return None
+    return box.get("result")
+
+
+def _engine_missing_re(datasource_id: str) -> re.Pattern[str]:
+    """The query engine's 404 for a datasource id, which it returns both for a
+    missing datasource and for one not shared with the caller ("Datasource
+    <id> not found or not authorized")."""
+    return re.compile(
+        rf"Datasource {re.escape(datasource_id)} (?:not found|does not exist)",
+        re.IGNORECASE,
+    )
+
+
+def _norm(text: str) -> str:
+    """Lower-case text with every run of non-alphanumerics folded to "_"."""
+    return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+def _similarity(wanted: str, candidate: str) -> tuple[float, float]:
+    """(score, ratio) of a requested name against a candidate name or label.
+
+    ratio is difflib's character-sequence ratio (catches typos). score is
+    ratio, raised to _CONTAINS_ALL_WORDS_SCORE when the candidate contains
+    every word of the request (catches reordered or longer names). A partial
+    word overlap does not count: "sea_surface_temperature" must not suggest
+    "sea_surface_salinity".
+    """
+    a, b = _norm(wanted), _norm(candidate)
+    if not a or not b:
+        return 0.0, 0.0
+    ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    if set(a.split("_")) <= set(b.split("_")):
+        return max(ratio, _CONTAINS_ALL_WORDS_SCORE), ratio
+    return ratio, ratio
+
+
+def _best_matches(wanted: str, candidates: dict[str, list[str]]) -> list[str]:
+    """Up to MAX_SUGGESTIONS candidate keys most similar to wanted.
+
+    candidates maps each key to the labels it is matched on (the key itself
+    plus e.g. a datasource name or a variable's standard_name/long_name).
+    Ranked by score, then by character similarity, then by key.
+    """
+    scored = []
+    for key, labels in candidates.items():
+        score, ratio = max(
+            (_similarity(wanted, label) for label in labels if label),
+            default=(0.0, 0.0),
+        )
+        if score >= _SUGGEST_CUTOFF:
+            scored.append((-score, -ratio, key))
+    return [key for *_, key in sorted(scored)[:MAX_SUGGESTIONS]]
+
+
+def _datasource_suggestions(
+    conn: Connector, datasource_id: str
+) -> list[dict[str, Any]]:
+    """Visible datasources whose id or name resembles datasource_id.
+
+    One bounded catalog search on the id's words (OR-ed, so a single typo'd
+    word does not empty a keyword search); the catalog only lists datasources
+    shared with the caller, so entitlement is respected.
+    """
+    words = [
+        w for w in _norm(datasource_id).split("_") if w not in _SEARCH_OPERATOR_WORDS
+    ]
+    if not words:
+        return []
+    catalog = conn.get_catalog(search=" or ".join(words), limit=SUGGEST_CATALOG_LIMIT)
+    names: dict[str, str] = {}
+    for ds in catalog:
+        if ds is not None and ds.id != datasource_id:
+            names[ds.id] = ds.name or ""
+    ranked = _best_matches(datasource_id, {i: [i, n] for i, n in names.items()})
+    return [{"id": i, "name": names[i]} for i in ranked]
+
+
+def _metadata_error_fields(
+    conn: Connector, datasource_id: str, message: str
+) -> dict[str, Any] | None:
+    """Error fields for a get_datasource failure on datasource_id: a "no
+    access" message for a 403, "did you mean" suggestions for a 404, and None
+    for anything else."""
+    if _FORBIDDEN_RE.match(message):
+        return {
+            "error": f"You don't have access to datasource {datasource_id!r}: it "
+            "exists but is not shared with your account. Ask its owner or "
+            "your Oceanum administrator for access."
+        }
+    if message != f"Datasource {datasource_id} not found":
+        return None
+    suggestions = _datasource_suggestions(conn, datasource_id)
+    hint = (
+        "did you mean one of the suggestions?"
+        if suggestions
+        else "no similar ids found; use search_catalog to find one."
+    )
+    return {
+        "error": f"Datasource {datasource_id!r} not found; {hint}",
+        "suggestions": suggestions,
+    }
+
+
+def _engine_missing_fields(
+    conn: Connector, datasource_id: str
+) -> dict[str, Any] | None:
+    """Error fields for the query engine's "not found or not authorized": the
+    metadata server tells a missing datasource (404) from one not shared with
+    the caller (403); the engine does not."""
+    try:
+        conn.get_datasource(datasource_id)
+    except _DATAMESH_ERRORS as exc:
+        return _metadata_error_fields(conn, datasource_id, str(exc))
+    return None  # visible to the caller: keep the engine's own error
+
+
+def _best_effort(fn: Callable[[], Any], datasource_id: str) -> Any:
+    """fn() (in-memory work, no I/O), or None, logging a warning, if it
+    raised: a bug in building suggestions must not replace the error."""
+    try:
+        return fn()
+    except Exception:
+        logger.warning("Suggestions for %r failed", datasource_id, exc_info=True)
+        return None
+
+
+def _datasource_schema(conn: Connector, datasource_id: str, exc: Exception) -> Any:
+    """The caller's own get_datasource record for datasource_id, fetched at
+    most once per error (cached on exc) and bounded by _run_bounded; None if
+    the lookup failed."""
+    if not hasattr(exc, "_datamesh_schema_lookup"):
+        exc._datamesh_schema_lookup = _run_bounded(  # type: ignore[attr-defined]
+            partial(conn.get_datasource, datasource_id), datasource_id
+        )
+    return exc._datamesh_schema_lookup  # type: ignore[attr-defined]
+
+
+def _unknown_variables(datasource: Any, variables: list[str]) -> list[str]:
+    """Requested variables that are neither data variables nor coordinates of
+    datasource; empty if its schema is unknown."""
+    data_vars = datasource.variables or {}
+    if not data_vars:
+        return []
+    coords = getattr(datasource.dataschema, "coords", None) or {}
+    return [v for v in variables if v not in data_vars and v not in coords]
+
+
+def _variable_attrs(schema: Any) -> dict[str, Any]:
+    return (schema or {}).get("attrs") or {}
+
+
+def _variable_fields(
+    datasource_id: str, datasource: Any, variables: list[str]
+) -> dict[str, Any] | None:
+    """Error fields for requested variables the datasource lacks, with the
+    closest variable names (matched on name, standard_name and long_name).
+    None if every requested variable exists, or the schema is unknown."""
+    unknown = _unknown_variables(datasource, variables)
+    if not unknown:
+        return None
+    candidates: dict[str, list[str]] = {}
+    for name, schema in datasource.variables.items():
+        attrs = _variable_attrs(schema)
+        labels = [str(name)]
+        labels += [
+            str(attrs[k]) for k in ("standard_name", "long_name") if attrs.get(k)
+        ]
+        candidates[str(name)] = labels
+    return {
+        "error": f"Variable(s) not in datasource {datasource_id!r}: "
+        f"{', '.join(unknown)}. See the suggestions; get_datasource_info lists "
+        "every variable.",
+        "suggestions": [
+            {"variable": v, "did_you_mean": _best_matches(v, candidates)}
+            for v in unknown
+        ],
+    }
+
+
+def _standard_name_aliases(
+    datasource: Any, variables: list[str]
+) -> dict[str, str] | None:
+    """{requested: variable} for every unknown requested variable that
+    EXACTLY equals the CF standard_name of exactly one of the datasource's
+    variables. None if any unknown variable has no such unique match: an
+    ambiguous or fuzzy alias is never resolved."""
+    unknown = _unknown_variables(datasource, variables)
+    if not unknown:
+        return None
+    aliases: dict[str, str] = {}
+    for wanted in unknown:
+        matches = [
+            str(name)
+            for name, schema in datasource.variables.items()
+            if _variable_attrs(schema).get("standard_name") == wanted
+        ]
+        if len(matches) != 1:
+            return None
+        aliases[wanted] = matches[0]
+    return aliases
+
+
+def _substituted(query: Query, aliases: dict[str, str]) -> Query:
+    """query with its variables renamed per aliases (duplicates dropped)."""
+    if not aliases or not query.variables:
+        return query
+    variables = list(dict.fromkeys(aliases.get(v, v) for v in query.variables))
+    return query.model_copy(update={"variables": variables})
+
+
+def _stage_resolving(
+    conn: Connector, query: Query, stage_fn: Callable[[Connector, Query], Any]
+) -> tuple[Any, dict[str, str]]:
+    """stage_fn(conn, query), retried once with variables resolved by CF
+    standard_name if the engine reports a requested variable missing.
+
+    Returns (result, aliases); aliases is empty unless the retry ran and
+    succeeded, in which case the caller must apply _substituted(query,
+    aliases) to the query it goes on to use. Only the caller's own
+    get_datasource record is consulted (one bounded fetch, reused by
+    _error_json on failure). If nothing resolves, or the retry still reports
+    a missing variable, the ORIGINAL error is raised; any other retry error
+    (e.g. GatewayTimeout) is raised as is. The retry is a second stage with
+    its own OCEANUM_MCP_STAGE_TIMEOUT, so this error path can take up to
+    twice the stage timeout plus SUGGEST_TIMEOUT.
+    """
+    try:
+        return stage_fn(conn, query), {}
+    except _DATAMESH_ERRORS as exc:
+        if (
+            isinstance(exc, GatewayTimeout)
+            or not query.variables
+            or not _VARIABLE_MISSING_RE.search(str(exc))
+        ):
+            raise
+        datasource = _datasource_schema(conn, query.datasource, exc)
+        aliases = (
+            _best_effort(
+                partial(_standard_name_aliases, datasource, query.variables),
+                query.datasource,
+            )
+            if datasource is not None
+            else None
+        )
+        if not aliases:
+            raise
+        try:
+            result = stage_fn(conn, _substituted(query, aliases))
+        except _DATAMESH_ERRORS as retry_exc:
+            if _VARIABLE_MISSING_RE.search(str(retry_exc)):
+                raise exc from None
+            # Anything else (a timeout, a 5xx) is the real problem now: the
+            # variables did resolve, so do not report them as missing.
+            raise
+    recorder = _RESOLVED_VARIABLES.get()
+    if recorder is not None:
+        recorder.update(aliases)
+    return result, aliases
+
+
+def _reporting_resolved_variables(tool: Callable[..., str]) -> Callable[..., str]:
+    """Wrap a query tool so a response whose variables were resolved by
+    _stage_resolving reports them as "resolved_variables" ({requested:
+    used}); responses without a resolution are returned unchanged."""
+
+    @wraps(tool)
+    def wrapper(*args: Any, **kwargs: Any) -> str:
+        resolved: dict[str, str] = {}
+        token = _RESOLVED_VARIABLES.set(resolved)
+        try:
+            out = tool(*args, **kwargs)
+        finally:
+            _RESOLVED_VARIABLES.reset(token)
+        if not resolved:
+            return out
+        try:
+            payload = json.loads(out)
+        except ValueError:
+            return out
+        if not isinstance(payload, dict):
+            return out
+        return to_json({**payload, "resolved_variables": resolved})
+
+    return wrapper
+
+
+def _error_json(
+    conn: Connector,
+    datasource_id: str,
+    exc: Exception,
+    context: dict[str, Any],
+    *,
+    variables: list[str] | None = None,
+    from_metadata: bool = False,
+) -> str:
+    """JSON for a Datamesh error on datasource_id, plus context (the echoed
+    query, or the datasource_id).
+
+    If the error says the datasource or a requested variable does not exist,
+    it is restated with "did you mean" suggestions; a datasource that exists
+    but is not shared with the caller is reported as such, without
+    suggestions. from_metadata marks exc as raised by get_datasource itself;
+    otherwise it is a query-engine error. The lookups (at most one
+    get_datasource and one bounded catalog search) run only on those error
+    paths, each bounded by _run_bounded; if they fail or time out the
+    original error is returned unchanged.
+    """
+    message = str(exc)
+    fields = None
+    if from_metadata:
+        fields = _run_bounded(
+            partial(_metadata_error_fields, conn, datasource_id, message),
+            datasource_id,
+        )
+    elif isinstance(exc, GatewayTimeout):
+        pass
+    elif _engine_missing_re(datasource_id).search(message):
+        fields = _run_bounded(
+            partial(_engine_missing_fields, conn, datasource_id), datasource_id
+        )
+    elif variables and _VARIABLE_MISSING_RE.search(message):
+        datasource = _datasource_schema(conn, datasource_id, exc)
+        if datasource is not None:
+            fields = _best_effort(
+                partial(_variable_fields, datasource_id, datasource, variables),
+                datasource_id,
+            )
+    return to_json({**(fields or {"error": message}), **context})
 
 
 # Coordinate keys Datamesh applies `limit` along (time, ensemble, quantile):
@@ -888,10 +1314,21 @@ def get_datasource_info(
         detail: "summary" (default) returns the bounded view described above. "full" returns the complete record, including every attribute; it can be very large.
 
     Returns:
-        Datasource metadata as JSON.
+        Datasource metadata as JSON. On failure, JSON with an "error" (and
+        the datasource_id); an unknown id adds "suggestions", close matches
+        as [{id, name}].
     """
     conn = get_datamesh_connector()
-    ds = conn.get_datasource(datasource_id)
+    try:
+        ds = conn.get_datasource(datasource_id)
+    except _DATAMESH_ERRORS as exc:
+        return _error_json(
+            conn,
+            datasource_id,
+            exc,
+            {"datasource_id": datasource_id},
+            from_metadata=True,
+        )
     if detail == "full":
         return to_json(format_datasource(ds))
     return to_json(format_datasource_bounded(ds))
@@ -933,6 +1370,11 @@ def stage_query(
     echoes the canonical query. With limit plus time_resolution or
     aggregate_operations the reported size is that of the unlimited result
     (limit is applied after resampling), so it is an upper bound.
+
+    A variable given as the exact CF standard_name of exactly one of the
+    datasource's variables (e.g. "sea_surface_wave_significant_height" for
+    "hs") is resolved to that variable; the response then includes
+    resolved_variables ({requested: used}) and echoes the resolved names.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -960,9 +1402,16 @@ def stage_query(
     )
     sent, client_limit = _split_limit(query)
     try:
-        stage = _stage(conn, sent)
+        stage, aliases = _stage_resolving(conn, sent, _stage)
+        sent, query = _substituted(sent, aliases), _substituted(query, aliases)
     except _DATAMESH_ERRORS as exc:
-        return to_json({"error": str(exc), "query": _query_echo(query)})
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
+        )
 
     if stage is None:
         return to_json(
@@ -1106,6 +1555,11 @@ def query_data(
     N resampled steps, or the last N rows of a table) rather than sent to
     Datamesh. A limited result is a subset of the requested range, so it is
     flagged as a preview, with a limit_note.
+
+    A variable given as the exact CF standard_name of exactly one of the
+    datasource's variables (e.g. "sea_surface_wave_significant_height" for
+    "hs") is resolved to that variable; the response then includes
+    resolved_variables ({requested: used}) and echoes the resolved names.
     """
     conn = get_datamesh_connector()
     query = _build_query(
@@ -1134,7 +1588,8 @@ def query_data(
     sent, client_limit = _split_limit(query)
     warnings: list[str] = []
     try:
-        stage = _stage(conn, sent)
+        stage, aliases = _stage_resolving(conn, sent, _stage)
+        sent, query = _substituted(sent, aliases), _substituted(query, aliases)
         if stage is None:
             return to_json(
                 {
@@ -1178,7 +1633,13 @@ def query_data(
                     # it comes back inline rather than as a lazy summary.
                     data = data.load()
     except _DATAMESH_ERRORS as exc:
-        return to_json({"error": str(exc), "query": _query_echo(query)})
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
+        )
 
     out = summarize_data(data, warnings=warnings)
     out["staged_size_bytes"] = stage.size
@@ -1218,9 +1679,16 @@ def _export_download_url(
     their code) fetches the URL out-of-band.
     """
     try:
-        stage = _download_stage(conn, query)
+        stage, aliases = _stage_resolving(conn, query, _download_stage)
+        query = _substituted(query, aliases)
     except _DATAMESH_ERRORS as exc:
-        return to_json({"error": str(exc), "query": _query_echo(query)})
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
+        )
     if stage is None or not stage.get("url"):
         return to_json(
             {
@@ -1417,6 +1885,11 @@ def export_query(
       the local export cap or the destination's free disk space. With limit
       plus time_resolution/aggregate_operations, the last N resampled steps
       are written.
+
+    A variable given as the exact CF standard_name of exactly one of the
+    datasource's variables (e.g. "sea_surface_wave_significant_height" for
+    "hs") is resolved to that variable; the response then includes
+    resolved_variables ({requested: used}) and echoes the resolved names.
     """
     # Some MCP clients send "null"/"" for an omitted path (never a file name).
     path = _unset_sentinel(path)
@@ -1464,7 +1937,8 @@ def export_query(
     sent, client_limit = _split_limit(query)
     warnings: list[str] = []
     try:
-        stage = _stage(conn, sent)
+        stage, aliases = _stage_resolving(conn, sent, _stage)
+        sent, query = _substituted(sent, aliases), _substituted(query, aliases)
         if stage is None:
             return to_json(
                 {
@@ -1522,7 +1996,13 @@ def export_query(
             # Datasets stream chunk-wise from lazy zarr; frames download fully.
             data = conn.query(sent, use_dask=is_dataset)
     except _DATAMESH_ERRORS as exc:
-        return to_json({"error": str(exc), "query": _query_echo(query)})
+        return _error_json(
+            conn,
+            query.datasource,
+            exc,
+            {"query": _query_echo(query)},
+            variables=query.variables,
+        )
 
     if data is None:
         # The gateway can report no data on the download staging even after a
@@ -1664,8 +2144,12 @@ _append_doc_sections(
     """,
 )
 
-stage_query = mcp.tool(annotations=READ_TOOL)(stage_query)
-query_data = mcp.tool(annotations=READ_TOOL)(query_data)
+# Wrapped so a response reports variables resolved by CF standard_name
+# (OCE-303); functools.wraps keeps the signature and docstring FastMCP parses.
+stage_query = mcp.tool(annotations=READ_TOOL)(
+    _reporting_resolved_variables(stage_query)
+)
+query_data = mcp.tool(annotations=READ_TOOL)(_reporting_resolved_variables(query_data))
 export_query = mcp.tool(
     annotations={
         "readOnlyHint": False,
@@ -1673,7 +2157,7 @@ export_query = mcp.tool(
         "idempotentHint": True,
         "openWorldHint": True,
     }
-)(export_query)
+)(_reporting_resolved_variables(export_query))
 
 
 @mcp.tool(annotations=READ_TOOL)
@@ -1729,7 +2213,7 @@ def load_datasource(datasource_id: str) -> str:
         with bound, _captured_warnings(warnings):
             data = conn.load_datasource(datasource_id)
     except _DATAMESH_ERRORS as exc:
-        return to_json({"error": str(exc), "datasource_id": datasource_id})
+        return _error_json(conn, datasource_id, exc, {"datasource_id": datasource_id})
     return to_json(summarize_data(data, warnings=warnings))
 
 
