@@ -94,6 +94,54 @@ class TestRequiredParams:
                     assert "null" in types, f"{name}.{pname} does not accept null"
 
 
+class TestParamDescriptions:
+    """Every parameter carries its docstring Args text in the schema (OCE-331).
+
+    Python 3.13+ dedents docstrings at compile time; the query tools' Args
+    sections are assembled at runtime, so a mismatch in indentation silently
+    stopped FastMCP extracting per-parameter descriptions on 3.13+ only.
+    """
+
+    @pytest.mark.parametrize(
+        "module_name",
+        [*sorted(EXPECTED_REQUIRED), "oceanum_mcp.servers.combined.server"],
+    )
+    async def test_every_param_has_schema_description(self, module_name):
+        module = importlib.import_module(module_name)
+        schemas = await _schemas(module.mcp)
+
+        missing = [
+            f"{name}.{pname}"
+            for name, schema in schemas.items()
+            for pname, prop in schema.get("properties", {}).items()
+            if not (prop.get("description") or "").strip()
+        ]
+        assert not missing, f"params without a schema description: {missing}"
+
+    async def test_args_section_not_left_in_query_tool_descriptions(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        for name in ("stage_query", "query_data", "export_query"):
+            desc = tools[name].description
+            assert "Args:" not in desc, name
+            assert "datasource_id:" not in desc, name
+
+    @pytest.mark.parametrize("module_name", sorted(EXPECTED_REQUIRED))
+    async def test_description_is_full_docstring_text_before_args(self, module_name):
+        """The published description is the whole docstring summary/body.
+
+        Pins that normalising the docstrings drops nothing an agent reads:
+        everything before the Args section is published, on every version.
+        """
+        module = importlib.import_module(module_name)
+        tools = {t.name: t for t in await module.mcp.list_tools()}
+
+        for name, tool in tools.items():
+            doc = inspect.getdoc(getattr(module, name))
+            head = doc.split("\n\nArgs:\n", 1)[0].strip()
+            assert head, name
+            assert tool.description == head, name
+
+
 class TestNullStringNormalisation:
     @pytest.mark.parametrize("sentinel", ["null", ""])
     def test_optional_string_params_treated_as_none(self, sentinel):

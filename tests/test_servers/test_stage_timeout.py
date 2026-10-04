@@ -50,12 +50,11 @@ class TestDocs:
         tools = {t.name: t for t in await server.mcp.list_tools()}
         for name in ("stage_query", "query_data", "export_query"):
             desc = tools[name].description
-            prop = tools[name].parameters["properties"]["time_resolution"]
-            # FastMCP moves the Args text into parameter descriptions where it
-            # can parse it (Python < 3.13), else it stays in the description.
-            line = prop.get("description") or next(
-                ln for ln in desc.splitlines() if "time_resolution:" in ln
-            )
+            # The Args text must land in the parameter schema on every Python
+            # version (OCE-331: it stayed in the description on 3.13+).
+            line = tools[name].parameters["properties"]["time_resolution"][
+                "description"
+            ]
             assert "1MS" not in desc and "1MS" not in line
             assert '"30D"' in line
             # Calendar aliases appear only as a caveat, not as an example.
