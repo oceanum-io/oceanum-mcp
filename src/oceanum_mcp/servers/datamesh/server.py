@@ -18,6 +18,7 @@ Error conventions:
 from __future__ import annotations
 
 import difflib
+import inspect
 import json
 import logging
 import math
@@ -34,7 +35,7 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 from functools import partial, wraps
 from pathlib import Path
-from typing import Any, Iterator, Literal
+from typing import Any, Callable, Iterator, Literal
 
 import numpy as np
 import pandas as pd
@@ -2087,17 +2088,35 @@ def export_query(
     return to_json(out)
 
 
+def _append_doc_sections(fn: Callable[..., Any], sections: str) -> None:
+    """Append Args/Returns sections to fn's docstring at a uniform indentation.
+
+    Python 3.13+ strips common leading whitespace from docstrings at compile
+    time while 3.10-3.12 keep the source indentation, so appending indented
+    text to __doc__ gave a mixed-indentation docstring on 3.13+ from which
+    FastMCP could not extract per-parameter descriptions (OCE-331). Cleaning
+    both parts separately yields the same docstring on every version.
+    """
+    head = inspect.cleandoc(fn.__doc__ or "")
+    fn.__doc__ = f"{head}\n\n{inspect.cleandoc(sections)}\n"
+
+
 # Assemble the shared Args docs into each query tool's docstring BEFORE
 # registration — FastMCP parses __doc__ at registration time.
-stage_query.__doc__ = f"""{stage_query.__doc__}
+_append_doc_sections(
+    stage_query,
+    f"""
     Args:
 {_QUERY_PARAM_DOCS}
 
     Returns:
         JSON with staged flag, container type, size_bytes, domain_length,
         the canonical query, and a recommendation for the next step.
-    """
-query_data.__doc__ = f"""{query_data.__doc__}
+    """,
+)
+_append_doc_sections(
+    query_data,
+    f"""
     Args:
 {_QUERY_PARAM_DOCS}
 
@@ -2106,8 +2125,11 @@ query_data.__doc__ = f"""{query_data.__doc__}
         structure summary, explicit truncated/lazy flags, preview/returned/
         total record counts, staged size, any limit_note, and any server
         warnings.
-    """
-export_query.__doc__ = f"""{export_query.__doc__}
+    """,
+)
+_append_doc_sections(
+    export_query,
+    f"""
     Args:
         path: Local (stdio) destination file path (required on stdio; parent directories are created; confined to OCEANUM_MCP_EXPORT_DIR when set). Ignored on hosted servers, which return a download URL.
         format: Output format: netcdf (datasets), parquet or csv (tabular, or datasets small enough to flatten into a table such as point time series). Defaults by container: dataset -> netcdf, tabular -> parquet.
@@ -2119,7 +2141,8 @@ export_query.__doc__ = f"""{export_query.__doc__}
         available_formats (or a refused object, with no URL, above the hosted
         cap). Local: JSON with the written path, format, bytes_written, a
         structure summary, and any limit_note. Neither returns inline values.
-    """
+    """,
+)
 
 # Wrapped so a response reports variables resolved by CF standard_name
 # (OCE-303); functools.wraps keeps the signature and docstring FastMCP parses.
