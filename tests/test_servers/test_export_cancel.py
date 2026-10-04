@@ -153,6 +153,20 @@ class TestExportCancellation:
                 samples.append((time.monotonic(), size))
                 time.sleep(0.005)
 
+        # Size seen by the cancel trigger itself. The sampler thread can be
+        # starved on a slow runner and miss the pre-cancel window.
+        on_disk_at_cancel: list[int] = []
+
+        def started() -> bool:
+            # Cancel once chunk data is landing on disk (past the netCDF
+            # library's chunk cache).
+            for f in _partial_files(tmp_path):
+                size = _disk_bytes(f)
+                if size >= 2 * CHUNK_BYTES:
+                    on_disk_at_cancel.append(size)
+                    return True
+            return False
+
         sampler = threading.Thread(target=sample)
         sampler.start()
         try:
@@ -160,12 +174,7 @@ class TestExportCancellation:
                 errors, t_cancel = await _call_and_cancel(
                     client,
                     {"datasource_id": "test-ds", "path": str(dest)},
-                    # Cancel once chunk data is landing on disk (past the
-                    # netCDF library's chunk cache).
-                    started=lambda: any(
-                        _disk_bytes(f) >= 2 * CHUNK_BYTES
-                        for f in _partial_files(tmp_path)
-                    ),
+                    started=started,
                 )
                 # The tool call returns once the in-flight chunks drain and the
                 # partial file is removed.
@@ -192,7 +201,7 @@ class TestExportCancellation:
         assert chunks.calls == calls_at_removal
         assert chunks.calls < N_CHUNKS // 4
         assert chunks.last_chunk_end - t_cancel < MAX_STOP_SECONDS
-        assert any(t < t_cancel and size >= CHUNK_BYTES for t, size in samples), (
+        assert on_disk_at_cancel and on_disk_at_cancel[-1] >= CHUNK_BYTES, (
             "no chunk data was on disk before the cancel"
         )
         grew = [t for (t, size), (_, prev) in zip(samples[1:], samples) if size > prev]
