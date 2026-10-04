@@ -548,16 +548,9 @@ class TestExportQueryLimit:
         tools = {t.name: t for t in await server.mcp.list_tools()}
 
         def limit_doc(tool) -> str:
-            # FastMCP moves Args into the parameter schema when it can parse
-            # them (Python < 3.13); otherwise they stay in the description.
-            param = tool.parameters["properties"]["limit"].get("description")
-            if param:
-                return param
-            return next(
-                line.strip().removeprefix("limit:").strip()
-                for line in tool.description.splitlines()
-                if line.strip().startswith("limit:")
-            )
+            # The Args text must land in the parameter schema on every Python
+            # version (OCE-331: it stayed in the description on 3.13+).
+            return tool.parameters["properties"]["limit"]["description"]
 
         docs = [
             limit_doc(tools[name])
