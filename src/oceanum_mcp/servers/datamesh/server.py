@@ -1870,9 +1870,12 @@ def _cancel_requested() -> bool:
 def _raise_if_cancelled() -> None:
     """Raise the event loop's cancellation exception if cancelled.
 
-    It must propagate out of the tool: the SDK has already answered the
-    request "cancelled", and a result or ToolError returned afterwards fails
-    its respond() assertion, which takes the stdio server down.
+    Propagating it unwinds the tool without writing anything. The mcp>=2
+    dispatcher never answers a cancelled request and drops whatever the
+    handler returns or raises (mcp/shared/jsonrpc_dispatcher.py,
+    _handle_request), so this stops work; it is no longer what keeps the
+    stdio server alive (with mcp 1.x a late answer failed the SDK's respond()
+    assertion and took the server down).
     """
     if _cancel_requested():
         from_thread.check_cancelled()

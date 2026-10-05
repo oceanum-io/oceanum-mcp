@@ -1102,10 +1102,10 @@ class TestRegistration:
             "load_datasource",
             "update_metadata",
         }
-        assert tools["search_catalog"].annotations.readOnlyHint is True
-        assert tools["query_data"].annotations.readOnlyHint is True
-        assert tools["update_metadata"].annotations.destructiveHint is True
-        assert tools["update_metadata"].annotations.readOnlyHint is False
+        assert tools["search_catalog"].annotations.read_only_hint is True
+        assert tools["query_data"].annotations.read_only_hint is True
+        assert tools["update_metadata"].annotations.destructive_hint is True
+        assert tools["update_metadata"].annotations.read_only_hint is False
 
     async def test_docstrings_present(self):
         for tool in await server.mcp.list_tools():
