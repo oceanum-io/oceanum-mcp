@@ -114,7 +114,8 @@ class _StdioServer:
         )
         self.messages: queue.Queue[dict[str, Any] | None] = queue.Queue()
         self.received: list[dict[str, Any]] = []
-        threading.Thread(target=self._read, daemon=True).start()
+        self._reader = threading.Thread(target=self._read, daemon=True)
+        self._reader.start()
 
     def _read(self) -> None:
         assert self.proc.stdout is not None
@@ -179,14 +180,20 @@ class _StdioServer:
         )
 
     def close(self) -> int:
-        try:
-            if self.proc.stdin is not None:
-                self.proc.stdin.close()  # EOF ends the session
-            return self.proc.wait(timeout=TIMEOUT)
-        finally:
-            if self.proc.poll() is None:
-                self.proc.kill()
-            self._stderr.close()
+        """End the session with stdin EOF; returns the exit code."""
+        if self.proc.stdin is not None:
+            self.proc.stdin.close()
+        return self.proc.wait(timeout=TIMEOUT)
+
+    def kill(self) -> None:
+        if self.proc.poll() is None:
+            self.proc.kill()
+            self.proc.wait()
+        self._reader.join(TIMEOUT)  # reads to EOF, then the pipes can close
+        for pipe in (self.proc.stdin, self.proc.stdout):
+            if pipe is not None:
+                pipe.close()
+        self._stderr.close()
 
 
 @pytest.fixture
@@ -198,9 +205,7 @@ def stdio_server(tmp_path: Path) -> Any:
         server.send({"jsonrpc": "2.0", "method": "notifications/initialized"})
         yield server
     finally:
-        if server.proc.poll() is None:
-            server.proc.kill()
-            server.proc.wait()
+        server.kill()
 
 
 # (tool, the mocked gateway call it blocks in)
