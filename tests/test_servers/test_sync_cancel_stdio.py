@@ -34,7 +34,9 @@ TIMEOUT = 60.0
 
 # Runs in the subprocess. Only the network boundary is mocked; calls on the
 # "slow-ds" datasource block in the worker thread and drop marker files so
-# the test knows when the tool entered and when it returned.
+# the test knows when the tool entered and when it returned. The "returned"
+# marker records whether the tool's own thread saw the request cancelled, which
+# proves the server received and applied the notifications/cancelled.
 _SERVER_SCRIPT = """
 import os
 import time
@@ -54,7 +56,10 @@ def gateway(tool, datasource):
     if datasource == "slow-ds":
         (markers / f"entered-{tool}").touch()
         time.sleep(slow_seconds)
-        (markers / f"returned-{tool}").touch()
+        seen = "cancelled" if server._cancel_requested() else "not cancelled"
+        partial = markers / f".returned-{tool}"
+        partial.write_text(seen)
+        partial.rename(markers / f"returned-{tool}")  # atomic: never read empty
 
 
 def fake_stage(conn, query):
@@ -91,7 +96,14 @@ _INITIALIZE = {
 
 
 class _StdioServer:
-    """The datamesh server in a subprocess, driven with raw JSON-RPC lines."""
+    """The datamesh server in a subprocess, driven with raw JSON-RPC lines.
+
+    Raw lines rather than fastmcp's Client: they pin the 2025-06-18 handshake
+    that stdio clients speak today, and the same file runs unchanged against
+    fastmcp 3 / mcp 1.x, which is how it shows red on the pre-upgrade code.
+    A reader thread keeps the harness synchronous and independent of either
+    SDK's client.
+    """
 
     def __init__(self, tmp_path: Path) -> None:
         self.markers = tmp_path / "markers"
@@ -120,7 +132,10 @@ class _StdioServer:
     def _read(self) -> None:
         assert self.proc.stdout is not None
         for line in self.proc.stdout:
-            self.messages.put(json.loads(line))
+            try:
+                self.messages.put(json.loads(line))
+            except ValueError:
+                self.messages.put({"non_json_stdout": line})
         self.messages.put(None)  # EOF: the server exited
 
     def send(self, message: dict[str, Any]) -> None:
@@ -144,6 +159,8 @@ class _StdioServer:
                     f"stdio server exited (code {self.proc.wait()}) before "
                     f"answering request {request_id}: {self.stderr()}"
                 )
+            if "non_json_stdout" in message:
+                pytest.fail(f"non-JSON on stdout: {message['non_json_stdout']!r}")
             self.received.append(message)
 
     def drain(self) -> None:
@@ -164,6 +181,9 @@ class _StdioServer:
             if time.monotonic() > deadline:
                 pytest.fail(f"marker {name} never appeared: {self.stderr()}")
             time.sleep(0.01)
+
+    def cancel_seen(self, name: str) -> str:
+        return (self.markers / name).read_text()
 
     def stderr(self) -> str:
         self._stderr.seek(0)
@@ -232,6 +252,7 @@ def test_cancelled_sync_tool_does_not_crash_stdio_server(
     # The worker thread runs to completion regardless of the cancel; let its
     # late answer reach the SDK before probing the server.
     stdio_server.wait_for_marker(f"returned-{blocks_in}")
+    assert stdio_server.cancel_seen(f"returned-{blocks_in}") == "cancelled"
     time.sleep(SETTLE_SECONDS)
 
     # The same server still serves a later call.
@@ -240,9 +261,9 @@ def test_cancelled_sync_tool_does_not_crash_stdio_server(
     assert "result" in later, later
     assert json.loads(later["result"]["content"][0]["text"])["id"] == "fast-ds"
 
-    # The cancelled call never produced a result on the wire.
+    # A cancelled request is never answered: no result, no error.
     stdio_server.drain()
-    assert not [m for m in stdio_server.received if m.get("id") == 1 and "result" in m]
+    assert [m for m in stdio_server.received if m.get("id") == 1] == []
 
     assert stdio_server.close() == 0
 
@@ -278,7 +299,8 @@ async def test_cancelled_sync_tools_on_modern_protocol_era(tmp_path: Path) -> No
                 await anyio.sleep(0.01)
 
     async with Client(transport, timeout=TIMEOUT) as client:
-        assert client.protocol_version == "2026-07-28"
+        # A 2026-era (sessionless) protocol, not the handshake era above.
+        assert client.protocol_version >= "2026-07-28"
         for tool, blocks_in in SYNC_TOOLS:
             for marker in markers.iterdir():
                 marker.unlink()
@@ -294,6 +316,9 @@ async def test_cancelled_sync_tools_on_modern_protocol_era(tmp_path: Path) -> No
                 await wait_for_marker(f"entered-{blocks_in}")
                 tg.cancel_scope.cancel()
             await wait_for_marker(f"returned-{blocks_in}")
+            # The client's abandon sent notifications/cancelled, and the
+            # server applied it to the tool's request.
+            assert (markers / f"returned-{blocks_in}").read_text() == "cancelled"
             await anyio.sleep(SETTLE_SECONDS)
 
             assert answered == [], tool
