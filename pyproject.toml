@@ -10,7 +10,10 @@ readme = "README.md"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
-    "fastmcp>=3.0,<4",
+    "fastmcp>=4.0,<5",
+    # Imported directly by common.auth. FastMCP 4 moved its HTTP stack from
+    # httpx to httpx2, so httpx is no longer installed transitively.
+    "httpx2>=2.5",
     # <2 pin guards the private Connector._stage_request/Session usage in the
     # datamesh server's staging helper (no public staging API in oceanum 1.x).
     "oceanum>=1.1,<2",

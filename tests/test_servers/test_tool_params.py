@@ -53,7 +53,7 @@ _COMBINED_EXPECTED = {
 async def _schemas(mcp) -> dict[str, dict]:
     """Input schemas as an MCP client sees them."""
     async with Client(mcp) as client:
-        return {t.name: t.inputSchema for t in await client.list_tools()}
+        return {t.name: t.input_schema for t in await client.list_tools()}
 
 
 class TestRequiredParams:

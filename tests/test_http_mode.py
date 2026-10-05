@@ -10,7 +10,7 @@ Covers the hosted-mode guarantees end to end at the ASGI layer:
 import importlib
 from contextlib import asynccontextmanager
 
-import httpx
+import httpx2
 import pytest
 
 from fastmcp import Client, FastMCP
@@ -71,8 +71,8 @@ async def http_client():
     app = mcp.http_app(stateless_http=True)
     app.add_middleware(DatameshHeaderMiddleware)
     async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(
             transport=transport, base_url="http://test"
         ) as client:
             yield client
@@ -221,8 +221,8 @@ async def test_oauth_discovery_metadata_served(restore_datamesh_policy):
         mp.setenv("OCEANUM_MCP_PUBLIC_URL", "https://mcp.example.test")
         app = create_http_app("datamesh")
     async with app.router.lifespan_context(app):
-        transport = httpx.ASGITransport(app=app)
-        async with httpx.AsyncClient(
+        transport = httpx2.ASGITransport(app=app)
+        async with httpx2.AsyncClient(
             transport=transport, base_url="http://test"
         ) as client:
             # The path-suffixed form is what fastmcp serves and what the 401
@@ -266,8 +266,8 @@ async def factory_client(**env: str):
         app = create_http_app("datamesh", stateless=stateless)
         try:
             async with app.router.lifespan_context(app):
-                transport = httpx.ASGITransport(app=app)
-                async with httpx.AsyncClient(
+                transport = httpx2.ASGITransport(app=app)
+                async with httpx2.AsyncClient(
                     transport=transport, base_url="http://test"
                 ) as client:
                     yield client
@@ -275,7 +275,7 @@ async def factory_client(**env: str):
             set_transport("stdio")
 
 
-async def _preflight(client: httpx.AsyncClient, origin: str) -> httpx.Response:
+async def _preflight(client: httpx2.AsyncClient, origin: str) -> httpx2.Response:
     return await client.options(
         "/datamesh",
         headers={

@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 import xarray as xr
 from fastmcp import Client
-from mcp.shared.exceptions import McpError
+from mcp.shared.exceptions import MCPError
 
 from oceanum.datamesh.exceptions import DatameshConnectError
 from oceanum.datamesh.query import Container
@@ -113,23 +113,31 @@ def two_workers() -> Any:
 async def _call_and_cancel(
     client: Client, args: dict[str, Any], started: Any, timeout: float = 10
 ) -> tuple[list[BaseException], float]:
-    """Call export_query, wait for started(), cancel it; return (errors, t_cancel)."""
-    errors: list[BaseException] = []
+    """Call export_query, wait for started(), cancel it; return (outcomes, t_cancel).
+
+    Abandoning the in-flight call is how an mcp>=2 client cancels: its
+    dispatcher sends the notifications/cancelled itself
+    (mcp/shared/jsonrpc_dispatcher.py, send_raw_request's cancelled arm), and
+    the server never answers a cancelled request. `outcomes` records any answer
+    the call got before the cancel; it stays empty when the cancel caught the
+    call in flight.
+    """
+    outcomes: list[BaseException] = []
 
     async def call() -> None:
         try:
             await client.call_tool("export_query", args)
-        except McpError as exc:
-            errors.append(exc)
+        except MCPError as exc:
+            outcomes.append(exc)
+        else:
+            outcomes.append(AssertionError("cancelled export_query was answered"))
 
     async with anyio.create_task_group() as tg:
         tg.start_soon(call)
         await _wait_until(started, timeout)
-        # call_tool exposes no request id: it is the session's last one.
-        request_id = client.session._request_id - 1
         t_cancel = time.monotonic()
-        await client.cancel(request_id, reason="test")
-    return errors, t_cancel
+        tg.cancel_scope.cancel()
+    return outcomes, t_cancel
 
 
 class TestExportCancellation:
@@ -171,7 +179,7 @@ class TestExportCancellation:
         sampler.start()
         try:
             async with Client(server.mcp) as client:
-                errors, t_cancel = await _call_and_cancel(
+                outcomes, t_cancel = await _call_and_cancel(
                     client,
                     {"datasource_id": "test-ds", "path": str(dest)},
                     started=started,
@@ -191,7 +199,7 @@ class TestExportCancellation:
             stop_sampling.set()
             sampler.join()
 
-        assert [str(e) for e in errors] == ["Request cancelled"]
+        assert outcomes == []  # the call was still in flight when cancelled
         assert not dest.exists()
         assert list(tmp_path.iterdir()) == []  # no partial file or temp dir
         assert _open_fds_under(tmp_path) == []
@@ -241,7 +249,7 @@ class TestExportCancellation:
             server, "_raise_if_cancelled", wraps=server._raise_if_cancelled
         ) as check:
             async with Client(server.mcp) as client:
-                errors, _ = await _call_and_cancel(
+                outcomes, _ = await _call_and_cancel(
                     client,
                     {"datasource_id": "test-ds", "path": str(dest)},
                     started=entered.is_set,
@@ -251,7 +259,7 @@ class TestExportCancellation:
                 await _wait_until(lambda: check.call_count >= 1, 3)
                 await client.list_tools()
 
-        assert [str(e) for e in errors] == ["Request cancelled"]
+        assert outcomes == []  # the call was still in flight when cancelled
         frame.to_parquet.assert_not_called()
         assert list(tmp_path.iterdir()) == []
 
@@ -275,7 +283,7 @@ class TestExportCancellation:
         dest = tmp_path / "out.parquet"
 
         async with Client(server.mcp) as client:
-            errors, _ = await _call_and_cancel(
+            outcomes, _ = await _call_and_cancel(
                 client,
                 {"datasource_id": "test-ds", "path": str(dest)},
                 started=writing.is_set,
@@ -285,7 +293,7 @@ class TestExportCancellation:
             await _wait_until(lambda: not list(tmp_path.iterdir()), 3)
             await client.list_tools()
 
-        assert [str(e) for e in errors] == ["Request cancelled"]
+        assert outcomes == []  # the call was still in flight when cancelled
         assert not dest.exists()
 
 

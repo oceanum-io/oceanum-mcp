@@ -4,7 +4,7 @@ import os
 from typing import Any
 from unittest.mock import AsyncMock, patch
 
-import httpx
+import httpx2
 import pytest
 
 from fastmcp.server.auth import AccessToken
@@ -21,7 +21,7 @@ from oceanum_mcp.common.client import CREDENTIAL_CLAIM
 
 
 class _FakeAsyncClient:
-    """Stands in for httpx.AsyncClient; records calls, returns a canned response."""
+    """Stands in for httpx2.AsyncClient; records calls, returns a canned response."""
 
     calls = 0
     status = 200
@@ -31,13 +31,13 @@ class _FakeAsyncClient:
     def __init__(self, **kwargs: Any) -> None:
         pass
 
-    async def get(self, url: str, headers: dict | None = None) -> httpx.Response:
+    async def get(self, url: str, headers: dict | None = None) -> httpx2.Response:
         cls = type(self)
         cls.calls += 1
         if cls.error is not None:
             raise cls.error
-        return httpx.Response(
-            cls.status, json=cls.payload, request=httpx.Request("GET", url)
+        return httpx2.Response(
+            cls.status, json=cls.payload, request=httpx2.Request("GET", url)
         )
 
 
@@ -47,7 +47,7 @@ def fake_gateway():
     _FakeAsyncClient.status = 200
     _FakeAsyncClient.payload = None
     _FakeAsyncClient.error = None
-    with patch("oceanum_mcp.common.auth.httpx.AsyncClient", _FakeAsyncClient):
+    with patch("oceanum_mcp.common.auth.httpx2.AsyncClient", _FakeAsyncClient):
         yield _FakeAsyncClient
 
 
@@ -86,7 +86,7 @@ async def test_datamesh_verifier_caches_confirmed_rejections(fake_gateway):
 
 
 async def test_datamesh_verifier_gateway_error_fails_closed_uncached(fake_gateway):
-    fake_gateway.error = httpx.ConnectError("boom")
+    fake_gateway.error = httpx2.ConnectError("boom")
     verifier = DatameshTokenVerifier(service="https://datamesh.test")
     assert await verifier.verify_token("good-token") is None
     fake_gateway.error = None
