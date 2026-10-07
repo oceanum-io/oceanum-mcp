@@ -316,9 +316,10 @@ refused with the staged size and alternatives. Library warnings (e.g. the
 | `level_interp`         | string       | Interpolation for level series: nearest or linear                  |
 | `coord_filters`        | list[object] | Coordinate selections: `[{"coord": "name", "values": [...]}]`      |
 | `crs`                  | string/int   | CRS for filter coordinates and returned data                       |
-| `aggregate_operations` | list[string] | Aggregation ops: mean, min, max, std, sum                          |
+| `aggregate_operations` | list[string] | Aggregation ops: mean, min, max, std, sum, quantile                |
 | `aggregate_spatial`    | bool         | Aggregate over spatial dims (default true)                         |
 | `aggregate_temporal`   | bool         | Aggregate over temporal dims (default true)                        |
+| `aggregate_q`          | float        | Quantile (0-1) for the quantile op, e.g. 0.95; required with it    |
 | `limit`                | int          | Keep the last N records (see below)                                |
 
 `limit` keeps the last N records (Datamesh semantics: the last N steps along

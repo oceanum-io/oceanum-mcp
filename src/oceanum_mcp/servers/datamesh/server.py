@@ -1072,10 +1072,11 @@ def _build_query(
     level_interp: Literal["nearest", "linear"] | None = None,
     coord_filters: list[CoordSelector] | None = None,
     crs: str | int | None = None,
-    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum"]]
+    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum", "quantile"]]
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
+    aggregate_q: float | None = None,
     limit: int | None = None,
 ) -> Query:
     """Build a validated Datamesh Query from flat tool parameters."""
@@ -1147,12 +1148,16 @@ def _build_query(
         q["coordfilter"] = coord_filters
     if crs is not None:
         q["crs"] = crs
+    if aggregate_q is not None and not aggregate_operations:
+        raise ToolError('aggregate_q requires aggregate_operations=["quantile"].')
     if aggregate_operations:
         q["aggregate"] = {
             "operations": aggregate_operations,
             "spatial": aggregate_spatial,
             "temporal": aggregate_temporal,
         }
+        if aggregate_q is not None:
+            q["aggregate"]["q"] = aggregate_q
     if limit is not None:
         if limit < 1:
             raise ToolError("limit must be at least 1.")
@@ -1185,9 +1190,10 @@ _QUERY_PARAM_DOCS = """\
         level_interp: Interpolation for level series selection: nearest or linear.
         coord_filters: Additional coordinate selections, e.g. [{"coord": "station", "values": ["A1", "B2"]}].
         crs: CRS for filter coordinates and returned data (EPSG code or CRS string).
-        aggregate_operations: Aggregations to apply after filtering: mean, min, max, std, sum.
+        aggregate_operations: Aggregations to apply after filtering: mean, min, max, std, sum, quantile. Each output variable is named <variable>_<operation>, e.g. hs_mean, hs_quantile.
         aggregate_spatial: Aggregate over spatial dimensions (default true).
         aggregate_temporal: Aggregate over the temporal dimension (default true).
+        aggregate_q: Quantile for the quantile operation, between 0 and 1 (e.g. 0.95 for the 95th percentile; linear interpolation as in numpy/pandas). Required with quantile, invalid without it. One quantile per query.
         limit: Keep only the last N records (Datamesh semantics: the last N steps along time/ensemble). Combined with time_resolution or aggregate_operations it is applied AFTER resampling/aggregation (by this server, not sent to Datamesh), so stage_query sizes the unlimited result as an upper bound; hosted export_query refuses that combination."""
 
 
@@ -1364,10 +1370,11 @@ def stage_query(
     level_interp: Literal["nearest", "linear"] | None = None,
     coord_filters: list[CoordSelector] | None = None,
     crs: str | int | None = None,
-    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum"]]
+    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum", "quantile"]]
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
+    aggregate_q: float | None = None,
     limit: int | None = None,
 ) -> str:
     """Dry-run a query: report the result size WITHOUT downloading any data.
@@ -1405,6 +1412,7 @@ def stage_query(
         aggregate_operations=aggregate_operations,
         aggregate_spatial=aggregate_spatial,
         aggregate_temporal=aggregate_temporal,
+        aggregate_q=aggregate_q,
         limit=limit,
     )
     sent, client_limit = _split_limit(query)
@@ -1540,10 +1548,11 @@ def query_data(
     level_interp: Literal["nearest", "linear"] | None = None,
     coord_filters: list[CoordSelector] | None = None,
     crs: str | int | None = None,
-    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum"]]
+    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum", "quantile"]]
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
+    aggregate_q: float | None = None,
     limit: int | None = None,
 ) -> str:
     """Query a datasource and return small results inline.
@@ -1590,6 +1599,7 @@ def query_data(
         aggregate_operations=aggregate_operations,
         aggregate_spatial=aggregate_spatial,
         aggregate_temporal=aggregate_temporal,
+        aggregate_q=aggregate_q,
         limit=limit,
     )
     sent, client_limit = _split_limit(query)
@@ -2001,10 +2011,11 @@ def export_query(
     level_interp: Literal["nearest", "linear"] | None = None,
     coord_filters: list[CoordSelector] | None = None,
     crs: str | int | None = None,
-    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum"]]
+    aggregate_operations: list[Literal["mean", "min", "max", "std", "sum", "quantile"]]
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
+    aggregate_q: float | None = None,
     limit: int | None = None,
 ) -> str:
     """Export the FULL result of a query — the data never enters the conversation.
@@ -2052,6 +2063,7 @@ def export_query(
         aggregate_operations=aggregate_operations,
         aggregate_spatial=aggregate_spatial,
         aggregate_temporal=aggregate_temporal,
+        aggregate_q=aggregate_q,
         limit=limit,
     )
 

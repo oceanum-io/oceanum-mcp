@@ -202,6 +202,30 @@ class TestBuildQuery:
         assert q.crs == 4326
         assert q.aggregate.temporal is False
 
+    def test_quantile_aggregate(self):
+        q = server._build_query(
+            "test-ds", aggregate_operations=["quantile", "mean"], aggregate_q=0.95
+        )
+        assert [op.value for op in q.aggregate.operations] == ["quantile", "mean"]
+        assert q.aggregate.q == 0.95
+        assert server._query_echo(q)["aggregate"]["q"] == 0.95
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"aggregate_operations": ["quantile"]},
+            {"aggregate_operations": ["quantile"], "aggregate_q": 1.5},
+            {"aggregate_operations": ["mean"], "aggregate_q": 0.95},
+        ],
+    )
+    def test_invalid_quantile_raises_tool_error(self, kwargs):
+        with pytest.raises(ToolError, match="Invalid query parameters"):
+            server._build_query("test-ds", **kwargs)
+
+    def test_aggregate_q_without_operations_raises_tool_error(self):
+        with pytest.raises(ToolError, match="aggregate_q requires"):
+            server._build_query("test-ds", aggregate_q=0.95)
+
     def test_invalid_bbox_raises_tool_error(self):
         with pytest.raises(ToolError, match="Invalid query parameters"):
             server._build_query("test-ds", bbox=[0, 0, 1])
