@@ -214,17 +214,19 @@ class TestBuildQuery:
         "kwargs",
         [
             {"aggregate_operations": ["quantile"]},
-            {"aggregate_operations": ["quantile"], "aggregate_q": 1.5},
             {"aggregate_operations": ["mean"], "aggregate_q": 0.95},
+            {"aggregate_q": 0.95},
         ],
     )
-    def test_invalid_quantile_raises_tool_error(self, kwargs):
-        with pytest.raises(ToolError, match="Invalid query parameters"):
+    def test_quantile_and_q_must_come_together(self, kwargs):
+        with pytest.raises(ToolError, match="aggregate_q .* required with"):
             server._build_query("test-ds", **kwargs)
 
-    def test_aggregate_q_without_operations_raises_tool_error(self):
-        with pytest.raises(ToolError, match="aggregate_q requires"):
-            server._build_query("test-ds", aggregate_q=0.95)
+    def test_out_of_range_q_raises_tool_error(self):
+        with pytest.raises(ToolError, match="Invalid query parameters"):
+            server._build_query(
+                "test-ds", aggregate_operations=["quantile"], aggregate_q=1.5
+            )
 
     def test_invalid_bbox_raises_tool_error(self):
         with pytest.raises(ToolError, match="Invalid query parameters"):
@@ -1145,3 +1147,27 @@ class TestRegistration:
         finally:
             monkeypatch.delenv("OCEANUM_MCP_READ_ONLY")
             importlib.reload(server)
+
+
+class TestQuantileAggregate:
+    @pytest.mark.parametrize("tool", ["stage_query", "query_data", "export_query"])
+    async def test_schema_bounds_aggregate_q(self, tool):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        props = tools[tool].parameters["properties"]
+        assert "quantile" in json.dumps(props["aggregate_operations"])
+        q = json.dumps(props["aggregate_q"])
+        assert '"minimum": 0' in q and '"maximum": 1' in q
+        assert "95th percentile" in q
+
+    @pytest.mark.parametrize("tool", ["stage_query", "query_data"])
+    def test_tool_passes_q_through(self, tool, mock_conn, mock_stage):
+        mock_conn.query.return_value = xr.Dataset({"hs_quantile": ((), 3.823916)})
+        getattr(server, tool)(
+            datasource_id="test-ds",
+            variables=["hs"],
+            aggregate_operations=["quantile"],
+            aggregate_q=0.95,
+        )
+        aggregate = mock_stage.call_args.args[1].aggregate
+        assert [op.value for op in aggregate.operations] == ["quantile"]
+        assert aggregate.q == 0.95

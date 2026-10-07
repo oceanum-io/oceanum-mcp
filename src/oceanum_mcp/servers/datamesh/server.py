@@ -38,7 +38,7 @@ from dataclasses import dataclass
 from functools import partial, wraps
 from pathlib import Path
 from types import FrameType, TracebackType
-from typing import Any, Iterator, Literal
+from typing import Annotated, Any, Iterator, Literal
 
 import dask
 import dask.array
@@ -51,6 +51,7 @@ from dask.system import CPU_COUNT
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from pandas.tseries.frequencies import to_offset
+from pydantic import Field
 from urllib3.exceptions import ReadTimeoutError
 
 from oceanum.datamesh import Connector
@@ -1053,6 +1054,10 @@ def _check_time_resolution(resolution: str) -> None:
         raise _resolution_error(resolution, "fine")
 
 
+# The quantile operation's q; the bounds go into the tool schema.
+AggregateQ = Annotated[float, Field(ge=0, le=1)]
+
+
 def _build_query(
     datasource_id: str,
     *,
@@ -1076,7 +1081,7 @@ def _build_query(
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
-    aggregate_q: float | None = None,
+    aggregate_q: AggregateQ | None = None,
     limit: int | None = None,
 ) -> Query:
     """Build a validated Datamesh Query from flat tool parameters."""
@@ -1148,8 +1153,12 @@ def _build_query(
         q["coordfilter"] = coord_filters
     if crs is not None:
         q["crs"] = crs
-    if aggregate_q is not None and not aggregate_operations:
-        raise ToolError('aggregate_q requires aggregate_operations=["quantile"].')
+    quantile = "quantile" in (aggregate_operations or [])
+    if quantile != (aggregate_q is not None):
+        raise ToolError(
+            "aggregate_q (0-1, e.g. 0.95) is required with, and only valid "
+            'with, aggregate_operations=["quantile"].'
+        )
     if aggregate_operations:
         q["aggregate"] = {
             "operations": aggregate_operations,
@@ -1374,7 +1383,7 @@ def stage_query(
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
-    aggregate_q: float | None = None,
+    aggregate_q: AggregateQ | None = None,
     limit: int | None = None,
 ) -> str:
     """Dry-run a query: report the result size WITHOUT downloading any data.
@@ -1552,7 +1561,7 @@ def query_data(
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
-    aggregate_q: float | None = None,
+    aggregate_q: AggregateQ | None = None,
     limit: int | None = None,
 ) -> str:
     """Query a datasource and return small results inline.
@@ -2015,7 +2024,7 @@ def export_query(
     | None = None,
     aggregate_spatial: bool = True,
     aggregate_temporal: bool = True,
-    aggregate_q: float | None = None,
+    aggregate_q: AggregateQ | None = None,
     limit: int | None = None,
 ) -> str:
     """Export the FULL result of a query — the data never enters the conversation.
