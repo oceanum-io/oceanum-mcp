@@ -88,49 +88,76 @@ class TestSearchCatalog:
 
         parsed = json.loads(server.search_catalog(search="nonexistent"))
         assert parsed["count"] == 0
-        assert "No datasources shared with your account" in parsed["message"]
-        assert "access" in parsed["message"]
-        assert "do not conclude it does not exist" in parsed["scope"]
+        assert "No datasources found" in parsed["message"]
+        assert parsed["scope"] == server._ACCESS_SCOPE
 
-    def test_scope_note_on_short_result(self, mock_conn):
-        # Fewer matches than the limit looks exhaustive; the scope note says
-        # the list covers only datasources shared with the caller.
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    def test_scope_note_on_short_result(self, mock_conn, detail):
+        # Fewer matches than the limit looks exhaustive: state the scope.
         mock_conn.get_catalog.return_value = _mock_catalog([_mock_datasource()])
 
-        parsed = json.loads(server.search_catalog(search="wave"))
+        parsed = json.loads(server.search_catalog(search="wave", detail=detail))
         assert parsed["count"] == 1
         assert parsed["scope"] == server._ACCESS_SCOPE
-        assert "shared with your account" in parsed["scope"]
 
-    @pytest.mark.parametrize("found", [[], ["era5-waves"]])
-    def test_access_wording_reveals_nothing_about_hidden_datasources(
-        self, mock_conn, found
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    def test_no_scope_note_when_limit_reached(self, mock_conn, detail):
+        mock_conn.get_catalog.return_value = _mock_catalog([_mock_datasource()])
+
+        parsed = json.loads(server.search_catalog(limit=1, detail=detail))
+        assert "more matches may exist" in parsed["note"]
+        assert "scope" not in parsed
+
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    def test_no_scope_note_when_page_is_full(self, mock_conn, monkeypatch, detail):
+        # Matches dropped by the output bound: the note already says more exist.
+        monkeypatch.setattr(server, "SEARCH_BUDGET_CHARS", {detail: 1})
+        mock_conn.get_catalog.return_value = _mock_catalog(
+            [_mock_datasource(id=f"ds-{i}") for i in range(3)]
+        )
+
+        parsed = json.loads(server.search_catalog(detail=detail))
+        assert parsed["omitted"] == 2
+        assert "scope" not in parsed
+
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    @pytest.mark.parametrize("search", ["hindcast", "wave"])
+    def test_response_identical_whether_or_not_hidden_datasources_exist(
+        self, mock_conn, search, detail
     ):
-        # The wording is fixed text: it neither varies with the search nor
-        # names or counts anything beyond the visible results, and the tool
-        # makes exactly one catalog call (no probing for hidden datasources).
-        responses = []
-        for search in ("secret-client-hindcast", "x"):
-            mock_conn.get_catalog.reset_mock()
-            mock_conn.get_catalog.return_value = _mock_catalog(
-                [_mock_datasource(id=i, name=i) for i in found]
-            )
-            parsed = json.loads(server.search_catalog(search=search))
-            mock_conn.get_catalog.assert_called_once()
-            assert parsed["count"] == len(found)
-            assert "secret-client-hindcast" not in json.dumps(parsed)
-            responses.append(
-                {k: v for k, v in parsed.items() if k not in ("count", "results")}
-            )
-        assert responses[0] == responses[1]
-        assert not any(ch.isdigit() for ch in json.dumps(responses[0]))
+        # A backend holding a datasource the token can't see. "hindcast"
+        # matches only that one (empty result); "wave" matches it and a
+        # visible one (short result). The response must be the same as on a
+        # backend without it: nothing names, counts or hints at it.
+        visible = _mock_datasource(id="era5-wave", name="ERA5 wave")
+        hidden = _mock_datasource(
+            id="secret-wave-hindcast", name="Licensed wave hindcast"
+        )
 
-    async def test_description_states_access_scope(self):
+        def respond(backend):
+            def get_catalog(search=None, limit=None, **_):
+                return _mock_catalog(
+                    [ds for ds in backend if ds is not hidden and search in ds.id]
+                )
+
+            mock_conn.get_catalog.reset_mock()
+            mock_conn.get_catalog.side_effect = get_catalog
+            out = server.search_catalog(search=search, detail=detail)
+            mock_conn.get_catalog.assert_called_once()
+            return out
+
+        with_hidden = respond([visible, hidden])
+        assert with_hidden == respond([visible])
+        assert "secret" not in with_hidden
+        assert "Licensed" not in with_hidden
+        assert json.loads(with_hidden)["scope"] == server._ACCESS_SCOPE
+
+    async def test_description_and_instructions_state_access_scope(self):
         tools = {t.name: t for t in await server.mcp.list_tools()}
-        desc = tools["search_catalog"].description
-        assert "shared with your account" in desc
-        assert "does not mean a dataset" in desc
-        assert "does not exist" in desc
+        desc = " ".join(tools["search_catalog"].description.split())
+        assert server._ACCESS_SCOPE in desc
+        assert "{access_scope}" not in desc
+        assert server._ACCESS_SCOPE in server.mcp.instructions
 
     def test_note_when_limit_reached(self, mock_conn):
         ds = _mock_datasource()

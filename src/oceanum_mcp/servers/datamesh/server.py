@@ -131,6 +131,18 @@ _GATEWAY_FORMAT = {"netcdf": "nc", "parquet": "parquet", "csv": "csv"}
 
 READ_TOOL = {"readOnlyHint": True, "openWorldHint": True}
 
+# The catalog lists only datasources the caller's credentials can access, so a
+# missing match proves nothing about existence (OCE-297). The one source for
+# this caveat in the instructions, the search_catalog description and its
+# empty/short results. Fixed text: it must not reveal whether, how many, or
+# which inaccessible datasources exist.
+_ACCESS_SCOPE = (
+    "Catalog search only covers datasources accessible to the credentials "
+    "used for this request; a datasource missing from the results either "
+    "does not exist or is not accessible with these credentials, so do not "
+    "report it as nonexistent."
+)
+
 # Instructions are transport-neutral: they describe the stage -> narrow
 # workflow without naming export_query, whose behaviour differs by transport
 # (download link on hosted, local file on stdio). The runtime "result too
@@ -145,6 +157,7 @@ mcp = FastMCP(
         "schema and coverage -> stage_query to learn the result size WITHOUT "
         "downloading -> query_data for small results inline, narrowing large "
         "results with filters, aggregation, or time_resolution downsampling.\n"
+        f"{_ACCESS_SCOPE}\n"
         "Never pull large data inline: stage first, then shrink results with "
         "time/geo/level filters, aggregation, or time_resolution downsampling. "
         "Times are ISO 8601 (UTC assumed if naive); sizes are bytes."
@@ -563,7 +576,8 @@ def _metadata_error_fields(
         else "no similar ids found; use search_catalog to find one."
     )
     return {
-        "error": f"Datasource {datasource_id!r} not found; {hint}",
+        "error": f"Datasource {datasource_id!r} not found or not accessible "
+        f"with these credentials; {hint}",
         "suggestions": suggestions,
     }
 
@@ -1210,15 +1224,6 @@ _SEARCH_HINT = (
     "attributes."
 )
 
-# The catalog lists only datasources shared with the caller's account, so a
-# missing match proves nothing about existence. The wording is fixed: it must
-# not reveal whether, how many, or which inaccessible datasources exist.
-_ACCESS_SCOPE = (
-    "Results only include datasources shared with your account; one that "
-    "is not listed may still exist without being shared with you, so do "
-    "not conclude it does not exist."
-)
-
 
 def _within_budget(results: list[dict[str, Any]], budget: int) -> int:
     """How many leading results fit in budget characters (always at least one).
@@ -1235,7 +1240,6 @@ def _within_budget(results: list[dict[str, Any]], budget: int) -> int:
     return len(results)
 
 
-@mcp.tool(annotations=READ_TOOL)
 def search_catalog(
     search: str | None = None,
     time_start: str | None = None,
@@ -1246,12 +1250,7 @@ def search_catalog(
 ) -> str:
     """Search the Oceanum Datamesh catalog for datasets.
 
-    Only datasources shared with your account (the credential this server
-    calls Datamesh with) are searched. A datasource that is not shared with
-    you is never listed, so an empty or short result does not mean a dataset
-    does not exist: it may exist without being shared with you. If an
-    expected dataset is missing, try broader search text, then suggest
-    asking its owner or an Oceanum administrator for access.
+    {access_scope}
 
     Args:
         search: Text search string to filter datasources by name, description, or tags.
@@ -1262,11 +1261,11 @@ def search_catalog(
         detail: "summary" (default) returns id, name, a short description, time range, bounds, and variable names when known. "full" returns each datasource's complete catalog record; prefer get_datasource_info for one datasource's details.
 
     Returns:
-        JSON with count and matching datasources, and a "scope" note on
-        which datasources were searched. If count equals limit, more
-        results may exist. The total output is bounded: matches beyond the
-        bound are dropped and counted in "omitted", with a note to refine the
-        search.
+        JSON with count and matching datasources; an empty or short (below
+        limit) result also carries the access "scope" note above. If count
+        equals limit, more results may exist. The total output is bounded:
+        matches beyond the bound are dropped and counted in "omitted", with a
+        note to refine the search.
     """
     if limit < 1:
         raise ToolError("limit must be at least 1.")
@@ -1295,18 +1294,12 @@ def search_catalog(
     results = [formatter(ds) for ds in catalog if ds is not None]
     shown = _within_budget(results, SEARCH_BUDGET_CHARS[detail])
     omitted = len(results) - shown
-    out: dict[str, Any] = {
-        "count": shown,
-        "results": results[:shown],
-        "scope": _ACCESS_SCOPE,
-    }
+    out: dict[str, Any] = {"count": shown, "results": results[:shown]}
+    if not omitted and len(results) < limit:
+        # Empty or short: the page looks exhaustive, so state its scope.
+        out["scope"] = _ACCESS_SCOPE
     if not results:
-        out["message"] = (
-            "No datasources shared with your account match the search "
-            "criteria. Try broader search text or fewer filters; if an "
-            "expected dataset is still missing, ask its owner or an Oceanum "
-            "administrator for access."
-        )
+        out["message"] = "No datasources found matching the search criteria."
     elif omitted:
         out["omitted"] = omitted
         out["note"] = (
@@ -1329,6 +1322,15 @@ def search_catalog(
     if results and detail == "summary":
         out["hint"] = _SEARCH_HINT
     return to_json(out)
+
+
+# The caveat is spliced in from its one source constant (a single line, so the
+# docstring's indentation is unaffected) BEFORE registration, which parses
+# __doc__.
+search_catalog.__doc__ = search_catalog.__doc__.replace(  # type: ignore[union-attr]
+    "{access_scope}", _ACCESS_SCOPE
+)
+search_catalog = mcp.tool(annotations=READ_TOOL)(search_catalog)
 
 
 @mcp.tool(annotations=READ_TOOL)
