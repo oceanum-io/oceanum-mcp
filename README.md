@@ -242,6 +242,9 @@ code reads directly.
 
 Search the Datamesh catalog with optional text search, time range, and bounding box filters.
 Returns a JSON object with `count` and `results`; if `count` equals `limit`, more matches may exist.
+Only datasources shared with the caller's account are searched, so a fixed `scope` note
+in every response warns that an unlisted datasource may exist without being shared; it
+never reveals whether, how many, or which inaccessible datasources exist.
 
 By default each result is a compact summary: `id`, `name`, a `description`
 cut to 200 characters, `tstart`/`tend`, `bounds`, variable names when the
