@@ -1262,7 +1262,8 @@ def search_catalog(
 
     Returns:
         JSON with count and matching datasources; an empty or short (below
-        limit) result also carries the access "scope" note above. If count
+        limit, with nothing omitted) result also carries the access "scope"
+        note above. If count
         equals limit, more results may exist. The total output is bounded:
         matches beyond the bound are dropped and counted in "omitted", with a
         note to refine the search.
@@ -1327,7 +1328,8 @@ def search_catalog(
 # The caveat is spliced in from its one source constant (a single line, so the
 # docstring's indentation is unaffected) BEFORE registration, which parses
 # __doc__.
-search_catalog.__doc__ = search_catalog.__doc__.replace(  # type: ignore[union-attr]
+# `or ""`: under `python -OO` docstrings are stripped and __doc__ is None.
+search_catalog.__doc__ = (search_catalog.__doc__ or "").replace(
     "{access_scope}", _ACCESS_SCOPE
 )
 search_catalog = mcp.tool(annotations=READ_TOOL)(search_catalog)

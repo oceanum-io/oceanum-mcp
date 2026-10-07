@@ -243,7 +243,7 @@ code reads directly.
 Search the Datamesh catalog with optional text search, time range, and bounding box filters.
 Returns a JSON object with `count` and `results`; if `count` equals `limit`, more matches may exist.
 Only datasources accessible to the request's credentials are searched. An empty or short
-(below `limit`) result carries a fixed `scope` note saying a missing datasource either does
+(below `limit`, with nothing `omitted`) result carries a fixed `scope` note saying a missing datasource either does
 not exist or is not accessible with these credentials; it never reveals whether, how many,
 or which inaccessible datasources exist.
 
