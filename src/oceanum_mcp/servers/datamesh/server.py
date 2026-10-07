@@ -1210,6 +1210,15 @@ _SEARCH_HINT = (
     "attributes."
 )
 
+# The catalog lists only datasources shared with the caller's account, so a
+# missing match proves nothing about existence. The wording is fixed: it must
+# not reveal whether, how many, or which inaccessible datasources exist.
+_ACCESS_SCOPE = (
+    "Results only include datasources shared with your account; one that "
+    "is not listed may still exist without being shared with you, so do "
+    "not conclude it does not exist."
+)
+
 
 def _within_budget(results: list[dict[str, Any]], budget: int) -> int:
     """How many leading results fit in budget characters (always at least one).
@@ -1237,6 +1246,13 @@ def search_catalog(
 ) -> str:
     """Search the Oceanum Datamesh catalog for datasets.
 
+    Only datasources shared with your account (the credential this server
+    calls Datamesh with) are searched. A datasource that is not shared with
+    you is never listed, so an empty or short result does not mean a dataset
+    does not exist: it may exist without being shared with you. If an
+    expected dataset is missing, try broader search text, then suggest
+    asking its owner or an Oceanum administrator for access.
+
     Args:
         search: Text search string to filter datasources by name, description, or tags.
         time_start: ISO 8601 datetime for start of time range filter (e.g. "2023-01-01").
@@ -1246,7 +1262,8 @@ def search_catalog(
         detail: "summary" (default) returns id, name, a short description, time range, bounds, and variable names when known. "full" returns each datasource's complete catalog record; prefer get_datasource_info for one datasource's details.
 
     Returns:
-        JSON with count and matching datasources. If count equals limit, more
+        JSON with count and matching datasources, and a "scope" note on
+        which datasources were searched. If count equals limit, more
         results may exist. The total output is bounded: matches beyond the
         bound are dropped and counted in "omitted", with a note to refine the
         search.
@@ -1278,9 +1295,18 @@ def search_catalog(
     results = [formatter(ds) for ds in catalog if ds is not None]
     shown = _within_budget(results, SEARCH_BUDGET_CHARS[detail])
     omitted = len(results) - shown
-    out: dict[str, Any] = {"count": shown, "results": results[:shown]}
+    out: dict[str, Any] = {
+        "count": shown,
+        "results": results[:shown],
+        "scope": _ACCESS_SCOPE,
+    }
     if not results:
-        out["message"] = "No datasources found matching the search criteria."
+        out["message"] = (
+            "No datasources shared with your account match the search "
+            "criteria. Try broader search text or fewer filters; if an "
+            "expected dataset is still missing, ask its owner or an Oceanum "
+            "administrator for access."
+        )
     elif omitted:
         out["omitted"] = omitted
         out["note"] = (

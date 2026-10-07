@@ -88,7 +88,49 @@ class TestSearchCatalog:
 
         parsed = json.loads(server.search_catalog(search="nonexistent"))
         assert parsed["count"] == 0
-        assert "No datasources found" in parsed["message"]
+        assert "No datasources shared with your account" in parsed["message"]
+        assert "access" in parsed["message"]
+        assert "do not conclude it does not exist" in parsed["scope"]
+
+    def test_scope_note_on_short_result(self, mock_conn):
+        # Fewer matches than the limit looks exhaustive; the scope note says
+        # the list covers only datasources shared with the caller.
+        mock_conn.get_catalog.return_value = _mock_catalog([_mock_datasource()])
+
+        parsed = json.loads(server.search_catalog(search="wave"))
+        assert parsed["count"] == 1
+        assert parsed["scope"] == server._ACCESS_SCOPE
+        assert "shared with your account" in parsed["scope"]
+
+    @pytest.mark.parametrize("found", [[], ["era5-waves"]])
+    def test_access_wording_reveals_nothing_about_hidden_datasources(
+        self, mock_conn, found
+    ):
+        # The wording is fixed text: it neither varies with the search nor
+        # names or counts anything beyond the visible results, and the tool
+        # makes exactly one catalog call (no probing for hidden datasources).
+        responses = []
+        for search in ("secret-client-hindcast", "x"):
+            mock_conn.get_catalog.reset_mock()
+            mock_conn.get_catalog.return_value = _mock_catalog(
+                [_mock_datasource(id=i, name=i) for i in found]
+            )
+            parsed = json.loads(server.search_catalog(search=search))
+            mock_conn.get_catalog.assert_called_once()
+            assert parsed["count"] == len(found)
+            assert "secret-client-hindcast" not in json.dumps(parsed)
+            responses.append(
+                {k: v for k, v in parsed.items() if k not in ("count", "results")}
+            )
+        assert responses[0] == responses[1]
+        assert not any(ch.isdigit() for ch in json.dumps(responses[0]))
+
+    async def test_description_states_access_scope(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        desc = tools["search_catalog"].description
+        assert "shared with your account" in desc
+        assert "does not mean a dataset" in desc
+        assert "does not exist" in desc
 
     def test_note_when_limit_reached(self, mock_conn):
         ds = _mock_datasource()
