@@ -908,6 +908,31 @@ class TestExportQueryHosted:
         assert parsed["available_formats"] == ["nc", "parquet", "csv"]
         assert "self-authenticating" in parsed["note"]
 
+    def test_scoped_link_reports_expiry_and_uses(self, mock_conn):
+        # OCE-317 gateways return a ?dl= handle link plus its scope.
+        stage = self._stage(
+            url="https://datamesh.oceanum.io/oceanql/abc$?dl=" + "h" * 43
+        )
+        stage["url_expires_at"] = "2026-10-07T04:00:00+00:00"
+        stage["url_max_uses"] = 3
+        with patch.object(server, "_download_stage", return_value=stage):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["download_url"] == (
+            "https://datamesh.oceanum.io/oceanql/abc$?dl=" + "h" * 43 + "&f=parquet"
+        )
+        assert parsed["expires_at"] == "2026-10-07T04:00:00+00:00"
+        assert parsed["max_uses"] == 3
+        assert "valid until 2026-10-07T04:00:00+00:00 for 3 fetches" in parsed["note"]
+        assert "treat it like a password" in parsed["note"]
+
+    def test_unscoped_link_from_older_gateway(self, mock_conn):
+        # Pre-OCE-317 gateways send no scope: same response as before.
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "expires_at" not in parsed
+        assert "max_uses" not in parsed
+        assert parsed["note"].startswith("Time-limited, self-authenticating")
+
     def test_path_ignored_on_hosted(self, mock_conn, tmp_path):
         # A path arg does not cause a local write on hosted; a URL is returned
         # and the response signals the path was ignored.
