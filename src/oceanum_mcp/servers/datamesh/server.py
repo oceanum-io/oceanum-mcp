@@ -120,8 +120,9 @@ LARGE_DOWNLOAD_BYTES = 2_000_000_000
 
 # Above this staged size hosted export refuses to return a download link
 # (OCE-299). The link is a bearer URL: anyone holding it can fetch the data
-# with no credential until it expires, so until the gateway issues scoped
-# links (OCE-317) this bounds what one leaked link, or one runaway agent call,
+# with no credential. Since OCE-317 the gateway scopes it (by default 60
+# minutes, 3 fetches, revoked if the org's token changes), but within that
+# scope this still bounds what one leaked link, or one runaway agent call,
 # can pull. Equal to the local dataset cap (MAX_EXPORT_DATASET_BYTES) so an
 # export that works on stdio also works hosted; 2-10 GB stays warn-and-allow.
 MAX_HOSTED_EXPORT_BYTES = MAX_EXPORT_DATASET_BYTES
@@ -346,9 +347,10 @@ def _download_stage(conn: Connector, query: Query) -> dict[str, Any] | None:
     """Stage a query for download, returning the gateway's response dict.
 
     POSTs to the gateway's /oceanql/download/ endpoint, which the oceanum<2
-    library does not wrap. The response carries a self-authenticating signed
-    `url` (append `&f=<format>` to pick a format), plus `formats`, `size`, and
-    `container`. Mirrors Connector._stage_request's auth/error handling.
+    library does not wrap. The response carries a self-authenticating `url`
+    (append `&f=<format>` to pick a format), plus `formats`, `size`, and
+    `container`; OCE-317 gateways add the link's `url_expires_at` and
+    `url_max_uses`. Mirrors Connector._stage_request's auth/error handling.
     Returns None when no data matches (HTTP 204). Bounded by
     OCEANUM_MCP_STAGE_TIMEOUT like _stage.
     """
@@ -1779,16 +1781,27 @@ def _export_download_url(
                 "query": _query_echo(query),
             }
         )
-    # The signed URL is a capability: append the format token, keeping the
-    # signature intact. Use '?' if the URL has no query string yet, else '&'.
+    # The URL is a capability: append the format token, keeping its
+    # credential intact. Use '?' if the URL has no query string yet, else '&'.
     url = stage["url"]
     sep = "&" if "?" in url else "?"
     download_url = f"{url}{sep}f={gateway_fmt}"
-    note = (
-        "Time-limited, self-authenticating download link (it needs no "
-        "token, so treat it like a password). Fetch it out-of-band; the "
-        "data is not returned inline."
-    )
+    # OCE-317 gateways report the link's scope; older ones do not.
+    expires_at = stage.get("url_expires_at")
+    max_uses = stage.get("url_max_uses")
+    if expires_at and max_uses:
+        note = (
+            "Self-authenticating download link (it needs no token, so treat "
+            f"it like a password), valid until {expires_at} for {max_uses} "
+            "fetches; every fetch counts, whatever the format. Fetch it "
+            "out-of-band; the data is not returned inline."
+        )
+    else:
+        note = (
+            "Time-limited, self-authenticating download link (it needs no "
+            "token, so treat it like a password). Fetch it out-of-band; the "
+            "data is not returned inline."
+        )
     if requested_path is not None:
         note += " (The path argument is ignored on hosted servers.)"
     out: dict[str, Any] = {
@@ -1801,6 +1814,9 @@ def _export_download_url(
         "note": note,
         "query": _query_echo(query),
     }
+    if expires_at and max_uses:
+        out["expires_at"] = expires_at
+        out["max_uses"] = max_uses
     if size > LARGE_DOWNLOAD_BYTES:
         out["warning"] = (
             f"Large download ({human_bytes(size)}); ensure the consumer can "
@@ -2040,10 +2056,10 @@ def export_query(
     """Export the FULL result of a query — the data never enters the conversation.
 
     Behavior depends on how the server is running:
-    - Hosted (http/sse): returns a time-limited, self-authenticating gateway
-      download_url (choose format via `format`); `path` is ignored. Fetch the
-      URL out-of-band — it needs no credential, so treat it as a secret.
-      Refused above the hosted export cap, and for limit combined with
+    - Hosted (http/sse): returns a short-lived, use-limited, self-authenticating
+      gateway download_url (choose format via `format`); `path` is ignored.
+      Fetch the URL out-of-band, before expires_at and at most max_uses times
+      — it needs no credential, so treat it as a secret. Refused above the hosted export cap, and for limit combined with
       time_resolution/aggregate_operations.
     - Local (stdio): writes the result to the local file `path` (required) and
       returns that path. Gridded datasets stream to NetCDF; tabular results

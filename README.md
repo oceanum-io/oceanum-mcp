@@ -166,9 +166,12 @@ Notes:
 
 - `export_query` works over HTTP but changes shape: instead of writing to the
   server's local filesystem (meaningless for remote clients), it returns a
-  time-limited, self-authenticating gateway `download_url` that the caller
-  fetches out-of-band. The `path` argument is ignored on hosted servers. The
-  URL needs no credential, so it is a capability — treat it as a secret.
+  short-lived, use-limited, self-authenticating gateway `download_url` that
+  the caller fetches out-of-band. The `path` argument is ignored on hosted
+  servers. The URL needs no credential, so it is a capability — treat it as a
+  secret. The gateway scopes it: by default it expires after 60 minutes,
+  allows 3 fetches (`expires_at` and `max_uses` in the response), and stops
+  working if the organisation's Datamesh token changes.
   Hosted exports are capped at 10 GB to bound what one link can pull.
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
@@ -342,8 +345,10 @@ large to return inline. Behaviour depends on transport:
 - **Local (stdio):** writes the result to the local file `path` (required) and
   returns that path. Gridded datasets stream lazily to NetCDF; tabular results
   write Parquet or CSV.
-- **Hosted (http/sse):** returns a time-limited, self-authenticating gateway
-  `download_url` (choose `format`; `path` is ignored). Fetch it out-of-band.
+- **Hosted (http/sse):** returns a short-lived, use-limited,
+  self-authenticating gateway `download_url` (choose `format`; `path` is
+  ignored). Fetch it out-of-band, before `expires_at` and at most `max_uses`
+  times (by default 60 minutes and 3 fetches).
   Results above 10 GB (for CSV, the estimated text size, about 3x the staged
   size) are refused (narrow the query); above 2 GB the link is returned with
   a large-download warning.
