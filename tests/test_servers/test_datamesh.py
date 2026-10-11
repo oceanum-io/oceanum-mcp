@@ -271,6 +271,32 @@ class TestBuildQuery:
         assert q.crs == 4326
         assert q.aggregate.temporal is False
 
+    def test_quantile_aggregate(self):
+        q = server._build_query(
+            "test-ds", aggregate_operations=["quantile", "mean"], aggregate_q=0.95
+        )
+        assert [op.value for op in q.aggregate.operations] == ["quantile", "mean"]
+        assert q.aggregate.q == 0.95
+        assert server._query_echo(q)["aggregate"]["q"] == 0.95
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"aggregate_operations": ["quantile"]},
+            {"aggregate_operations": ["mean"], "aggregate_q": 0.95},
+            {"aggregate_q": 0.95},
+        ],
+    )
+    def test_quantile_and_q_must_come_together(self, kwargs):
+        with pytest.raises(ToolError, match="aggregate_q .* required with"):
+            server._build_query("test-ds", **kwargs)
+
+    def test_out_of_range_q_raises_tool_error(self):
+        with pytest.raises(ToolError, match="Invalid query parameters"):
+            server._build_query(
+                "test-ds", aggregate_operations=["quantile"], aggregate_q=1.5
+            )
+
     def test_invalid_bbox_raises_tool_error(self):
         with pytest.raises(ToolError, match="Invalid query parameters"):
             server._build_query("test-ds", bbox=[0, 0, 1])
@@ -1190,3 +1216,27 @@ class TestRegistration:
         finally:
             monkeypatch.delenv("OCEANUM_MCP_READ_ONLY")
             importlib.reload(server)
+
+
+class TestQuantileAggregate:
+    @pytest.mark.parametrize("tool", ["stage_query", "query_data", "export_query"])
+    async def test_schema_bounds_aggregate_q(self, tool):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        props = tools[tool].parameters["properties"]
+        assert "quantile" in json.dumps(props["aggregate_operations"])
+        q = json.dumps(props["aggregate_q"])
+        assert '"minimum": 0' in q and '"maximum": 1' in q
+        assert "95th percentile" in q
+
+    @pytest.mark.parametrize("tool", ["stage_query", "query_data"])
+    def test_tool_passes_q_through(self, tool, mock_conn, mock_stage):
+        mock_conn.query.return_value = xr.Dataset({"hs_quantile": ((), 3.823916)})
+        getattr(server, tool)(
+            datasource_id="test-ds",
+            variables=["hs"],
+            aggregate_operations=["quantile"],
+            aggregate_q=0.95,
+        )
+        aggregate = mock_stage.call_args.args[1].aggregate
+        assert [op.value for op in aggregate.operations] == ["quantile"]
+        assert aggregate.q == 0.95
