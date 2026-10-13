@@ -1110,6 +1110,21 @@ class TestExportQueryHosted:
         assert "bad query" in parsed["error"]
         assert parsed["query"]["datasource"] == "test-ds"
 
+    async def test_download_url_sent_once_per_result(self, mock_conn):
+        # The URL is a bearer credential (S2-9): every copy on the wire can
+        # end up in a client log. Without an output schema FastMCP returns
+        # the result as text only, not duplicated in structuredContent.
+        from fastmcp import Client
+
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            async with Client(server.mcp) as client:
+                result = await client.call_tool(
+                    "export_query", {"datasource_id": "test-ds"}
+                )
+        texts = [block.text for block in result.content if block.type == "text"]
+        assert sum(text.count("sig=xyz") for text in texts) == 1
+        assert result.structured_content is None
+
 
 class TestLoadDatasource:
     def test_dataset_loaded(self, mock_conn, mock_stage):

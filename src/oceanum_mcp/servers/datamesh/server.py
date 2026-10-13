@@ -2324,13 +2324,17 @@ stage_query = mcp.tool(annotations=READ_TOOL)(
     _reporting_resolved_variables(stage_query)
 )
 query_data = mcp.tool(annotations=READ_TOOL)(_reporting_resolved_variables(query_data))
+# No output schema: FastMCP would otherwise send each result twice (text and
+# structuredContent), and a hosted result carries a bearer download URL that
+# any copy can leak into client logs (S2-9).
 export_query = mcp.tool(
     annotations={
         "readOnlyHint": False,
         "destructiveHint": False,
         "idempotentHint": True,
         "openWorldHint": True,
-    }
+    },
+    output_schema=None,
 )(_reporting_resolved_variables(export_query))
 
 
