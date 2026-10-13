@@ -426,6 +426,38 @@ _FORBIDDEN_RE = re.compile(r"You do not have permission\b")
 _VARIABLE_MISSING_RE = re.compile(
     r"variables? not found|no variable named", re.IGNORECASE
 )
+# The engine renames aggregated variables to <name>_<op> and then selects the
+# original names, so `variables` combined with `aggregate_operations` fails
+# with "No variable named '<name>'" followed by its renamed forms (S1-2). Not a
+# missing variable: the renamed form does not work as a variable either.
+_AGGREGATE_RENAME_RE = re.compile(r"No variable named '([^']+)'")
+_AGGREGATE_OPS = ("mean", "min", "max", "std", "sum")
+
+
+def _aggregate_rename_error(message: str) -> str | None:
+    """The variable the engine lost to aggregate renaming, or None if
+    message is not that engine failure."""
+    match = _AGGREGATE_RENAME_RE.search(message)
+    if match is None:
+        return None
+    name = match.group(1)
+    renamed = (f"'{name}_{op}'" for op in _AGGREGATE_OPS)
+    return name if any(r in message[match.end() :] for r in renamed) else None
+
+
+def _aggregate_rename_fields(name: str, message: str) -> dict[str, Any]:
+    return {
+        "error": "Datamesh cannot currently combine variables with "
+        "aggregate_operations: it renames aggregated variables to "
+        f"<name>_<op> (e.g. '{name}_mean') and then fails to find "
+        f"'{name}'. Requesting '{name}_mean' as a variable does not work "
+        "either. Workaround until the engine is fixed: omit variables (the "
+        "result then holds <name>_<op> for every variable, so size it with "
+        "stage_query first), or for means over fixed periods use "
+        "time_resolution with time_resample='mean' instead of aggregation.",
+        "engine_error": message,
+    }
+
 
 # Lookups run in daemon threads, at most this many at once: a lookup that
 # times out keeps its thread until the SDK gives up, and must neither delay
@@ -712,6 +744,7 @@ def _stage_resolving(
             isinstance(exc, GatewayTimeout)
             or not query.variables
             or not _VARIABLE_MISSING_RE.search(str(exc))
+            or _aggregate_rename_error(str(exc))
         ):
             raise
         datasource = _datasource_schema(conn, query.datasource, exc)
@@ -795,6 +828,8 @@ def _error_json(
         )
     elif isinstance(exc, GatewayTimeout):
         pass
+    elif (lost := _aggregate_rename_error(message)) is not None:
+        fields = _aggregate_rename_fields(lost, message)
     elif _engine_missing_re(datasource_id).search(message):
         fields = _run_bounded(
             partial(_engine_missing_fields, conn, datasource_id), datasource_id
