@@ -8,7 +8,12 @@ version = "0.5.1"
 description = "MCP servers for the Oceanum platform"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+# <3.14: numcodecs<0.16 (below) ships no cp314 wheels, so 3.14 falls back to a
+# source build that fails (e.g. c-blosc vs GCC 15's C23 default); the first
+# cp314 numcodecs (0.16.4) can't be used because no zarr 2.x release imports
+# with it. uv ignores this upper bound when resolving, so uvx users still need
+# `--python 3.13` (see README). Lift together with the numcodecs pin.
+requires-python = ">=3.10,<3.14"
 dependencies = [
     "fastmcp>=4.0,<5",
     # Imported directly by common.auth. FastMCP 4 moved its HTTP stack from

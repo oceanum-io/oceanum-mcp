@@ -18,17 +18,22 @@ Get an API token from [oceanum.io](https://oceanum.io). Set it as the `DATAMESH_
 
 ## Installation
 
+Requires Python 3.10–3.13. Python 3.14 is not supported yet: the `zarr` 2.x
+stack that `oceanum` depends on needs `numcodecs<0.16`, which has no Python
+3.14 wheels.
+
 ```bash
 pip install oceanum-mcp
 ```
 
-Or run directly with `uvx`:
+Or run directly with `uvx`. Pass `--python 3.13` so uv doesn't pick Python
+3.14 (uv downloads 3.13 if it isn't installed):
 
 ```bash
-uvx oceanum-mcp              # combined server (default)
-uvx oceanum-mcp datamesh     # datamesh only
-uvx oceanum-mcp storage      # storage only
-uvx oceanum-mcp --list       # show available servers
+uvx --python 3.13 oceanum-mcp              # combined server (default)
+uvx --python 3.13 oceanum-mcp datamesh     # datamesh only
+uvx --python 3.13 oceanum-mcp storage      # storage only
+uvx --python 3.13 oceanum-mcp --list       # show available servers
 ```
 
 ## Configuration
@@ -47,7 +52,7 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "oceanum": {
       "command": "uvx",
-      "args": ["oceanum-mcp"],
+      "args": ["--python", "3.13", "oceanum-mcp"],
       "env": {
         "DATAMESH_TOKEN": "your-token-here"
       }
@@ -63,7 +68,7 @@ Add to your `claude_desktop_config.json`:
   "mcpServers": {
     "oceanum-datamesh": {
       "command": "uvx",
-      "args": ["oceanum-mcp", "datamesh"],
+      "args": ["--python", "3.13", "oceanum-mcp", "datamesh"],
       "env": {
         "DATAMESH_TOKEN": "your-token-here"
       }
@@ -76,10 +81,10 @@ Add to your `claude_desktop_config.json`:
 
 ```bash
 # Combined server
-claude mcp add --transport stdio oceanum -- uvx oceanum-mcp
+claude mcp add --transport stdio oceanum -- uvx --python 3.13 oceanum-mcp
 
 # Individual server
-claude mcp add --transport stdio oceanum-datamesh -- uvx oceanum-mcp datamesh
+claude mcp add --transport stdio oceanum-datamesh -- uvx --python 3.13 oceanum-mcp datamesh
 ```
 
 Set the token in your environment:
@@ -95,7 +100,7 @@ Use stdio transport with the same command:
 ```json
 {
   "command": "uvx",
-  "args": ["oceanum-mcp"],
+  "args": ["--python", "3.13", "oceanum-mcp"],
   "env": {
     "DATAMESH_TOKEN": "your-token-here"
   }
