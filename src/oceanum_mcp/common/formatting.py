@@ -9,9 +9,11 @@ never mistakes a preview for the full result.
 from __future__ import annotations
 
 import json
+import math
 import sys
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import xarray as xr
 
@@ -37,12 +39,24 @@ def export_clause() -> str:
     return ", or use export_query to write the full result to a file"
 
 
-def _narrow_hint() -> str:
-    """How to get more than the inline preview, appropriate to the transport."""
+def _preview_note(lead: str) -> str:
+    """Note for a partial inline result: never analyse it, get stats server-side."""
     return (
-        "Narrow the query with filters, aggregation, or time_resolution "
-        "downsampling" + export_clause() + "."
+        lead + " PREVIEW ONLY: this is not the full result, so it is NOT "
+        "suitable for statistics or aggregation (means, extremes, counts, "
+        "trends). Compute statistics over the full result server-side with "
+        "aggregate_operations or time_resolution downsampling; narrow the "
+        "query with filters to see more values inline" + export_clause() + "."
     )
+
+
+def _preview_fields(returned: int, total: int) -> dict[str, Any]:
+    """Machine-readable preview flags shared by every inline result shape.
+
+    total is the record count of the full result; preview is true whenever
+    fewer records were returned than the result holds.
+    """
+    return {"preview": returned < total, "returned": returned, "total": total}
 
 
 def human_bytes(n: int | float) -> str:
@@ -55,8 +69,70 @@ def human_bytes(n: int | float) -> str:
     raise AssertionError("unreachable")
 
 
+def _float_value(value: float | np.floating) -> float | None:
+    """A JSON-safe float at full precision; NaN/inf -> None.
+
+    float64 converts exactly (json.dumps then writes its shortest round-trip
+    repr). Narrower floats (float32/float16) take the shortest repr that
+    round-trips in their own precision: widening 0.1f to float64 directly
+    would print as 0.10000000149011612, digits the source data never had.
+    """
+    if not math.isfinite(value):
+        return None
+    if isinstance(value, np.floating) and value.dtype.itemsize < 8:
+        return float(np.format_float_scientific(value, unique=True))
+    return float(value)
+
+
+# Marks object-column cells that are not floats: they keep to_json's value.
+_KEEP = object()
+
+
+def _exact_floats(col: pd.Series) -> list[Any] | None:
+    """Full-precision values for a column's float cells, or None if it has none.
+
+    Float dtypes (numpy, nullable, sparse, Arrow) convert every cell. Object
+    columns convert their float cells and mark the rest _KEEP.
+    """
+    dtype = col.dtype
+    if isinstance(dtype, np.dtype) and dtype.kind == "O":
+        return [
+            _float_value(v) if isinstance(v, (float, np.floating)) else _KEEP
+            for v in col
+        ]
+    if not pd.api.types.is_float_dtype(dtype):
+        return None
+    if not isinstance(dtype, np.dtype):
+        # Nullable/Arrow dtypes expose numpy_dtype; SparseDtype has subtype.
+        dtype = getattr(dtype, "numpy_dtype", None) or dtype.subtype
+    return [_float_value(v) for v in col.to_numpy(dtype=dtype, na_value=np.nan)]
+
+
 def _records(df: pd.DataFrame) -> list[dict[str, Any]]:
-    return json.loads(df.to_json(orient="records", date_format="iso"))
+    # to_json rounds floats to 10 decimal places (5e-12 -> 0.0), and its
+    # maximum double_precision=15 is still decimal places, not significant
+    # digits (OCE-325). Keep to_json for every other dtype (ISO datetimes and
+    # durations, NaT -> null) and replace float cells with exact values.
+    # Rows are serialized as positional lists and keyed by str(label), as in
+    # the summary's column list. Labels that repeat as keys (duplicates, or
+    # 1 and "1") get a ".N" suffix so no column is dropped.
+    keys: list[str] = []
+    for label in df.columns:
+        key = base = str(label)
+        n = 0
+        while key in keys:
+            n += 1
+            key = f"{base}.{n}"
+        keys.append(key)
+    rows = json.loads(df.to_json(orient="values", date_format="iso"))
+    for i, (_, col) in enumerate(df.items()):
+        floats = _exact_floats(col)
+        if floats is None:
+            continue
+        for row, value in zip(rows, floats, strict=True):
+            if value is not _KEEP:
+                row[i] = value
+    return [dict(zip(keys, row, strict=True)) for row in rows]
 
 
 def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
@@ -84,10 +160,9 @@ def _frame_summary(df: pd.DataFrame, max_rows: int) -> dict[str, Any]:
         shown = plain
     out["data"] = _records(shown)
     out["truncated"] = df.shape[0] > max_rows
+    out.update(_preview_fields(int(shown.shape[0]), int(df.shape[0])))
     if out["truncated"]:
-        out["note"] = (
-            f"Showing first {max_rows} of {df.shape[0]} rows. " + _narrow_hint()
-        )
+        out["note"] = _preview_note(f"Showing first {max_rows} of {df.shape[0]} rows.")
     return out
 
 
@@ -101,7 +176,42 @@ def _coord_summary(coord: xr.DataArray) -> dict[str, Any]:
     return out
 
 
+def _scalar_value(var: xr.DataArray) -> Any:
+    """JSON-safe value of a 0-d variable, at full precision.
+
+    Datetimes/timedeltas use the records conversion (ISO strings, NaT ->
+    null) to match other records; numbers skip it because DataFrame.to_json
+    rounds floats to 10 decimals, which would erase small aggregates.
+    """
+    value = var.values[()]
+    if isinstance(value, (np.datetime64, np.timedelta64)):
+        return _records(pd.DataFrame({"v": [value]}))[0]["v"]
+    if isinstance(value, np.floating):
+        return _float_value(value)
+    if isinstance(value, np.generic):
+        value = value.item()
+    if isinstance(value, float) and not math.isfinite(value):
+        return None
+    return value
+
+
+def _scalar_records(ds: xr.Dataset) -> list[dict[str, Any]]:
+    """One record per variable of a 0-d Dataset: name, value, units/long_name."""
+    out = []
+    for name, var in ds.data_vars.items():
+        rec: dict[str, Any] = {"name": str(name), "value": _scalar_value(var)}
+        for key in ("units", "long_name"):
+            if var.attrs.get(key) not in (None, ""):
+                rec[key] = str(var.attrs[key])
+        out.append(rec)
+    return out
+
+
 def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
+    if not ds.sizes and max_rows > 0:
+        # A 0-d result is one value per variable: compute it even if lazy
+        # (use_dask is chosen from the staged size, not the result's).
+        ds = ds.compute()
     lazy = any(ds[v].chunks is not None for v in ds.data_vars)
     out: dict[str, Any] = {
         "container": "dataset",
@@ -121,22 +231,38 @@ def _dataset_summary(ds: xr.Dataset, max_rows: int) -> dict[str, Any]:
         "size_human": human_bytes(ds.nbytes),
         "lazy": lazy,
     }
-    if lazy:
+    if lazy and max_rows > 0:
+        # No values are returned; the record count (the full dim product, as
+        # to_dataframe would yield) is known without downloading anything.
+        out.update(_preview_fields(0, math.prod(out["dims"].values())))
+        out["note"] = _preview_note("Dataset is lazily loaded (values not downloaded).")
+    elif lazy:
         out["note"] = (
             "Dataset is lazily loaded (values not downloaded). Narrow the query "
             "with filters, aggregation, or time_resolution downsampling to see "
             "values inline" + export_clause() + "."
         )
+    elif max_rows > 0 and not ds.sizes:
+        # A 0-d result (e.g. aggregate_operations over space and time) has no
+        # index for to_dataframe (OCE-320): it is one record of scalars,
+        # returned as one scalar entry per variable. Datasets with any dim
+        # still go through to_dataframe, which broadcasts 0-d variables.
+        out["data"] = _scalar_records(ds)
+        out["truncated"] = False
+        # One record, as counted elsewhere (prod of no dims = 1).
+        out.update(_preview_fields(1, 1))
     elif max_rows > 0:
         # Eager data is already in memory — always include a preview of
         # coordinate-attributed values.
         df = ds.to_dataframe().reset_index()
-        out["data"] = _records(df.head(max_rows))
+        shown = df.head(max_rows)
+        out["data"] = _records(shown)
         out["truncated"] = df.shape[0] > max_rows
+        out.update(_preview_fields(int(shown.shape[0]), int(df.shape[0])))
         if out["truncated"]:
-            out["note"] = (
-                f"Showing first {max_rows} of {df.shape[0]} records. "
-            ) + _narrow_hint()
+            out["note"] = _preview_note(
+                f"Showing first {max_rows} of {df.shape[0]} records."
+            )
     return out
 
 
@@ -206,3 +332,174 @@ def format_datasource(ds: Any) -> dict[str, Any]:
     if ds.created:
         result["created"] = ds.created.isoformat()
     return result
+
+
+# ---------------------------------------------------------------------------
+# Compact datasource views (OCE-309)
+#
+# format_datasource above is the complete record (detail="full"). Real records
+# carry GRIB coefficient arrays, hundreds of model-parameter attributes and
+# 100+ variables, and schema.data_vars/attrs repeat variables/attributes, so
+# the full record can run to hundreds of kB per datasource.
+# ---------------------------------------------------------------------------
+
+# search_catalog summaries.
+SUMMARY_DESCRIPTION_CHARS = 200
+SUMMARY_MAX_VARIABLES = 20
+SUMMARY_TAG_CHARS = 120
+
+# get_datasource_info bounded view.
+INFO_MAX_ATTRS = 8  # attributes per variable / coordinate
+INFO_MAX_GLOBAL_ATTRS = 25  # global attributes, and info entries
+INFO_VALUE_CHARS = 200  # longest attribute value shown before clipping
+# Above this serialized size the view is rebuilt lean: every variable and
+# coordinate keeps only dims/shape/dtype and its priority attributes. Every
+# variable stays listed either way: its exact name is what a query needs.
+INFO_BUDGET_CHARS = 60_000
+
+# Kept first, so a capped attribute list still carries what code needs.
+_PRIORITY_ATTRS = ("units", "long_name", "standard_name")
+
+_BOUNDED_NOTE = (
+    "Bounded view: long attribute values are clipped (ending in ...), attribute "
+    "lists are capped (see *_omitted counts), and schema.data_vars/attrs are "
+    'omitted as duplicates of variables/attributes. Pass detail="full" for '
+    "the complete record."
+)
+_LEAN_NOTE = (
+    "Bounded view of a large record: each variable and coordinate keeps only "
+    "dims, shape, dtype and units/long_name/standard_name (see attrs_omitted "
+    "counts), global attribute lists are capped, long values are clipped "
+    "(ending in ...), and schema.data_vars/attrs are omitted as duplicates of "
+    'variables/attributes. Pass detail="full" for the complete record.'
+)
+
+
+def _clip(text: str, limit: int) -> str:
+    """text cut to limit characters, with an ellipsis when cut."""
+    return text if len(text) <= limit else text[:limit].rstrip() + "..."
+
+
+def _clip_value(value: Any, limit: int) -> Any:
+    """An attribute value, replaced by a clipped JSON string if it is long."""
+    if value is None or isinstance(value, (bool, int, float)):
+        return value
+    text = value if isinstance(value, str) else json.dumps(value, default=str)
+    return value if len(text) <= limit else _clip(text, limit)
+
+
+def _bounded_attrs(attrs: dict[str, Any], max_items: int) -> tuple[dict, int]:
+    """Priority attributes plus others up to max_items in all, values clipped.
+
+    Priority attributes are always kept. Returns the kept attributes and how
+    many were omitted.
+    """
+    keys = [k for k in _PRIORITY_ATTRS if k in attrs]
+    others = [k for k in attrs if k not in _PRIORITY_ATTRS]
+    keys += others[: max(0, max_items - len(keys))]
+    kept = {str(k): _clip_value(attrs[k], INFO_VALUE_CHARS) for k in keys}
+    return kept, len(attrs) - len(kept)
+
+
+def _bounded_entry(entry: Any, max_attrs: int) -> Any:
+    """A schema variable/coordinate entry with its attributes bounded.
+
+    dims, shape and dtype pass through unchanged: they are small, and clients
+    index them structurally.
+    """
+    if not isinstance(entry, dict):
+        return entry
+    out: dict[str, Any] = {}
+    for key, value in entry.items():
+        if key == "attrs" and isinstance(value, dict):
+            out["attrs"], omitted = _bounded_attrs(value, max_attrs)
+            if omitted:
+                out["attrs_omitted"] = omitted
+        else:
+            out[key] = value
+    return out
+
+
+def _bounded_entries(entries: dict[str, Any], max_attrs: int) -> dict[str, Any]:
+    return {str(n): _bounded_entry(e, max_attrs) for n, e in entries.items()}
+
+
+def format_datasource_summary(ds: Any) -> dict[str, Any]:
+    """A compact search_catalog hit: identity, coverage and variable names.
+
+    Catalog hits from the gateway usually carry no schema, so variable names
+    appear only when the record includes them.
+    """
+    description = ds.description
+    if isinstance(description, str):
+        description = _clip(" ".join(description.split()), SUMMARY_DESCRIPTION_CHARS)
+    result: dict[str, Any] = {"id": ds.id, "name": ds.name, "description": description}
+    if ds.geom is not None:
+        result["bounds"] = list(ds.bounds)
+    if ds.tstart is not None:
+        result["tstart"] = ds.tstart.isoformat()
+    if ds.tend is not None:
+        result["tend"] = ds.tend.isoformat()
+
+    data_vars = getattr(ds.dataschema, "data_vars", None)
+    if isinstance(data_vars, dict) and data_vars:
+        names = [str(n) for n in data_vars]
+        result["variables"] = names[:SUMMARY_MAX_VARIABLES]
+        if len(names) > SUMMARY_MAX_VARIABLES:
+            result["variables_total"] = len(names)
+
+    tags = [str(t) for t in ds.tags or []]
+    shown: list[str] = []
+    for tag in tags:
+        if sum(map(len, shown)) + len(tag) > SUMMARY_TAG_CHARS:
+            break
+        shown.append(tag)
+    if shown:
+        result["tags"] = shown
+    if len(shown) < len(tags):
+        result["tags_total"] = len(tags)
+    return result
+
+
+def _bounded_view(full: dict[str, Any], max_attrs: int) -> dict[str, Any]:
+    out = dict(full)
+    for key in ("attributes", "info"):
+        if isinstance(full.get(key), dict):
+            out[key], omitted = _bounded_attrs(full[key], INFO_MAX_GLOBAL_ATTRS)
+            if omitted:
+                out[f"{key}_omitted"] = omitted
+    if isinstance(full.get("variables"), dict):
+        out["variables"] = _bounded_entries(full["variables"], max_attrs)
+    if isinstance(full.get("schema"), dict):
+        schema = full["schema"]
+        bounded: dict[str, Any] = {
+            "dims": schema.get("dims"),
+            "coords": _bounded_entries(schema.get("coords") or {}, max_attrs),
+        }
+        # data_vars/attrs duplicate variables/attributes only on a detailed
+        # record; keep them (bounded) when the record has no such fields.
+        if "variables" not in full and schema.get("data_vars"):
+            bounded["data_vars"] = _bounded_entries(schema["data_vars"], max_attrs)
+        if "attributes" not in full and schema.get("attrs"):
+            bounded["attrs"], _ = _bounded_attrs(schema["attrs"], INFO_MAX_GLOBAL_ATTRS)
+        out["schema"] = bounded
+    return out
+
+
+def format_datasource_bounded(ds: Any) -> dict[str, Any]:
+    """The full record's fields and shape, with every large section bounded.
+
+    Every variable and coordinate is kept with its dims, shape, dtype and
+    priority attributes (units, long_name, standard_name); up to
+    INFO_MAX_ATTRS attributes in all, with long values clipped. If that still
+    serializes past INFO_BUDGET_CHARS, entries keep only the priority
+    attributes. schema.data_vars and schema.attrs are dropped when they
+    duplicate variables/attributes.
+    """
+    full = format_datasource(ds)
+    out = _bounded_view(full, INFO_MAX_ATTRS)
+    out["note"] = _BOUNDED_NOTE
+    if len(to_json(out)) > INFO_BUDGET_CHARS:
+        out = _bounded_view(full, 0)
+        out["note"] = _LEAN_NOTE
+    return out

@@ -11,7 +11,7 @@ import threading
 import time
 from typing import Any
 
-import httpx
+import httpx2
 from fastmcp.server.auth import (
     AccessToken,
     AuthProvider,
@@ -95,7 +95,7 @@ class DatameshTokenVerifier(TokenVerifier):
         # One client for the verifier's lifetime: per-verification clients
         # would pay TCP+TLS setup on every cache miss. Never closed — the
         # verifier lives as long as the server process.
-        self._http = httpx.AsyncClient(timeout=10.0)
+        self._http = httpx2.AsyncClient(timeout=10.0)
         self._valid = TokenCache(ttl_seconds=_VALID_TTL_S, max_size=_CACHE_MAX)
         self._lock = threading.Lock()
         # sha256(token) -> monotonic expiry; only gateway-confirmed rejections.
@@ -133,7 +133,7 @@ class DatameshTokenVerifier(TokenVerifier):
             return None
         try:
             result = await self._verify_with_gateway(token)
-        except httpx.HTTPError:
+        except httpx2.HTTPError:
             # Gateway unreachable or in an unexpected state: fail closed
             # without caching, so recovery is immediate.
             return None
@@ -146,7 +146,7 @@ class DatameshTokenVerifier(TokenVerifier):
     async def _verify_with_gateway(self, token: str) -> AccessToken | None:
         """Returns None only for a gateway-confirmed rejection (401/403).
 
-        Any other non-200 status raises httpx.HTTPStatusError so the caller
+        Any other non-200 status raises httpx2.HTTPStatusError so the caller
         treats it as an outage, not an invalid token.
         """
         resp = await self._http.get(
@@ -156,7 +156,7 @@ class DatameshTokenVerifier(TokenVerifier):
         if resp.status_code in (401, 403):
             return None
         if resp.status_code != 200:
-            raise httpx.HTTPStatusError(
+            raise httpx2.HTTPStatusError(
                 f"Datamesh gateway returned {resp.status_code} during token "
                 "verification",
                 request=resp.request,

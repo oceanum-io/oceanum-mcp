@@ -3,8 +3,10 @@
 import importlib
 import json
 import warnings
+import zipfile
 from unittest.mock import MagicMock, patch
 
+import dask.array as da
 import numpy as np
 import pandas as pd
 import pytest
@@ -19,6 +21,7 @@ from oceanum.datamesh.exceptions import (
 from oceanum.datamesh.query import Container, CoordSelector, GeoFilter, Query
 
 import oceanum_mcp.servers.datamesh.server as server
+from oceanum_mcp.common.formatting import human_bytes
 from tests.conftest import make_stage
 
 
@@ -86,6 +89,75 @@ class TestSearchCatalog:
         parsed = json.loads(server.search_catalog(search="nonexistent"))
         assert parsed["count"] == 0
         assert "No datasources found" in parsed["message"]
+        assert parsed["scope"] == server._ACCESS_SCOPE
+
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    def test_scope_note_on_short_result(self, mock_conn, detail):
+        # Fewer matches than the limit looks exhaustive: state the scope.
+        mock_conn.get_catalog.return_value = _mock_catalog([_mock_datasource()])
+
+        parsed = json.loads(server.search_catalog(search="wave", detail=detail))
+        assert parsed["count"] == 1
+        assert parsed["scope"] == server._ACCESS_SCOPE
+
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    def test_no_scope_note_when_limit_reached(self, mock_conn, detail):
+        mock_conn.get_catalog.return_value = _mock_catalog([_mock_datasource()])
+
+        parsed = json.loads(server.search_catalog(limit=1, detail=detail))
+        assert "more matches may exist" in parsed["note"]
+        assert "scope" not in parsed
+
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    def test_no_scope_note_when_page_is_full(self, mock_conn, monkeypatch, detail):
+        # Matches dropped by the output bound: the note already says more exist.
+        monkeypatch.setattr(server, "SEARCH_BUDGET_CHARS", {detail: 1})
+        mock_conn.get_catalog.return_value = _mock_catalog(
+            [_mock_datasource(id=f"ds-{i}") for i in range(3)]
+        )
+
+        parsed = json.loads(server.search_catalog(detail=detail))
+        assert parsed["omitted"] == 2
+        assert "scope" not in parsed
+
+    @pytest.mark.parametrize("detail", ["summary", "full"])
+    @pytest.mark.parametrize("search", ["hindcast", "wave"])
+    def test_response_identical_whether_or_not_hidden_datasources_exist(
+        self, mock_conn, search, detail
+    ):
+        # A backend holding a datasource the token can't see. "hindcast"
+        # matches only that one (empty result); "wave" matches it and a
+        # visible one (short result). The response must be the same as on a
+        # backend without it: nothing names, counts or hints at it.
+        visible = _mock_datasource(id="era5-wave", name="ERA5 wave")
+        hidden = _mock_datasource(
+            id="secret-wave-hindcast", name="Licensed wave hindcast"
+        )
+
+        def respond(backend):
+            def get_catalog(search=None, limit=None, **_):
+                return _mock_catalog(
+                    [ds for ds in backend if ds is not hidden and search in ds.id]
+                )
+
+            mock_conn.get_catalog.reset_mock()
+            mock_conn.get_catalog.side_effect = get_catalog
+            out = server.search_catalog(search=search, detail=detail)
+            mock_conn.get_catalog.assert_called_once()
+            return out
+
+        with_hidden = respond([visible, hidden])
+        assert with_hidden == respond([visible])
+        assert "secret" not in with_hidden
+        assert "Licensed" not in with_hidden
+        assert json.loads(with_hidden)["scope"] == server._ACCESS_SCOPE
+
+    async def test_description_and_instructions_state_access_scope(self):
+        tools = {t.name: t for t in await server.mcp.list_tools()}
+        desc = " ".join(tools["search_catalog"].description.split())
+        assert server._ACCESS_SCOPE in desc
+        assert "{access_scope}" not in desc
+        assert server._ACCESS_SCOPE in server.mcp.instructions
 
     def test_note_when_limit_reached(self, mock_conn):
         ds = _mock_datasource()
@@ -225,6 +297,75 @@ class TestStageQuery:
         parsed = json.loads(server.stage_query(datasource_id="test-ds"))
         assert "export_query" in parsed["recommendation"]
 
+    def test_below_large_threshold_keeps_export_wording(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(
+            Container.Dataset, size=server.LARGE_EXPORT_BYTES
+        )
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "write the full result to a file" in rec
+        assert "ask the user" not in rec
+
+    def test_large_result_leads_with_narrowing_and_disk_cost(
+        self, mock_conn, mock_stage
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=7_300_000_000)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert rec.index("Narrow") < rec.index("export_query")
+        for lever in ("time", "bbox", "variables", "time_resolution", "aggregation"):
+            assert lever in rec
+        assert "7.3 GB" in rec
+        assert "to the user's disk" in rec
+        assert "ask the user before exporting" in rec
+
+    def test_large_result_above_local_cap_says_export_refused(
+        self, mock_conn, mock_stage
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=73_000_000_000)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "73.0 GB" in rec
+        assert "refuse" in rec
+        assert rec.index("Narrow") < rec.index("export_query")
+
+    def test_large_result_on_hosted_mentions_download_not_disk(
+        self, mock_conn, mock_stage
+    ):
+        from oceanum_mcp.common.config import set_transport
+
+        mock_stage.return_value = make_stage(Container.Dataset, size=7_300_000_000)
+        try:
+            set_transport("http")
+            rec = json.loads(server.stage_query(datasource_id="test-ds"))[
+                "recommendation"
+            ]
+        finally:
+            set_transport("stdio")
+        assert "7.3 GB download" in rec
+        assert "ask the user before exporting" in rec
+        assert "disk" not in rec
+        assert "refuse" not in rec
+
+    def test_large_result_above_hosted_cap_says_export_refused(
+        self, mock_conn, mock_stage
+    ):
+        from oceanum_mcp.common.config import set_transport
+
+        mock_stage.return_value = make_stage(Container.Dataset, size=73_000_000_000)
+        try:
+            set_transport("http")
+            rec = json.loads(server.stage_query(datasource_id="test-ds"))[
+                "recommendation"
+            ]
+        finally:
+            set_transport("stdio")
+        assert "73.0 GB" in rec
+        assert "refuse" in rec
+        assert human_bytes(server.MAX_HOSTED_EXPORT_BYTES) in rec
+        assert "disk" not in rec
+        assert rec.index("Narrow") < rec.index("export_query")
+
     def test_row_cap_warning(self, mock_conn, mock_stage):
         mock_stage.return_value = make_stage(
             Container.DataFrame, size=10**9, dlen=3_000_000
@@ -356,6 +497,72 @@ class TestQueryData:
         assert len(parsed["data"]) == 100  # DEFAULT_MAX_INLINE_ROWS
         assert parsed["truncated"] is True
 
+    def test_full_aggregate_returns_scalars(self, mock_conn, mock_stage):
+        # OCE-320: aggregating over space and time yields a 0-d Dataset.
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = xr.Dataset(
+            {
+                "hs": ((), np.float32(2.25), {"units": "m"}),
+                "tp": ((), np.float64(9.5)),
+            }
+        )
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds",
+                variables=["hs", "tp"],
+                aggregate_operations=["mean"],
+                aggregate_spatial=True,
+                aggregate_temporal=True,
+            )
+        )
+        assert "error" not in parsed
+        assert mock_conn.query.call_args.args[0].aggregate is not None
+        assert parsed["data"] == [
+            {"name": "hs", "value": 2.25, "units": "m"},
+            {"name": "tp", "value": 9.5},
+        ]
+        assert parsed["preview"] is False
+        assert parsed["returned"] == 1
+        assert parsed["total"] == 1
+
+    def test_full_aggregate_over_inline_limit_returns_scalars(
+        self, mock_conn, mock_stage
+    ):
+        # A large staged size switches to use_dask; the 0-d result is still
+        # tiny and must come back as values, not a lazy summary.
+        mock_stage.return_value = make_stage(Container.Dataset, size=10**9)
+        mock_conn.query.return_value = xr.Dataset(
+            {"hs": ((), da.from_array(np.array(2.25)))}
+        )
+
+        parsed = json.loads(
+            server.query_data(datasource_id="test-ds", aggregate_operations=["max"])
+        )
+        assert mock_conn.query.call_args.kwargs["use_dask"] is True
+        assert parsed["lazy"] is False
+        assert parsed["data"] == [{"name": "hs", "value": 2.25}]
+        assert (parsed["preview"], parsed["returned"], parsed["total"]) == (
+            False,
+            1,
+            1,
+        )
+
+    def test_full_aggregate_with_limit_returns_scalars(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = xr.Dataset({"hs": ((), 2.25)})
+
+        parsed = json.loads(
+            server.query_data(
+                datasource_id="test-ds", aggregate_operations=["mean"], limit=3
+            )
+        )
+        assert mock_conn.query.call_args.args[0].limit is None
+        assert parsed["data"] == [{"name": "hs", "value": 2.25}]
+        # Nothing was cut: the single aggregate record is the full result.
+        assert parsed["preview"] is False
+        assert "no effect" in parsed["limit_note"]
+
 
 class TestExportQuery:
     def test_frame_to_parquet(self, mock_conn, mock_stage, tmp_path):
@@ -397,19 +604,188 @@ class TestExportQuery:
         assert parsed["format"] == "netcdf"
         assert mock_conn.query.call_args.kwargs["use_dask"] is True
 
-    def test_dataset_rejects_csv(self, mock_conn, mock_stage, tmp_path):
+    @pytest.mark.parametrize("fmt", ["csv", "parquet"])
+    def test_point_series_dataset_exports_tabular(
+        self, mock_conn, mock_stage, tmp_path, fmt
+    ):
         mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = _small_dataset()
+        dest = tmp_path / f"out.{fmt}"
 
-        with pytest.raises(ToolError, match="netcdf"):
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest), format=fmt)
+        )
+        assert parsed["format"] == fmt
+        df = pd.read_csv(dest) if fmt == "csv" else pd.read_parquet(dest)
+        assert list(df.columns) == ["time", "hs"]
+        assert df["hs"].tolist() == [1.0, 2.0, 3.0]
+
+    def test_flattened_size_checked_not_just_staged_size(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        # 3x4 float32 grid: 48 bytes staged, but flattening repeats both
+        # coordinates on every row (12 rows x 3 cols x 8 bytes = 288).
+        grid = xr.Dataset(
+            {"v": (("t", "x"), np.zeros((3, 4), dtype="float32"))},
+            coords={"t": [0, 1, 2], "x": [0, 1, 2, 3]},
+        )
+        mock_stage.return_value = make_stage(Container.Dataset, size=48)
+        mock_conn.query.return_value = grid
+        dest = tmp_path / "out.csv"
+
+        with patch.object(server, "MAX_EXPORT_FRAME_BYTES", 100):
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds", path=str(dest), format="csv"
+                )
+            )
+        assert parsed["refused"] is True
+        assert "too large to flatten" in parsed["message"]
+        assert not dest.exists()
+
+    def test_flatten_fetch_error_is_structured(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        lazy = MagicMock()
+        lazy.sizes = {"time": 3}
+        lazy.dims = {"time": 3}
+        lazy.data_vars = {"hs": None}
+        lazy.coords = {"time": None}
+        lazy.to_dataframe.side_effect = DatameshConnectError("chunk fetch failed")
+        mock_conn.query.return_value = lazy
+        dest = tmp_path / "out.parquet"
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds", path=str(dest), format="parquet"
+            )
+        )
+        assert "chunk fetch failed" in parsed["error"]
+        assert not dest.exists()
+
+    def test_large_gridded_dataset_rejects_csv(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(
+            Container.Dataset, size=server.MAX_EXPORT_FRAME_BYTES + 1
+        )
+
+        parsed = json.loads(
             server.export_query(
                 datasource_id="test-ds",
                 path=str(tmp_path / "out.csv"),
                 format="csv",
             )
+        )
+        assert parsed["refused"] is True
+        assert "gridded" in parsed["message"]
+        assert "too large" in parsed["message"]
+        assert "netcdf" in parsed["message"]
+        mock_conn.query.assert_not_called()
+
+    def test_dataset_above_local_cap_refused(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(
+            Container.Dataset, size=server.MAX_EXPORT_DATASET_BYTES + 1
+        )
+        dest = tmp_path / "out.nc"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        )
+        assert parsed["refused"] is True
+        assert "Narrow" in parsed["message"]
+        assert not dest.exists()
+        mock_conn.query.assert_not_called()
+
+    def test_insufficient_disk_refused(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=500_000_000)
+        dest = tmp_path / "sub" / "out.nc"
+
+        usage = MagicMock(free=400_000_000)
+        with patch.object(server.shutil, "disk_usage", return_value=usage) as du:
+            parsed = json.loads(
+                server.export_query(datasource_id="test-ds", path=str(dest))
+            )
+        # Probed on the nearest existing ancestor of a not-yet-created dir.
+        assert du.call_args.args[0] == tmp_path
+        assert parsed["refused"] is True
+        assert "free" in parsed["message"]
+        assert not dest.exists()
+        mock_conn.query.assert_not_called()
+
+    def test_disk_check_failure_is_structured(self, mock_conn, mock_stage, tmp_path):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        dest = tmp_path / "out.nc"
+
+        with patch.object(
+            server.shutil, "disk_usage", side_effect=PermissionError("denied")
+        ):
+            parsed = json.loads(
+                server.export_query(datasource_id="test-ds", path=str(dest))
+            )
+        assert "free disk space" in parsed["error"]
+        assert "denied" in parsed["error"]
+        assert parsed["query"]["datasource"] == "test-ds"
+        assert not dest.exists()
+        mock_conn.query.assert_not_called()
+
+    @pytest.mark.parametrize(
+        ("suffix", "magic"),
+        [
+            (".csv.gz", b"\x1f\x8b"),
+            (".csv.bz2", b"BZh"),
+            (".csv.xz", b"\xfd7zXZ\x00"),
+            (".csv.zip", b"PK\x03\x04"),
+        ],
+    )
+    def test_csv_compression_inferred_from_destination(
+        self, mock_conn, mock_stage, tmp_path, suffix, magic
+    ):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"temp": [15.0, 16.0]})
+        dest = tmp_path / f"out{suffix}"
+
+        server.export_query(datasource_id="test-ds", path=str(dest), format="csv")
+        assert dest.read_bytes().startswith(magic)
+        assert pd.read_csv(dest)["temp"].tolist() == [15.0, 16.0]
+        if suffix == ".csv.zip":
+            # The archive member is named after the destination, not a temp.
+            with zipfile.ZipFile(dest) as zf:
+                assert zf.namelist() == ["out.csv"]
+        assert list(tmp_path.iterdir()) == [dest]
+
+    def test_parquet_and_netcdf_written_in_their_formats(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100)
+        mock_conn.query.return_value = pd.DataFrame({"temp": [15.0]})
+        pq = tmp_path / "out.parquet"
+        server.export_query(datasource_id="test-ds", path=str(pq))
+        assert pq.read_bytes()[:4] == b"PAR1"
+        assert pd.read_parquet(pq)["temp"].tolist() == [15.0]
+
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        mock_conn.query.return_value = _small_dataset()
+        nc = tmp_path / "out.nc"
+        server.export_query(datasource_id="test-ds", path=str(nc))
+        assert nc.read_bytes()[:4] in (b"\x89HDF", b"CDF\x01", b"CDF\x02")
+        with xr.open_dataset(nc) as ds:
+            assert ds["hs"].values.tolist() == [1.0, 2.0, 3.0]
+        assert sorted(tmp_path.iterdir()) == [nc, pq]
 
     def test_path_required_on_stdio(self, mock_conn, mock_stage):
         with pytest.raises(ToolError, match="path is required"):
             server.export_query(datasource_id="test-ds")
+
+    @pytest.mark.parametrize("sentinel", ["null", ""])
+    def test_sentinel_path_treated_as_omitted(
+        self, mock_conn, mock_stage, tmp_path, monkeypatch, sentinel
+    ):
+        # Some MCP clients send "null" for an omitted optional param; it must
+        # not become a file literally named "null" in the working directory.
+        monkeypatch.chdir(tmp_path)
+        mock_conn.query.return_value = _small_dataset()
+        with pytest.raises(ToolError, match="path is required"):
+            server.export_query(datasource_id="test-ds", path=sentinel)
+        assert list(tmp_path.iterdir()) == []
+        mock_conn.query.assert_not_called()
 
     def test_refuses_overwrite(self, mock_conn, mock_stage, tmp_path):
         dest = tmp_path / "exists.nc"
@@ -452,6 +828,46 @@ class TestExportQuery:
         )
         assert "chunk fetch failed" in parsed["error"]
         assert not dest.exists()
+
+    @pytest.mark.parametrize("exc_type", [RuntimeError, KeyboardInterrupt])
+    def test_unexpected_failure_mid_write_removes_partial_file(
+        self, mock_conn, mock_stage, tmp_path, exc_type
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        dest = tmp_path / "out.nc"
+
+        def _partial_write(path, **kwargs):
+            path.write_bytes(b"partial")
+            raise exc_type("interrupted")
+
+        broken = MagicMock()
+        broken.to_netcdf.side_effect = _partial_write
+        mock_conn.query.return_value = broken
+
+        with pytest.raises(exc_type):
+            server.export_query(datasource_id="test-ds", path=str(dest))
+        assert not dest.exists()
+        assert list(tmp_path.iterdir()) == []  # no temp file left behind
+
+    def test_failed_overwrite_keeps_original_file(
+        self, mock_conn, mock_stage, tmp_path
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=100)
+        dest = tmp_path / "out.nc"
+        dest.write_bytes(b"original")
+
+        def _partial_write(path, **kwargs):
+            path.write_bytes(b"partial")
+            raise KeyboardInterrupt
+
+        broken = MagicMock()
+        broken.to_netcdf.side_effect = _partial_write
+        mock_conn.query.return_value = broken
+
+        with pytest.raises(KeyboardInterrupt):
+            server.export_query(datasource_id="test-ds", path=str(dest), overwrite=True)
+        assert dest.read_bytes() == b"original"
+        assert list(tmp_path.iterdir()) == [dest]
 
     def test_export_dir_confinement(self, mock_conn, mock_stage, tmp_path, monkeypatch):
         monkeypatch.setenv("OCEANUM_MCP_EXPORT_DIR", str(tmp_path / "allowed"))
@@ -619,6 +1035,68 @@ class TestExportQueryHosted:
         assert "download_url" in parsed
         assert "warning" in parsed and "Large download" in parsed["warning"]
 
+    def test_download_at_hosted_cap_still_returned(self, mock_conn):
+        at_cap = self._stage(size=server.MAX_HOSTED_EXPORT_BYTES)
+        with patch.object(server, "_download_stage", return_value=at_cap):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "download_url" in parsed
+        assert "refused" not in parsed
+        assert "Large download" in parsed["warning"]
+
+    def test_small_download_has_no_warning(self, mock_conn):
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "download_url" in parsed
+        assert "warning" not in parsed
+        assert "refused" not in parsed
+
+    def test_download_above_hosted_cap_refused_without_url(self, mock_conn):
+        size = server.MAX_HOSTED_EXPORT_BYTES + 1
+        huge = self._stage(container="dataset", size=size)
+        with patch.object(server, "_download_stage", return_value=huge):
+            raw = server.export_query(datasource_id="test-ds")
+        parsed = json.loads(raw)
+        assert parsed["refused"] is True
+        assert parsed["size_bytes"] == size
+        assert parsed["container"] == "dataset"
+        assert "Narrow" in parsed["message"]
+        assert human_bytes(server.MAX_HOSTED_EXPORT_BYTES) in parsed["message"]
+        assert parsed["query"]["datasource"] == "test-ds"
+        # The signed (bearer) URL must not leak in any field.
+        assert "download_url" not in parsed
+        assert "sig=xyz" not in raw and "oceanql" not in raw
+
+    def test_csv_cap_applies_to_estimated_text_size(self, mock_conn):
+        # 4 GB staged is below the cap as parquet but ~12 GB as CSV text.
+        stage = self._stage(size=4 * 10**9)
+        with patch.object(server, "_download_stage", return_value=stage):
+            as_csv = json.loads(
+                server.export_query(datasource_id="test-ds", format="csv")
+            )
+            as_parquet = json.loads(server.export_query(datasource_id="test-ds"))
+        assert as_csv["refused"] is True
+        assert "as csv" in as_csv["message"]
+        assert "download_url" not in as_csv
+        assert "download_url" in as_parquet
+
+    @pytest.mark.parametrize("size", [None, "n/a"])
+    def test_unknown_size_fails_closed(self, mock_conn, size):
+        stage = self._stage()
+        stage["size"] = size
+        with patch.object(server, "_download_stage", return_value=stage):
+            raw = server.export_query(datasource_id="test-ds")
+        parsed = json.loads(raw)
+        assert "download size" in parsed["error"]
+        assert "download_url" not in parsed
+        assert "sig=xyz" not in raw
+
+    def test_null_path_does_not_claim_path_ignored(self, mock_conn):
+        with patch.object(server, "_download_stage", return_value=self._stage()):
+            parsed = json.loads(
+                server.export_query(datasource_id="test-ds", path="null")
+            )
+        assert "ignored on hosted" not in parsed["note"]
+
     def test_no_data(self, mock_conn):
         with patch.object(server, "_download_stage", return_value=None):
             parsed = json.loads(server.export_query(datasource_id="test-ds"))
@@ -693,10 +1171,10 @@ class TestRegistration:
             "load_datasource",
             "update_metadata",
         }
-        assert tools["search_catalog"].annotations.readOnlyHint is True
-        assert tools["query_data"].annotations.readOnlyHint is True
-        assert tools["update_metadata"].annotations.destructiveHint is True
-        assert tools["update_metadata"].annotations.readOnlyHint is False
+        assert tools["search_catalog"].annotations.read_only_hint is True
+        assert tools["query_data"].annotations.read_only_hint is True
+        assert tools["update_metadata"].annotations.destructive_hint is True
+        assert tools["update_metadata"].annotations.read_only_hint is False
 
     async def test_docstrings_present(self):
         for tool in await server.mcp.list_tools():

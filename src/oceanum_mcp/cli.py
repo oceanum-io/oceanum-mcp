@@ -2,12 +2,48 @@
 
 import argparse
 import sys
+from typing import Any, TextIO
 
 SERVER_REGISTRY = {
     "datamesh": "oceanum_mcp.servers.datamesh.server",
     "storage": "oceanum_mcp.servers.storage.server",
     "combined": "oceanum_mcp.servers.combined.server",
 }
+
+
+class _StdoutGuard:
+    """sys.stdout stand-in while serving the stdio transport.
+
+    The MCP stdio transport writes JSON-RPC to sys.stdout.buffer, so any text
+    printed to stdout would corrupt the protocol stream. The oceanum library
+    print()s to stdout (e.g. its "new version available" notice on first
+    connect), so text writes go to stderr while .buffer stays the real stdout
+    for the transport.
+    """
+
+    def __init__(self, stdout: TextIO, stderr: TextIO) -> None:
+        self.buffer = stdout.buffer
+        self._stderr = stderr
+
+    def write(self, s: str) -> int:
+        return self._stderr.write(s)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._stderr, name)
+
+
+def _run_stdio(mcp_server: Any) -> None:
+    """Serve over stdio with nothing but JSON-RPC on stdout.
+
+    No banner: stdio clients surface stderr output as warnings, and the
+    banner also triggers a PyPI update check on every launch.
+    """
+    real_stdout = sys.stdout
+    sys.stdout = _StdoutGuard(real_stdout, sys.stderr)
+    try:
+        mcp_server.run(transport="stdio", show_banner=False)
+    finally:
+        sys.stdout = real_stdout
 
 
 def main():
@@ -126,4 +162,4 @@ def main():
             path=args.path or f"/{args.server}",
         )
     else:
-        mcp_server.run(transport=args.transport)
+        _run_stdio(mcp_server)

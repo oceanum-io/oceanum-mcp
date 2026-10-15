@@ -119,10 +119,12 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_MAX_INLINE_ROWS` | No       | Max rows/records previewed inline before truncation (default 100)               |
 | `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |
+| `OCEANUM_MCP_STAGE_TIMEOUT`   | No       | Seconds a Datamesh staging/query request may wait on the gateway before the tool returns a timeout error (default 120) |
 | `OCEANUM_MCP_AUTH`            | No       | Auth scheme for `--transport http`: `auto` (default), `datamesh`, `auth0`, or `none` |
 | `OCEANUM_MCP_AUTH0_DOMAIN`    | No       | Auth0 tenant domain for `auth0` mode (default: `auth.oceanum.io`)               |
 | `OCEANUM_MCP_AUTH0_AUDIENCE`  | No       | Auth0 API audience for `auth0` mode (default: `https://api.oceanum.io`)         |
 | `OCEANUM_MCP_PUBLIC_URL`      | No       | Externally visible base URL (e.g. `https://mcp.oceanum.io`); enables OAuth discovery metadata for claude.ai connectors |
+| `OCEANUM_MCP_CORS_ORIGINS`    | No       | Comma-separated browser origins allowed by CORS on http (default: `https://*.oceanum.io,https://*.oceanum.tech,https://vscode.dev`; empty string disables) |
 
 `DATAMESH_TOKEN` is required for the stdio transport (and for `--transport http`
 with `OCEANUM_MCP_AUTH=none`); in authenticated http mode each request carries
@@ -172,6 +174,7 @@ Notes:
   time-limited, self-authenticating gateway `download_url` that the caller
   fetches out-of-band. The `path` argument is ignored on hosted servers. The
   URL needs no credential, so it is a capability — treat it as a secret.
+  Hosted exports are capped at 10 GB to bound what one link can pull.
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance
@@ -195,6 +198,34 @@ Requests on a network transport never fall back to the server's
 `DATAMESH_TOKEN`: an unauthenticated request fails unless
 `OCEANUM_MCP_AUTH=none` was set explicitly.
 
+### Browser clients (CORS)
+
+Browser-based MCP clients send a CORS preflight (`OPTIONS`) before every
+cross-origin request. The http app answers preflights for an allowlist of
+origins, ahead of authentication (a preflight never carries a credential);
+all other requests still require one. Configure the allowlist with
+`OCEANUM_MCP_CORS_ORIGINS`, comma-separated:
+
+```bash
+OCEANUM_MCP_CORS_ORIGINS="https://*.oceanum.io,https://vscode.dev,http://localhost:6274"
+```
+
+- Unset: `https://*.oceanum.io`, `https://*.oceanum.tech` and
+  `https://vscode.dev`.
+- Empty string: CORS disabled — no CORS headers, preflights are not answered.
+- Each entry is an exact origin (`scheme://host[:port]`, no path). A leading
+  `*.` matches exactly one subdomain label: `https://*.oceanum.io` allows
+  `https://app.oceanum.io` but not `https://oceanum.io`,
+  `https://a.b.oceanum.io` or `https://oceanum.io.evil.com`. Bare `*`,
+  single-label wildcards (`https://*.io`) and malformed entries are rejected
+  at startup; a scheme-default port (`:443` on https) is dropped, as browsers
+  omit it. Multi-label public suffixes (`https://*.co.uk`,
+  `https://*.github.io`) cannot be detected — never configure them: they
+  would admit every site under that suffix.
+- Credentials travel in `Authorization` / `X-DATAMESH-TOKEN` headers, never
+  cookies, so `Access-Control-Allow-Credentials` is never sent.
+  `Mcp-Session-Id` and `WWW-Authenticate` are exposed to browser scripts.
+
 ### claude.ai custom connectors
 
 Set `OCEANUM_MCP_PUBLIC_URL` to the server's public base URL and the `auto`
@@ -216,6 +247,18 @@ code reads directly.
 
 Search the Datamesh catalog with optional text search, time range, and bounding box filters.
 Returns a JSON object with `count` and `results`; if `count` equals `limit`, more matches may exist.
+Only datasources accessible to the request's credentials are searched. An empty or short
+(below `limit`, with nothing `omitted`) result carries a fixed `scope` note saying a missing datasource either does
+not exist or is not accessible with these credentials; it never reveals whether, how many,
+or which inaccessible datasources exist.
+
+By default each result is a compact summary: `id`, `name`, a `description`
+cut to 200 characters, `tstart`/`tend`, `bounds`, variable names when the
+catalog provides them (first 20, with `variables_total`), and short `tags`
+(with `tags_total`). `detail="full"` returns each datasource's complete
+catalog record instead. The total output is bounded (~30k characters for
+summaries, ~100k for full records): matches beyond the bound are dropped,
+counted in `omitted`, and a note asks to refine the search.
 
 | Parameter    | Type        | Description                                      |
 | ------------ | ----------- | ------------------------------------------------ |
@@ -224,14 +267,28 @@ Returns a JSON object with `count` and `results`; if `count` equals `limit`, mor
 | `time_end`   | string      | ISO 8601 end time                                |
 | `bbox`       | list[float] | Bounding box `[xmin, ymin, xmax, ymax]` in WGS84 |
 | `limit`      | int         | Max results to return (default 20)               |
+| `detail`     | string      | `summary` (default) or `full`                    |
 
 ### `get_datasource_info`
 
-Get full metadata for a datasource including schema, variables, coordinates, and attributes.
+Get the metadata for a datasource: coverage, schema dims and coordinates,
+variables, and attributes.
 
-| Parameter       | Type   | Description   |
-| --------------- | ------ | ------------- |
-| `datasource_id` | string | Datasource ID |
+The default (`detail="summary"`) is a bounded view with the same fields and
+shape as the full record. Each variable and coordinate keeps its `dims`,
+`shape`, `dtype` and `units`/`long_name`/`standard_name`; other attributes are
+capped at 8 per variable (with `attrs_omitted`), global `attributes` and
+`info` at 25 entries, and long values are clipped to 200 characters. If the
+view still exceeds ~60k characters, each variable and coordinate keeps only
+`dims`, `shape`, `dtype` and `units`/`long_name`/`standard_name`; every
+variable is listed either way. `schema.data_vars`/`schema.attrs` are omitted
+as duplicates of `variables`/`attributes`. `detail="full"` returns the
+complete record.
+
+| Parameter       | Type   | Description                   |
+| --------------- | ------ | ----------------------------- |
+| `datasource_id` | string | Datasource ID                 |
+| `detail`        | string | `summary` (default) or `full` |
 
 ### `stage_query`
 
@@ -256,7 +313,7 @@ refused with the staged size and alternatives. Library warnings (e.g. the
 | `time_start`           | string       | ISO 8601 start of a time range (open-ended if omitted)             |
 | `time_end`             | string       | ISO 8601 end of a time range (open-ended if omitted)               |
 | `times`                | list[string] | Discrete times (series selection); excludes `time_start`/`time_end`|
-| `time_resolution`      | string       | Server-side temporal downsampling (pandas frequency, e.g. `1D`)    |
+| `time_resolution`      | string       | Server-side temporal downsampling (pandas frequency, e.g. `1h`, `1D`, `30D`; not `MS`/`ME`/`QS`/`YS` or finer than 1 minute) |
 | `time_resample`        | string       | Resampling method for `time_resolution`: mean, nearest, linear     |
 | `bbox`                 | list[float]  | Bounding box `[xmin, ymin, xmax, ymax]`                            |
 | `geofilter_feature`    | object       | GeoJSON Feature (Point, MultiPoint, or Polygon) for selection      |
@@ -271,7 +328,16 @@ refused with the staged size and alternatives. Library warnings (e.g. the
 | `aggregate_operations` | list[string] | Aggregation ops: mean, min, max, std, sum                          |
 | `aggregate_spatial`    | bool         | Aggregate over spatial dims (default true)                         |
 | `aggregate_temporal`   | bool         | Aggregate over temporal dims (default true)                        |
-| `limit`                | int          | Max rows to return                                                 |
+| `limit`                | int          | Keep the last N records (see below)                                |
+
+`limit` keeps the last N records (Datamesh semantics: the last N steps along
+time/ensemble), with the same meaning in `stage_query`, `query_data`, and
+`export_query`. Combined with `time_resolution` or `aggregate_operations` it is
+applied by this server **after** resampling/aggregation instead of being sent
+to Datamesh (which would apply it to the native records first), so
+`stage_query` reports the unlimited size as an upper bound. Hosted
+`export_query` cannot apply it to a gateway download and refuses that
+combination: drop `limit` or narrow the time range.
 
 ### `export_query`
 
@@ -283,6 +349,9 @@ large to return inline. Behaviour depends on transport:
   write Parquet or CSV.
 - **Hosted (http/sse):** returns a time-limited, self-authenticating gateway
   `download_url` (choose `format`; `path` is ignored). Fetch it out-of-band.
+  Results above 10 GB (for CSV, the estimated text size, about 3x the staged
+  size) are refused (narrow the query); above 2 GB the link is returned with
+  a large-download warning.
 
 Accepts the same query parameters as `query_data` plus:
 
@@ -381,7 +450,7 @@ Get metadata about a file or directory.
 **Shrink a 40-year hourly time series to something inline-sized:**
 
 1. `stage_query(datasource_id="hindcast", variables=["Hs"], time_start="1984-01-01", time_end="2024-01-01")` — too large
-2. `query_data(..., time_resolution="1MS", time_resample="mean")` — monthly means, small enough to return inline
+2. `query_data(..., time_resolution="30D", time_resample="mean")` — roughly monthly means, small enough to return inline (calendar aliases such as `"1MS"` are refused until a Datamesh engine fix ships: the engine currently reads `"1MS"` as 1 millisecond)
 
 **Browse and read files in cloud storage:**
 

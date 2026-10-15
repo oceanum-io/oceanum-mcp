@@ -13,13 +13,48 @@ Usage:
 from __future__ import annotations
 
 import importlib
+import re
 from typing import Any
 
 from starlette.applications import Starlette
+from starlette.middleware.cors import CORSMiddleware
 
 from oceanum_mcp.cli import SERVER_REGISTRY
 from oceanum_mcp.common.auth import DatameshHeaderMiddleware, build_auth_provider
-from oceanum_mcp.common.config import set_transport
+from oceanum_mcp.common.config import DNS_LABEL, cors_origins, set_transport
+
+# What the MCP streamable-HTTP transport sends cross-origin: POST for
+# messages, GET for the server event stream, DELETE to end a session.
+CORS_ALLOW_METHODS = ["GET", "POST", "DELETE", "OPTIONS"]
+CORS_ALLOW_HEADERS = [
+    "Authorization",
+    "Content-Type",
+    "X-DATAMESH-TOKEN",
+    "Mcp-Session-Id",
+    "MCP-Protocol-Version",
+    "Last-Event-ID",
+]
+# Mcp-Session-Id must be readable for stateful sessions; WWW-Authenticate
+# lets a browser OAuth client find the resource metadata from a 401.
+CORS_EXPOSE_HEADERS = ["Mcp-Session-Id", "WWW-Authenticate"]
+CORS_MAX_AGE = 3600
+
+
+def cors_origin_regex(origins: list[str]) -> str | None:
+    """Anchored regex matching the wildcard (``*.``) origins in the list.
+
+    Exact origins are left to Starlette's plain ``allow_origins`` membership
+    check. Literal parts are escaped, so dots only match dots; "*." becomes
+    exactly one DNS label (no dots, so it never spans several). Starlette
+    applies it with fullmatch, so no suffix
+    (``https://app.oceanum.io.evil.com``) can slip through.
+    """
+    parts = []
+    for origin in origins:
+        scheme, _, host = origin.partition("://")
+        if host.startswith("*."):
+            parts.append(re.escape(f"{scheme}://") + DNS_LABEL + re.escape(host[1:]))
+    return f"(?:{'|'.join(parts)})" if parts else None
 
 
 def create_http_app(
@@ -57,4 +92,20 @@ def create_http_app(
     # passed to http_app() inside its auth middleware, where the header
     # promotion would run only after authentication already failed.
     app.add_middleware(DatameshHeaderMiddleware)
+    # Added last so it is outermost of all: a browser preflight carries no
+    # credential, so it must be answered before auth (or the header
+    # promotion) ever sees it. Credentials travel in headers, never cookies,
+    # hence allow_credentials=False.
+    origins = cors_origins()
+    if origins:
+        app.add_middleware(
+            CORSMiddleware,
+            allow_origins=[o for o in origins if "*" not in o],
+            allow_origin_regex=cors_origin_regex(origins),
+            allow_methods=CORS_ALLOW_METHODS,
+            allow_headers=CORS_ALLOW_HEADERS,
+            expose_headers=CORS_EXPOSE_HEADERS,
+            allow_credentials=False,
+            max_age=CORS_MAX_AGE,
+        )
     return app
