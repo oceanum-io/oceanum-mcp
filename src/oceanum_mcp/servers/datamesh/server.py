@@ -2073,7 +2073,7 @@ def export_query(
     - Hosted (http/sse): returns a time-limited, self-authenticating gateway
       download_url (choose format via `format`); `path` is ignored. Fetch the
       URL out-of-band — it needs no credential, so treat it as a secret. When
-      the response includes expires_at and max_uses, fetch it before
+      the response includes expires_at or max_uses, fetch it before
       expires_at and at most max_uses times. Refused above the hosted export
       cap, and for limit combined with time_resolution/aggregate_operations.
     - Local (stdio): writes the result to the local file `path` (required) and

@@ -169,10 +169,9 @@ Notes:
   time-limited, self-authenticating gateway `download_url` that the caller
   fetches out-of-band. The `path` argument is ignored on hosted servers. The
   URL needs no credential, so it is a capability — treat it as a secret.
-  Gateways with scoped download links (OCE-317) also limit it: by default it
-  expires after 60 minutes, allows 3 fetches (`expires_at` and `max_uses` in
-  the response), and stops working if the organisation's Datamesh token
-  changes.
+  Gateways with scoped download links (OCE-317) also limit its lifetime and
+  number of fetches; the response then reports them as `expires_at` and
+  `max_uses`.
   Hosted exports are capped at 10 GB to bound what one link can pull.
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
@@ -348,9 +347,8 @@ large to return inline. Behaviour depends on transport:
   write Parquet or CSV.
 - **Hosted (http/sse):** returns a time-limited, self-authenticating gateway
   `download_url` (choose `format`; `path` is ignored). Fetch it out-of-band.
-  When the response includes `expires_at` and `max_uses` (gateways with
-  scoped links), fetch it before `expires_at` and at most `max_uses` times
-  (by default 60 minutes and 3 fetches).
+  When the response includes `expires_at` or `max_uses` (gateways with
+  scoped links), fetch it before `expires_at` and at most `max_uses` times.
   Results above 10 GB (for CSV, the estimated text size, about 3x the staged
   size) are refused (narrow the query); above 2 GB the link is returned with
   a large-download warning.
