@@ -1002,6 +1002,50 @@ class TestExportQueryHosted:
         assert "max_uses" not in parsed
         assert parsed["note"].startswith("Time-limited, self-authenticating")
 
+    def test_partial_scope_expiry_only(self, mock_conn):
+        stage = self._stage()
+        stage["url_expires_at"] = "2026-10-07T04:00:00+00:00"
+        with patch.object(server, "_download_stage", return_value=stage):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["expires_at"] == "2026-10-07T04:00:00+00:00"
+        assert "max_uses" not in parsed
+        assert "valid until 2026-10-07T04:00:00+00:00" in parsed["note"]
+        assert "fetches" not in parsed["note"]
+
+    def test_partial_scope_max_uses_only_coerced(self, mock_conn):
+        stage = self._stage()
+        stage["url_max_uses"] = "3"
+        with patch.object(server, "_download_stage", return_value=stage):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["max_uses"] == 3
+        assert "expires_at" not in parsed
+        assert "for 3 fetches" in parsed["note"]
+        assert "download it once" in parsed["note"]
+
+    def test_null_scope_fields_are_unscoped(self, mock_conn):
+        stage = self._stage()
+        stage["url_expires_at"] = None
+        stage["url_max_uses"] = None
+        with patch.object(server, "_download_stage", return_value=stage):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "expires_at" not in parsed
+        assert "max_uses" not in parsed
+        assert parsed["note"].startswith("Time-limited, self-authenticating")
+
+    def test_refused_scoped_link_leaks_nothing(self, mock_conn):
+        stage = self._stage(
+            size=server.MAX_HOSTED_EXPORT_BYTES + 1,
+            url="https://datamesh.oceanum.io/oceanql/abc$?dl=SECRET",
+        )
+        stage["url_expires_at"] = "2026-10-07T04:00:00+00:00"
+        stage["url_max_uses"] = 3
+        with patch.object(server, "_download_stage", return_value=stage):
+            raw = server.export_query(datasource_id="test-ds")
+        parsed = json.loads(raw)
+        assert parsed["refused"] is True
+        assert "SECRET" not in raw
+        assert "expires_at" not in parsed and "max_uses" not in parsed
+
     def test_path_ignored_on_hosted(self, mock_conn, tmp_path):
         # A path arg does not cause a local write on hosted; a URL is returned
         # and the response signals the path was ignored.

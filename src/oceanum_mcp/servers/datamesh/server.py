@@ -1711,7 +1711,7 @@ def _export_download_url(
     format: Literal["netcdf", "parquet", "csv"] | None,
     requested_path: str | None = None,
 ) -> str:
-    """Hosted export: return a signed gateway download URL, no local file.
+    """Hosted export: return a gateway download URL, no local file.
 
     The gateway stages the result and returns a self-authenticating URL; the
     data never touches this server's disk or the conversation. The caller (or
@@ -1766,7 +1766,7 @@ def _export_download_url(
     est = int(size * _EXPORT_DISK_FACTOR["csv"]) if fmt == "csv" else size
     if est > MAX_HOSTED_EXPORT_BYTES:
         # Same shape as _refusal; the gateway's download stage has no dlen.
-        # The signed URL is withheld: it is a bearer credential (OCE-299).
+        # The URL is withheld: it is a bearer credential (OCE-299).
         as_fmt = f" (about {human_bytes(est)} as {fmt})" if fmt == "csv" else ""
         return to_json(
             {
@@ -1786,15 +1786,28 @@ def _export_download_url(
     url = stage["url"]
     sep = "&" if "?" in url else "?"
     download_url = f"{url}{sep}f={gateway_fmt}"
-    # OCE-317 gateways report the link's scope; older ones do not.
+    # OCE-317 gateways report the link's scope; older ones do not. Report
+    # each field on its own so a partial response still surfaces what it has.
     expires_at = stage.get("url_expires_at")
-    max_uses = stage.get("url_max_uses")
-    if expires_at and max_uses:
+    expires_at = str(expires_at) if expires_at is not None else None
+    try:
+        max_uses = int(stage["url_max_uses"])
+    except (KeyError, TypeError, ValueError):
+        max_uses = None
+    scope = []
+    if expires_at is not None:
+        scope.append(f"valid until {expires_at}")
+    if max_uses is not None:
+        scope.append(
+            f"for {max_uses} fetches; every fetch counts, whatever the format, "
+            "and a failed or retried fetch may use one up, so download it once "
+            "rather than probing it first"
+        )
+    if scope:
         note = (
             "Self-authenticating download link (it needs no token, so treat "
-            f"it like a password), valid until {expires_at} for {max_uses} "
-            "fetches; every fetch counts, whatever the format. Fetch it "
-            "out-of-band; the data is not returned inline."
+            f"it like a password), {' '.join(scope)}. Fetch it out-of-band; "
+            "the data is not returned inline."
         )
     else:
         note = (
@@ -1814,8 +1827,9 @@ def _export_download_url(
         "note": note,
         "query": _query_echo(query),
     }
-    if expires_at and max_uses:
+    if expires_at is not None:
         out["expires_at"] = expires_at
+    if max_uses is not None:
         out["max_uses"] = max_uses
     if size > LARGE_DOWNLOAD_BYTES:
         out["warning"] = (
@@ -2328,7 +2342,7 @@ _append_doc_sections(
 {_QUERY_PARAM_DOCS}
 
     Returns:
-        Hosted: JSON with a signed download_url, format, size, container, and
+        Hosted: JSON with a self-authenticating download_url, format, size, container, and
         available_formats (or a refused object, with no URL, above the hosted
         cap). Local: JSON with the written path, format, bytes_written, a
         structure summary, and any limit_note. Neither returns inline values.
