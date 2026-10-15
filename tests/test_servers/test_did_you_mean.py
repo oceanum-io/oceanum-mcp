@@ -97,7 +97,8 @@ class TestGetDatasourceInfoNotFound:
 
         parsed = json.loads(server.get_datasource_info("era5_wave_glob"))
 
-        assert "not found" in parsed["error"]
+        # A 404 must not assert non-existence (OCE-297).
+        assert "not found or not accessible with these credentials" in (parsed["error"])
         ids = [s["id"] for s in parsed["suggestions"]]
         assert ids[0] == "era5_wave_global"
         assert "gebco_bathymetry" not in ids
