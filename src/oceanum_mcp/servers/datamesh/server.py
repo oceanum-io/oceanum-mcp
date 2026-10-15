@@ -120,8 +120,9 @@ LARGE_DOWNLOAD_BYTES = 2_000_000_000
 
 # Above this staged size hosted export refuses to return a download link
 # (OCE-299). The link is a bearer URL: anyone holding it can fetch the data
-# with no credential until it expires, so until the gateway issues scoped
-# links (OCE-317) this bounds what one leaked link, or one runaway agent call,
+# with no credential. OCE-317 gateways scope it (by default 60 minutes, 3
+# fetches, revoked if the org's token changes), but even within that scope
+# this still bounds what one leaked link, or one runaway agent call,
 # can pull. Equal to the local dataset cap (MAX_EXPORT_DATASET_BYTES) so an
 # export that works on stdio also works hosted; 2-10 GB stays warn-and-allow.
 MAX_HOSTED_EXPORT_BYTES = MAX_EXPORT_DATASET_BYTES
@@ -346,9 +347,10 @@ def _download_stage(conn: Connector, query: Query) -> dict[str, Any] | None:
     """Stage a query for download, returning the gateway's response dict.
 
     POSTs to the gateway's /oceanql/download/ endpoint, which the oceanum<2
-    library does not wrap. The response carries a self-authenticating signed
-    `url` (append `&f=<format>` to pick a format), plus `formats`, `size`, and
-    `container`. Mirrors Connector._stage_request's auth/error handling.
+    library does not wrap. The response carries a self-authenticating `url`
+    (append `&f=<format>` to pick a format), plus `formats`, `size`, and
+    `container`; OCE-317 gateways add the link's `url_expires_at` and
+    `url_max_uses`. Mirrors Connector._stage_request's auth/error handling.
     Returns None when no data matches (HTTP 204). Bounded by
     OCEANUM_MCP_STAGE_TIMEOUT like _stage.
     """
@@ -1709,7 +1711,7 @@ def _export_download_url(
     format: Literal["netcdf", "parquet", "csv"] | None,
     requested_path: str | None = None,
 ) -> str:
-    """Hosted export: return a signed gateway download URL, no local file.
+    """Hosted export: return a gateway download URL, no local file.
 
     The gateway stages the result and returns a self-authenticating URL; the
     data never touches this server's disk or the conversation. The caller (or
@@ -1764,7 +1766,7 @@ def _export_download_url(
     est = int(size * _EXPORT_DISK_FACTOR["csv"]) if fmt == "csv" else size
     if est > MAX_HOSTED_EXPORT_BYTES:
         # Same shape as _refusal; the gateway's download stage has no dlen.
-        # The signed URL is withheld: it is a bearer credential (OCE-299).
+        # The URL is withheld: it is a bearer credential (OCE-299).
         as_fmt = f" (about {human_bytes(est)} as {fmt})" if fmt == "csv" else ""
         return to_json(
             {
@@ -1779,16 +1781,40 @@ def _export_download_url(
                 "query": _query_echo(query),
             }
         )
-    # The signed URL is a capability: append the format token, keeping the
-    # signature intact. Use '?' if the URL has no query string yet, else '&'.
+    # The URL is a capability: append the format token, keeping its
+    # credential intact. Use '?' if the URL has no query string yet, else '&'.
     url = stage["url"]
     sep = "&" if "?" in url else "?"
     download_url = f"{url}{sep}f={gateway_fmt}"
-    note = (
-        "Time-limited, self-authenticating download link (it needs no "
-        "token, so treat it like a password). Fetch it out-of-band; the "
-        "data is not returned inline."
-    )
+    # OCE-317 gateways report the link's scope; older ones do not. Report
+    # each field on its own so a partial response still surfaces what it has.
+    expires_at = stage.get("url_expires_at")
+    expires_at = str(expires_at) if expires_at is not None else None
+    try:
+        max_uses = int(stage["url_max_uses"])
+    except (KeyError, TypeError, ValueError):
+        max_uses = None
+    scope = []
+    if expires_at is not None:
+        scope.append(f"valid until {expires_at}")
+    if max_uses is not None:
+        scope.append(
+            f"for {max_uses} fetches; every fetch counts, whatever the format, "
+            "and a failed or retried fetch may use one up, so download it once "
+            "rather than probing it first"
+        )
+    if scope:
+        note = (
+            "Self-authenticating download link (it needs no token, so treat "
+            f"it like a password), {' '.join(scope)}. Fetch it out-of-band; "
+            "the data is not returned inline."
+        )
+    else:
+        note = (
+            "Time-limited, self-authenticating download link (it needs no "
+            "token, so treat it like a password). Fetch it out-of-band; the "
+            "data is not returned inline."
+        )
     if requested_path is not None:
         note += " (The path argument is ignored on hosted servers.)"
     out: dict[str, Any] = {
@@ -1801,6 +1827,10 @@ def _export_download_url(
         "note": note,
         "query": _query_echo(query),
     }
+    if expires_at is not None:
+        out["expires_at"] = expires_at
+    if max_uses is not None:
+        out["max_uses"] = max_uses
     if size > LARGE_DOWNLOAD_BYTES:
         out["warning"] = (
             f"Large download ({human_bytes(size)}); ensure the consumer can "
@@ -2042,9 +2072,10 @@ def export_query(
     Behavior depends on how the server is running:
     - Hosted (http/sse): returns a time-limited, self-authenticating gateway
       download_url (choose format via `format`); `path` is ignored. Fetch the
-      URL out-of-band — it needs no credential, so treat it as a secret.
-      Refused above the hosted export cap, and for limit combined with
-      time_resolution/aggregate_operations.
+      URL out-of-band — it needs no credential, so treat it as a secret. When
+      the response includes expires_at or max_uses, fetch it before
+      expires_at and at most max_uses times. Refused above the hosted export
+      cap, and for limit combined with time_resolution/aggregate_operations.
     - Local (stdio): writes the result to the local file `path` (required) and
       returns that path. Gridded datasets stream to NetCDF; tabular results
       write Parquet or CSV, as do datasets small enough to flatten into a
@@ -2311,7 +2342,7 @@ _append_doc_sections(
 {_QUERY_PARAM_DOCS}
 
     Returns:
-        Hosted: JSON with a signed download_url, format, size, container, and
+        Hosted: JSON with a self-authenticating download_url, format, size, container, and
         available_formats (or a refused object, with no URL, above the hosted
         cap). Local: JSON with the written path, format, bytes_written, a
         structure summary, and any limit_note. Neither returns inline values.
