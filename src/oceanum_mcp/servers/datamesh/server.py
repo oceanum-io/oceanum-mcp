@@ -120,9 +120,9 @@ LARGE_DOWNLOAD_BYTES = 2_000_000_000
 
 # Above this staged size hosted export refuses to return a download link
 # (OCE-299). The link is a bearer URL: anyone holding it can fetch the data
-# with no credential. Since OCE-317 the gateway scopes it (by default 60
-# minutes, 3 fetches, revoked if the org's token changes), but within that
-# scope this still bounds what one leaked link, or one runaway agent call,
+# with no credential. OCE-317 gateways scope it (by default 60 minutes, 3
+# fetches, revoked if the org's token changes), but even within that scope
+# this still bounds what one leaked link, or one runaway agent call,
 # can pull. Equal to the local dataset cap (MAX_EXPORT_DATASET_BYTES) so an
 # export that works on stdio also works hosted; 2-10 GB stays warn-and-allow.
 MAX_HOSTED_EXPORT_BYTES = MAX_EXPORT_DATASET_BYTES
@@ -2056,11 +2056,12 @@ def export_query(
     """Export the FULL result of a query — the data never enters the conversation.
 
     Behavior depends on how the server is running:
-    - Hosted (http/sse): returns a short-lived, use-limited, self-authenticating
-      gateway download_url (choose format via `format`); `path` is ignored.
-      Fetch the URL out-of-band, before expires_at and at most max_uses times
-      — it needs no credential, so treat it as a secret. Refused above the hosted export cap, and for limit combined with
-      time_resolution/aggregate_operations.
+    - Hosted (http/sse): returns a time-limited, self-authenticating gateway
+      download_url (choose format via `format`); `path` is ignored. Fetch the
+      URL out-of-band — it needs no credential, so treat it as a secret. When
+      the response includes expires_at and max_uses, fetch it before
+      expires_at and at most max_uses times. Refused above the hosted export
+      cap, and for limit combined with time_resolution/aggregate_operations.
     - Local (stdio): writes the result to the local file `path` (required) and
       returns that path. Gridded datasets stream to NetCDF; tabular results
       write Parquet or CSV, as do datasets small enough to flatten into a
