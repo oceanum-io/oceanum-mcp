@@ -259,7 +259,7 @@ By default each result is a compact summary: `id`, `name`, a `description`
 cut to 200 characters, `tstart`/`tend`, `bounds` (rounded outward to 4
 decimals), variable names when the catalog provides them (first 20, with
 `variables_total`), and the first 5 `tags` (each clipped to 60 characters,
-with `tags_total`). Non-finite bounds are `null`.
+with `tags_total`). Unusable bounds (empty or non-finite) are `null`.
 `detail="full"` returns each datasource's complete catalog record instead.
 The response is compact JSON, and its total size is bounded (~20k characters
 for summaries, ~100k for full records): matches beyond the bound are dropped,
@@ -268,13 +268,14 @@ counted in `omitted`, and a note asks to refine the search.
 The catalog ranks datasources by fuzzy similarity to the search text and
 returns the closest ones even when none contains it. With search text, the
 response therefore carries `text_matches`: how many results have every
-search word (or its singular) in their id, name, description, tags, labels
-or variable names. `or` separates alternatives and negated words (`-era5`,
+search word (as a whole word, singular or plural) in their id, name, description, tags, labels
+or variable names. `or` separates alternatives and negated words or phrases (`-era5`, `-"era5 grid"`,
 `not era5`) are ignored. This count is only a signal: no result is dropped
 for failing it, but results that fail are marked `"text_match": false`, and
 a `text_note` ahead of the results explains. If no result contains the text
-literally (`text_matches: 0`), every result is still returned but as `id` and
-`name` only, with a `text_note` first and no `scope` note.
+as whole words (`text_matches: 0`), every result is still returned, but in
+summary mode as `id` and `name` only, with a `text_note` first and no
+`scope` note.
 
 | Parameter    | Type        | Description                                      |
 | ------------ | ----------- | ------------------------------------------------ |
