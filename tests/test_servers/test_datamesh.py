@@ -193,22 +193,36 @@ class TestSearchCatalogTextMatches:
     @pytest.mark.parametrize(
         "search", ["qzxvbn", "fake", "wave_fake", '"oceanum_wave_fake_v9"']
     )
-    def test_zero_matches_returns_no_fallback(self, mock_conn, search):
+    def test_zero_matches_shrinks_to_a_few_fuzzy_results(self, mock_conn, search):
         mock_conn.get_catalog.return_value = _mock_catalog(FUZZY_PAGE)
 
         out = server.search_catalog(search=search)
         parsed = json.loads(out)
 
         assert parsed["text_matches"] == 0
-        assert parsed["count"] == 0
-        assert parsed["results"] == []
-        assert "No datasource matched the search text" in parsed["message"]
-        assert "20 closest results" in parsed["message"]
-        assert parsed["scope"] == server._ACCESS_SCOPE
-        assert "buoy" not in out
-        assert len(out) < 1_000
+        assert parsed["count"] == server.ZERO_TEXT_MATCH_SHOWN
+        assert [r["id"] for r in parsed["results"]] == [
+            f"buoy-{i}" for i in range(server.ZERO_TEXT_MATCH_SHOWN)
+        ]
+        note = parsed["text_note"]
+        assert "None of the catalog's 20 closest results" in note
+        assert "not text matches" in note
+        assert "raise limit" in note
+        keys = list(parsed)
+        assert keys.index("text_note") < keys.index("results")
+        assert len(out) < 3_000
 
-    def test_matches_counted_and_listed_first(self, mock_conn):
+    def test_zero_matches_on_empty_catalog(self, mock_conn):
+        mock_conn.get_catalog.return_value = _mock_catalog([])
+
+        parsed = json.loads(server.search_catalog(search="qzxvbn"))
+
+        assert parsed["text_matches"] == 0
+        assert parsed["results"] == []
+        assert "No datasources found" in parsed["message"]
+        assert "text_note" not in parsed
+
+    def test_partial_matches_flagged_in_catalog_order(self, mock_conn):
         hit = _mock_datasource(id="era5-swell", description="ERA5 swell hindcast")
         mock_conn.get_catalog.return_value = _mock_catalog(
             [FUZZY_PAGE[0], hit, FUZZY_PAGE[1]]
@@ -219,11 +233,12 @@ class TestSearchCatalogTextMatches:
         assert parsed["text_matches"] == 1
         assert parsed["count"] == 3
         assert [r["id"] for r in parsed["results"]] == [
-            "era5-swell",
             "buoy-0",
+            "era5-swell",
             "buoy-1",
         ]
-        assert "first 1 results contain the search text" in parsed["text_note"]
+        assert [r.get("text_match") for r in parsed["results"]] == [False, None, False]
+        assert "1 of the catalog's 3 closest results" in parsed["text_note"]
         keys = list(parsed)
         assert keys.index("text_matches") < keys.index("text_note")
         assert keys.index("text_note") < keys.index("results")
@@ -236,17 +251,16 @@ class TestSearchCatalogTextMatches:
         assert parsed["text_matches"] == 3
         assert parsed["count"] == 3
         assert "text_note" not in parsed
+        assert all("text_match" not in r for r in parsed["results"])
 
     def test_every_word_must_match(self, mock_conn):
         # Words may match different fields (here the id and the tags).
         mock_conn.get_catalog.return_value = _mock_catalog(FUZZY_PAGE[:2])
 
-        assert (
-            json.loads(server.search_catalog(search="buoy-1 wave"))["text_matches"] == 1
-        )
-        assert (
-            json.loads(server.search_catalog(search="buoy fake"))["text_matches"] == 0
-        )
+        parsed = json.loads(server.search_catalog(search="buoy-1 wave"))
+        assert parsed["text_matches"] == 1
+        parsed = json.loads(server.search_catalog(search="buoy fake"))
+        assert parsed["text_matches"] == 0
 
     def test_or_separates_alternatives(self, mock_conn):
         mock_conn.get_catalog.return_value = _mock_catalog(FUZZY_PAGE[:3])
@@ -254,9 +268,50 @@ class TestSearchCatalogTextMatches:
         parsed = json.loads(server.search_catalog(search="fake or buoy-2"))
 
         assert parsed["text_matches"] == 1
-        assert parsed["results"][0]["id"] == "buoy-2"
+        assert parsed["results"][2]["id"] == "buoy-2"
+        assert "text_match" not in parsed["results"][2]
 
-    @pytest.mark.parametrize("search", [None, "", "or"])
+    @pytest.mark.parametrize(
+        "search", ["wave -era5", "wave not era5", "wave and -era5"]
+    )
+    def test_negated_words_are_not_required(self, mock_conn, search):
+        ds = _mock_datasource(id="gfs-wave", name="GFS wave forecast")
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        parsed = json.loads(server.search_catalog(search=search))
+
+        assert parsed["text_matches"] == 1
+
+    @pytest.mark.parametrize("search", ["waves", "Wave", "buoys", "bathymetries"])
+    def test_plural_matches_singular(self, mock_conn, search):
+        ds = _mock_datasource(
+            id="ds", name="Wave buoy", description="Gridded bathymetry"
+        )
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        parsed = json.loads(server.search_catalog(search=search))
+
+        assert parsed["text_matches"] == 1
+
+    def test_match_on_variable_name(self, mock_conn):
+        schema = MagicMock(data_vars={"hs": {}, "tp": {}, "dpm": {}})
+        ds = _mock_datasource(id="ds", name="Hindcast", dataschema=schema)
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        parsed = json.loads(server.search_catalog(search="tp"))
+
+        assert parsed["text_matches"] == 1
+        assert parsed["count"] == 1
+
+    def test_non_ascii_words(self, mock_conn):
+        ds = _mock_datasource(id="ds", name="Estación meteorológica Quellón")
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        parsed = json.loads(server.search_catalog(search="Quellón estación"))
+
+        assert parsed["text_matches"] == 1
+
+    @pytest.mark.parametrize("search", [None, "", "or", "-era5"])
     def test_no_count_without_search_words(self, mock_conn, search):
         mock_conn.get_catalog.return_value = _mock_catalog(FUZZY_PAGE[:2])
 

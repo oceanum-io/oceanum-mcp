@@ -197,6 +197,8 @@ class TestSearchCatalogSummary:
             "tend",
             "variables",
             "variables_total",
+            "tags",
+            "tags_total",
         }
         for dumped in ("schema", "attributes", "info", "coordinates", "labels"):
             assert dumped not in hit
@@ -238,14 +240,33 @@ class TestSearchCatalogSummary:
         hit = _search(mock_conn, [ds])["results"][0]
         assert "variables" not in hit
 
-    def test_tags_left_out(self, mock_conn):
+    def test_tags_capped_with_total(self, mock_conn):
         hit = _search(mock_conn, [make_datasource(detail=False)])["results"][0]
-        assert "tags" not in hit
+        assert hit["tags"] == [f"tag-number-{k}" for k in range(5)]
+        assert hit["tags_total"] == 30
+
+    def test_few_tags_not_capped(self, mock_conn):
+        ds = make_datasource(detail=False)
+        ds.tags = ["wave", "era5"]
+        hit = _search(mock_conn, [ds])["results"][0]
+        assert hit["tags"] == ["wave", "era5"]
         assert "tags_total" not in hit
 
-    def test_bounds_rounded(self, mock_conn):
-        hit = _search(mock_conn, [nz_wave_hit(0)])["results"][0]
-        assert hit["bounds"] == [165.11, -47.29, 166.41, -45.89]
+    def test_bounds_rounded_outward(self, mock_conn):
+        ds = nz_wave_hit(0)
+        hit = _search(mock_conn, [ds])["results"][0]
+        xmin, ymin, xmax, ymax = ds.bounds
+        # Never shrinks the coverage, never by more than the rounding step.
+        assert xmin - 1e-4 < hit["bounds"][0] <= xmin
+        assert ymin - 1e-4 < hit["bounds"][1] <= ymin
+        assert xmax <= hit["bounds"][2] < xmax + 1e-4
+        assert ymax <= hit["bounds"][3] < ymax + 1e-4
+        for b in hit["bounds"]:
+            assert round(b, 4) == b
+
+    def test_exact_bounds_unchanged(self, mock_conn):
+        hit = _search(mock_conn, [make_datasource(detail=False)])["results"][0]
+        assert hit["bounds"] == [165.0, -48.0, 179.0, -34.0]
 
     def test_response_is_compact_json(self, mock_conn):
         mock_conn.get_catalog.return_value = _mock_catalog([nz_wave_hit(0)])
@@ -333,11 +354,10 @@ class TestSearchCatalogTotalBound:
 class TestOutputSizeBudget:
     """OCE-360: responses short enough for clients to use inline."""
 
-    # Before -> after: 17,070 -> 9,213 characters on these fixtures; live
-    # (20 hits) 15,484 -> 8,438.
-    NZ_WAVE_SEARCH_CHARS = 10_000
-    # Before -> after: 20,911 -> 7,896 characters, fixture and live alike.
-    NZPAR_SUMMARY_CHARS = 9_000
+    # Before -> after: 17,070 -> 10,816 characters on these fixtures.
+    NZ_WAVE_SEARCH_CHARS = 11_500
+    # Before -> after: 20,911 -> 13,086 characters, fixture and live alike.
+    NZPAR_SUMMARY_CHARS = 14_000
 
     def test_nz_wave_search(self, mock_conn):
         mock_conn.get_catalog.return_value = _mock_catalog(
@@ -361,8 +381,13 @@ class TestOutputSizeBudget:
             "attrs": {
                 "units": "m",
                 "long_name": "significant height of wind and swell waves",
+                "standard_name": "sea_surface_wave_significant_height",
             },
+            "attrs_omitted": 2,
+            "dtype": "float32",
+            "shape": [292897, 281, 301],
         }
+        assert "variables_omitted" not in parsed
         assert parsed["bounds"] == [165.0, -48.0, 180.0, -34.0]
         assert parsed["tstart"].startswith("1993-01-01")
         assert parsed["schema"]["dims"] == {
@@ -393,12 +418,18 @@ class TestGetDatasourceInfoDetail:
         out = json.loads(server.get_datasource_info(ds.id, detail="full"))
         assert out == json.loads(to_json(format_datasource(ds)))
 
-    def test_default_keeps_dims_units_and_long_name_per_variable(self, mock_conn):
+    def test_default_keeps_core_metadata_per_variable(self, mock_conn):
         out = self._info(mock_conn)
-        assert out["variables"]["hs_part0"] == {
-            "dims": ["time", "latitude", "longitude"],
-            "attrs": {"units": "m", "long_name": "significant height of partition 0"},
+        var = out["variables"]["hs_part0"]
+        assert var["dims"] == ["time", "latitude", "longitude"]
+        assert var["shape"] == [292897, 281, 301]
+        assert var["dtype"] == "float32"
+        assert var["attrs"] == {
+            "units": "m",
+            "long_name": "significant height of partition 0",
+            "standard_name": "sea_surface_wave_significant_height",
         }
+        assert var["attrs_omitted"] == 14
 
     def test_default_keeps_record_fields(self, mock_conn):
         out = self._info(mock_conn)
@@ -423,6 +454,9 @@ class TestGetDatasourceInfoDetail:
         assert out["schema"]["coords"]["latitude"] == {
             "dims": ["latitude"],
             "attrs": {"units": "degrees_north", "long_name": "latitude"},
+            "attrs_omitted": 1,
+            "dtype": "float32",
+            "shape": [281],
         }
         assert 'detail="full"' in out["note"]
 
@@ -438,14 +472,27 @@ class TestGetDatasourceInfoDetail:
         out = self._info(mock_conn)
         assert set(out["schema"]) == {"dims", "coords"}
 
-    def test_large_record_keeps_every_variable(self, mock_conn):
-        # oceanum-ai's compact_datasource reads only variables[*]: every name
-        # must stay there, with dims and units, however large the record.
-        out = self._info(mock_conn, n_variables=N_VARIABLES)
-        assert list(out["variables"]) == [f"hs_part{i}" for i in range(N_VARIABLES)]
-        for var in out["variables"].values():
-            assert var["dims"] == ["time", "latitude", "longitude"]
-            assert set(var["attrs"]) == {"units", "long_name"}
+    def test_normal_record_not_truncated(self, mock_conn):
+        out = self._info(mock_conn)
+        assert len(out["variables"]) == 10
+        assert "variables_omitted" not in out
+        assert "too large" not in out["note"]
+
+    def test_large_record_truncated_within_budget(self, mock_conn):
+        n = 400
+        ds = make_datasource(n_variables=n)
+        mock_conn.get_datasource.return_value = ds
+        raw = server.get_datasource_info(ds.id)
+        out = json.loads(raw)
+        assert len(raw) <= formatting.INFO_BUDGET_CHARS
+        kept = list(out["variables"])
+        # The leading variables are kept whole, in order; the rest counted.
+        assert kept == [f"hs_part{i}" for i in range(len(kept))]
+        assert out["variables"]["hs_part0"]["attrs"]["units"] == "m"
+        assert out["variables_omitted"] == n - len(kept) > 0
+        assert set(out["schema"]["coords"]) == {"time", "latitude", "longitude"}
+        assert 'detail="full"' in out["note"]
+        assert "variables_omitted" in out["note"]
 
     def test_description_clipped(self, mock_conn):
         out = self._info(mock_conn)

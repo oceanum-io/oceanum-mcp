@@ -352,27 +352,34 @@ def format_datasource(ds: Any) -> dict[str, Any]:
 # search_catalog summaries.
 SUMMARY_DESCRIPTION_CHARS = 200
 SUMMARY_MAX_VARIABLES = 20
-# Decimal places kept in summary bounds: ~10 m, and drops float32 noise
-# (e.g. -38.599998474121094).
+SUMMARY_MAX_TAGS = 5
+# Decimal places kept in summary bounds, rounded outward so coverage never
+# shrinks: ~10 m, and drops float32 noise (e.g. -38.599998474121094).
 SUMMARY_BOUNDS_DECIMALS = 4
 
 # get_datasource_info summary view (OCE-360).
 INFO_DESCRIPTION_CHARS = 1000
 INFO_MAX_GLOBAL_ATTRS = 25  # global attributes, and info entries
 INFO_VALUE_CHARS = 200  # longest attribute value shown before clipping
+# Ceiling on the serialized summary. Past it, trailing variables (then
+# coordinates) are left out and counted in variables_omitted/coords_omitted.
+INFO_BUDGET_CHARS = 30_000
 
-# Kept first, so a capped attribute list still carries what code needs.
-_PRIORITY_ATTRS = ("units", "long_name", "standard_name")
 # The only attributes a variable or coordinate keeps in the summary view.
-_SUMMARY_ATTRS = ("units", "long_name")
+_PRIORITY_ATTRS = ("units", "long_name", "standard_name")
 
 _SUMMARY_NOTE = (
-    "Summary view: each variable and coordinate keeps only its dims, units and "
-    "long_name (schema.dims gives every dim's size), the description and long "
-    "attribute values are clipped (ending in ...), global attribute lists are "
-    "capped (see *_omitted counts), and schema.data_vars/attrs are omitted as "
-    'duplicates of variables/attributes. Pass detail="full" for the complete '
-    "record, with every attribute."
+    "Summary view: each variable and coordinate keeps its dims, shape, dtype "
+    "and units/long_name/standard_name only (see attrs_omitted counts), the "
+    "description and long attribute values are clipped (ending in ...), "
+    "global attribute lists are capped (see *_omitted counts), and "
+    "schema.data_vars/attrs are omitted as duplicates of "
+    'variables/attributes. Pass detail="full" for the complete record, with '
+    "every attribute."
+)
+_TRUNCATED_NOTE = (
+    " This record is too large to list every variable here: see "
+    'variables_omitted/coords_omitted, and pass detail="full" for all of them.'
 )
 
 
@@ -403,20 +410,25 @@ def _bounded_attrs(attrs: dict[str, Any], max_items: int) -> tuple[dict, int]:
 
 
 def _summary_entry(entry: Any) -> Any:
-    """A schema variable/coordinate entry reduced to its dims and
-    _SUMMARY_ATTRS. dims is kept as is: clients index it structurally."""
+    """A schema variable/coordinate entry with only _PRIORITY_ATTRS kept.
+
+    dims, shape and dtype pass through unchanged: they are small, and clients
+    index them structurally.
+    """
     if not isinstance(entry, dict):
         return entry
     out: dict[str, Any] = {}
-    if "dims" in entry:
-        out["dims"] = entry["dims"]
-    attrs = entry.get("attrs")
-    if isinstance(attrs, dict):
-        out["attrs"] = {
-            k: _clip_value(attrs[k], INFO_VALUE_CHARS)
-            for k in _SUMMARY_ATTRS
-            if k in attrs
-        }
+    for key, value in entry.items():
+        if key == "attrs" and isinstance(value, dict):
+            out["attrs"] = {
+                k: _clip_value(value[k], INFO_VALUE_CHARS)
+                for k in _PRIORITY_ATTRS
+                if k in value
+            }
+            if len(value) > len(out["attrs"]):
+                out["attrs_omitted"] = len(value) - len(out["attrs"])
+        else:
+            out[key] = value
     return out
 
 
@@ -424,19 +436,33 @@ def _summary_entries(entries: dict[str, Any]) -> dict[str, Any]:
     return {str(n): _summary_entry(e) for n, e in entries.items()}
 
 
+def _round_out(value: float, up: bool) -> float:
+    """value rounded to SUMMARY_BOUNDS_DECIMALS, away from the box's inside."""
+    scale = 10**SUMMARY_BOUNDS_DECIMALS
+    # round() first: a float product such as 1650000.0000000002 must not
+    # step to the next unit.
+    step = math.ceil if up else math.floor
+    return step(round(value * scale, 6)) / scale
+
+
 def format_datasource_summary(ds: Any) -> dict[str, Any]:
     """A compact search_catalog hit: identity, coverage and variable names.
 
     Catalog hits from the gateway usually carry no schema, so variable names
-    appear only when the record includes them. Tags are left out (OCE-360):
-    they run to ~20% of a summary, and the description says the same.
+    appear only when the record includes them.
     """
     description = ds.description
     if isinstance(description, str):
         description = _clip(" ".join(description.split()), SUMMARY_DESCRIPTION_CHARS)
     result: dict[str, Any] = {"id": ds.id, "name": ds.name, "description": description}
     if ds.geom is not None:
-        result["bounds"] = [round(b, SUMMARY_BOUNDS_DECIMALS) for b in ds.bounds]
+        xmin, ymin, xmax, ymax = ds.bounds
+        result["bounds"] = [
+            _round_out(xmin, up=False),
+            _round_out(ymin, up=False),
+            _round_out(xmax, up=True),
+            _round_out(ymax, up=True),
+        ]
     if ds.tstart is not None:
         result["tstart"] = ds.tstart.isoformat()
     if ds.tend is not None:
@@ -448,17 +474,24 @@ def format_datasource_summary(ds: Any) -> dict[str, Any]:
         result["variables"] = names[:SUMMARY_MAX_VARIABLES]
         if len(names) > SUMMARY_MAX_VARIABLES:
             result["variables_total"] = len(names)
+
+    tags = [str(t) for t in ds.tags or []]
+    if tags:
+        result["tags"] = tags[:SUMMARY_MAX_TAGS]
+    if len(tags) > SUMMARY_MAX_TAGS:
+        result["tags_total"] = len(tags)
     return result
 
 
 def format_datasource_bounded(ds: Any) -> dict[str, Any]:
     """The full record's fields, with every large section reduced.
 
-    Every variable and coordinate stays listed (its exact name is what a
-    query needs) with only its dims, units and long_name. The description
-    and long attribute values are clipped and global attribute lists capped.
-    schema.data_vars and schema.attrs are dropped when they duplicate
-    variables/attributes.
+    Every variable and coordinate keeps its dims, shape, dtype and
+    units/long_name/standard_name only. The description and long attribute
+    values are clipped and global attribute lists capped. schema.data_vars
+    and schema.attrs are dropped when they duplicate variables/attributes.
+    Past INFO_BUDGET_CHARS, trailing variables and coordinates are left out
+    and counted.
     """
     full = format_datasource(ds)
     out = dict(full)
@@ -485,4 +518,36 @@ def format_datasource_bounded(ds: Any) -> dict[str, Any]:
             bounded["attrs"], _ = _bounded_attrs(schema["attrs"], INFO_MAX_GLOBAL_ATTRS)
         out["schema"] = bounded
     out["note"] = _SUMMARY_NOTE
+    _fit_budget(out)
     return out
+
+
+def _fit_budget(out: dict[str, Any]) -> None:
+    """Drop trailing entries of out's variable listings (variables, then
+    schema.data_vars, then schema.coords) until it serializes within
+    INFO_BUDGET_CHARS, counting them in *_omitted."""
+    size = len(to_compact_json(out))
+    if size <= INFO_BUDGET_CHARS:
+        return
+    out["note"] += _TRUNCATED_NOTE
+    # The note's addition, plus room for the *_omitted counts.
+    size += len(_TRUNCATED_NOTE) + 64
+    schema = out.get("schema") or {}
+    listings = [
+        (out, "variables", out, "variables_omitted"),
+        (schema, "data_vars", out, "variables_omitted"),
+        (schema, "coords", out, "coords_omitted"),
+    ]
+    for parent, key, counter, count_key in listings:
+        entries = parent.get(key)
+        if not isinstance(entries, dict):
+            continue
+        kept = dict(entries)
+        while kept and size > INFO_BUDGET_CHARS:
+            name, entry = kept.popitem()
+            # The entry, its key and separators; the count field is small.
+            size -= len(to_compact_json({name: entry})) - 1
+            counter[count_key] = counter.get(count_key, 0) + 1
+        parent[key] = kept
+        if size <= INFO_BUDGET_CHARS:
+            return

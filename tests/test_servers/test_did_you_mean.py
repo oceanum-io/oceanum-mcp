@@ -118,12 +118,12 @@ class TestGetDatasourceInfoNotFound:
             assert token in kwargs["search"]
 
     def test_suggestions_capped(self, mock_conn):
-        mock_conn.get_datasource.side_effect = _not_found("wave")
+        mock_conn.get_datasource.side_effect = _not_found("wave_glob")
         mock_conn.get_catalog.return_value = _catalog(
-            *(_summary(f"wave_{i}", f"Wave {i}") for i in range(12))
+            *(_summary(f"wave_glob_{i}", f"Wave {i}") for i in range(12))
         )
 
-        parsed = json.loads(server.get_datasource_info("wave"))
+        parsed = json.loads(server.get_datasource_info("wave_glob"))
 
         assert len(parsed["suggestions"]) == server.MAX_SUGGESTIONS
 
@@ -244,6 +244,11 @@ class TestDatasourceSuggestionThreshold:
     )
     def test_typos_suggest_the_id_first(self, mock_conn, wanted, expected):
         assert _suggested(mock_conn, wanted, WAVE_IDS)[0] == expected
+
+    @pytest.mark.parametrize("wanted", ["era5", "wave", "glob05"])
+    def test_generic_words_suggest_nothing(self, mock_conn, wanted):
+        # Every id below contains them; none is what was asked for.
+        assert _suggested(mock_conn, wanted, WAVE_IDS) == []
 
     def test_id_extending_the_request_is_suggested(self, mock_conn):
         ids = _suggested(mock_conn, "oceanum_wave_nzpar", WAVE_IDS)

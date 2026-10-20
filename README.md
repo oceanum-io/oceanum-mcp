@@ -256,21 +256,25 @@ not exist or is not accessible with these credentials; it never reveals whether,
 or which inaccessible datasources exist.
 
 By default each result is a compact summary: `id`, `name`, a `description`
-cut to 200 characters, `tstart`/`tend`, `bounds` (rounded to 4 decimals), and
-variable names when the catalog provides them (first 20, with
-`variables_total`). `detail="full"` returns each datasource's complete
-catalog record instead. The response is compact JSON, and its total size is
-bounded (~16k characters for summaries, ~100k for full records): matches
-beyond the bound are dropped, counted in `omitted`, and a note asks to refine
-the search.
+cut to 200 characters, `tstart`/`tend`, `bounds` (rounded outward to 4
+decimals), variable names when the catalog provides them (first 20, with
+`variables_total`), and the first 5 `tags` (with `tags_total`).
+`detail="full"` returns each datasource's complete catalog record instead.
+The response is compact JSON, and its total size is bounded (~20k characters
+for summaries, ~100k for full records): matches beyond the bound are dropped,
+counted in `omitted`, and a note asks to refine the search.
 
 The catalog ranks datasources by fuzzy similarity to the search text and
 returns the closest ones even when none contains it. With search text, the
-response therefore carries `text_matches`, the number of results whose id,
-name, description or tags contain every search word (`or` separates
-alternatives); those results come first, and a `text_note` flags the fuzzy
-ones after them. If no result contains the text, none is returned: `count`
-and `text_matches` are 0 and a `message` says so.
+response therefore carries `text_matches`: how many results have every
+search word (or its singular) in their id, name, description, tags, labels
+or variable names. `or` separates alternatives and negated words (`-era5`,
+`not era5`) are ignored. This count is only a signal: no result is dropped
+for failing it, but results that fail are marked `"text_match": false`, and
+a `text_note` ahead of the results explains. If no result contains the text
+(`text_matches: 0`), only the catalog's first 5 results are shown, with a
+note that they are fuzzy matches and that rephrasing or a larger `limit` may
+help.
 
 | Parameter    | Type        | Description                                      |
 | ------------ | ----------- | ------------------------------------------------ |
@@ -287,20 +291,23 @@ Get the metadata for a datasource: coverage, schema dims and coordinates,
 variables, and attributes.
 
 The default (`detail="summary"`) is a compact view with the same fields as
-the full record. Every variable and coordinate is listed with only its `dims`
-and its `units`/`long_name` attributes (`schema.dims` gives each dim's size);
-the description is clipped to 1,000 characters, global `attributes` and
-`info` are capped at 25 entries (with `*_omitted` counts), and long values
-are clipped to 200 characters. `schema.data_vars`/`schema.attrs` are omitted
-as duplicates of `variables`/`attributes`. `detail="full"` returns the
-complete record, including each variable's `shape`, `dtype`,
-`standard_name` and other attributes. Both are compact JSON.
+the full record. Each variable and coordinate keeps its `dims`, `shape`,
+`dtype` and `units`/`long_name`/`standard_name` attributes only (other
+attributes are counted in `attrs_omitted`); the description is clipped to
+1,000 characters, global `attributes` and `info` are capped at 25 entries
+(with `*_omitted` counts), and long values are clipped to 200 characters.
+`schema.data_vars`/`schema.attrs` are omitted as duplicates of
+`variables`/`attributes`. The summary is bounded at ~30k characters: past
+that, trailing variables (then coordinates) are left out and counted in
+`variables_omitted`/`coords_omitted`. `detail="full"` returns the complete
+record. Both are compact JSON.
 
-An unknown id adds `suggestions`: visible datasources whose id contains every
-word of the requested one, or differs from it by a typo (at most one
-character edit per 7 characters, up to 3, with the differing words still
-similar). An id that merely shares generic words such as
-`oceanum_wave_..._era5` is never suggested.
+An unknown id adds `suggestions`: visible datasources whose id differs from
+the requested one by a typo (at most one character edit per 7 characters, up
+to 3, with the differing words still similar), or extends a request of two
+or more words. An id that merely shares generic words such as
+`oceanum_wave_..._era5`, or a single word such as `wave`, is never
+suggested.
 
 | Parameter       | Type   | Description                   |
 | --------------- | ------ | ----------------------------- |
