@@ -145,9 +145,20 @@ that is set:
    uvx keyring set oceanum-mcp datamesh-token
    ```
 
-   `keyring` is normally installed alongside the server; if not, install the
-   `oceanum-mcp[keyring]` extra (with uvx: `uvx --python 3.13 --from
-   "oceanum-mcp[keyring]" oceanum-mcp`).
+   The token is looked up once per server process, so restart the server
+   after changing it. `keyring` is normally installed alongside the server;
+   if not, install the `oceanum-mcp[keyring]` extra (with uvx:
+   `uvx --python 3.13 --from "oceanum-mcp[keyring]" oceanum-mcp`).
+
+### Troubleshooting: `-32022` on the first `initialize`
+
+A client may log "connection is serving the 2026-07-28 protocol; the
+initialize handshake is not accepted" (error `-32022`) once on connect. This
+is MCP SDK behaviour, not a server fault: a connection's first request fixes
+its protocol version, so a client that first probes with the 2026-07-28
+protocol and then sends the older `initialize` handshake on the same
+connection is refused, with the supported versions in the error. Clients
+retry with a supported version and connect normally.
 
 ## Environment Variables
 
@@ -155,7 +166,7 @@ that is set:
 | ----------------------------- | -------- | ------------------------------------------------------------------------------- |
 | `DATAMESH_TOKEN`              | Yes*     | Oceanum API token (shared by all servers)                                       |
 | `DATAMESH_TOKEN_FILE`         | Yes*     | Path to a file holding the token, readable only by its owner; used when `DATAMESH_TOKEN` is unset |
-| `DATAMESH_TOKEN_KEYRING`      | Yes*     | Set to `1`/`true` to read the token from the OS credential store; used when neither of the above is set |
+| `DATAMESH_TOKEN_KEYRING`      | Yes*     | `1`/`true`/`yes` to read the token from the OS credential store (once per process); used when neither of the above is set |
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
@@ -227,8 +238,11 @@ Notes:
   was not accepted, without the OAuth `resource_metadata` challenge (which
   would send clients such as VS Code into a sign-in flow that cannot fix a
   header token). Requests with no credential at all still get the challenge,
-  so OAuth discovery is unaffected. A credential that is an unsubstituted
-  client variable (`${input:...}`) is refused up front, saying so.
+  so OAuth discovery is unaffected. If the token could not be verified
+  because the Datamesh service was unreachable, the response is a 503 asking
+  to retry instead. A credential that is an unsubstituted client variable
+  (`${input:...}`) is refused up front, saying so (except with
+  `OCEANUM_MCP_AUTH=none`, where client credentials are ignored).
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance

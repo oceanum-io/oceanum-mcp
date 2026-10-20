@@ -15,7 +15,11 @@ from fastmcp import Client
 from fastmcp.server.auth import AccessToken
 
 import oceanum_mcp.servers.datamesh.server as datamesh_server
-from oceanum_mcp.common.auth import HEADER_TOKEN_REJECTED, DatameshTokenVerifier
+from oceanum_mcp.common.auth import (
+    GATEWAY_UNAVAILABLE,
+    HEADER_TOKEN_REJECTED,
+    DatameshTokenVerifier,
+)
 from oceanum_mcp.common.client import (
     CREDENTIAL_CLAIM,
     UNRESOLVED_VARIABLE_MESSAGE,
@@ -61,14 +65,14 @@ async def test_local_placeholder_token_named_in_tool_error(monkeypatch):
 
 
 @asynccontextmanager
-async def hosted_client(gateway: AsyncMock):
-    """The real create_http_app("datamesh") in auto mode with OAuth discovery
-    on; the gateway verification call is replaced by ``gateway``."""
+async def hosted_client(gateway: AsyncMock, mode: str = "auto"):
+    """The real create_http_app("datamesh") (auth ``mode``, OAuth discovery
+    on); the gateway verification call is replaced by ``gateway``."""
     from oceanum_mcp.app import create_http_app
 
     with pytest.MonkeyPatch.context() as mp:
         mp.delenv("OCEANUM_MCP_CORS_ORIGINS", raising=False)
-        mp.setenv("OCEANUM_MCP_AUTH", "auto")
+        mp.setenv("OCEANUM_MCP_AUTH", mode)
         mp.setenv("OCEANUM_MCP_PUBLIC_URL", "https://mcp.example.test")
         mp.setattr(datamesh_server.mcp, "auth", None)
         mp.setattr(DatameshTokenVerifier, "_verify_with_gateway", gateway)
@@ -135,6 +139,52 @@ async def test_hosted_rejected_header_token_401_names_the_header():
     assert int(resp.headers["content-length"]) == len(resp.content)
     # Still readable by browser clients: CORS wraps the rewritten response.
     assert resp.headers["access-control-allow-origin"] == "https://vscode.dev"
+
+
+def _gateway_5xx() -> httpx2.HTTPStatusError:
+    request = httpx2.Request("GET", "https://datamesh.example.test/user/")
+    return httpx2.HTTPStatusError(
+        "Datamesh gateway returned 502",
+        request=request,
+        response=httpx2.Response(502, request=request),
+    )
+
+
+@pytest.mark.parametrize(
+    "failure",
+    [lambda: httpx2.ConnectError("unreachable"), _gateway_5xx],
+    ids=["transport-error", "gateway-5xx"],
+)
+async def test_hosted_header_token_unverified_on_gateway_outage_is_503(failure):
+    """A gateway outage fails verification closed; the valid-looking token
+    must not be reported as invalid, but as unverified, to retry."""
+    async with hosted_client(AsyncMock(side_effect=failure())) as client:
+        resp = await client.post(
+            "/datamesh", json=INIT, headers={**HDRS, "X-DATAMESH-TOKEN": "a" * 40}
+        )
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "error": "temporarily_unavailable",
+        "error_description": GATEWAY_UNAVAILABLE,
+    }
+    assert "retry-after" in resp.headers
+    assert "www-authenticate" not in resp.headers
+
+
+async def test_auth_none_ignores_placeholder_client_credentials():
+    """With OCEANUM_MCP_AUTH=none client credentials are ignored, so a
+    placeholder in them must not get the request refused."""
+    gateway = _rejecting_gateway()
+    async with hosted_client(gateway, mode="none") as client:
+        for headers in (
+            {"X-DATAMESH-TOKEN": PLACEHOLDER},
+            {"Authorization": f"Bearer {PLACEHOLDER}"},
+        ):
+            resp = await client.post(
+                "/datamesh", json=INIT, headers={**HDRS, **headers}
+            )
+            assert resp.status_code == 200, headers
+    gateway.assert_not_called()
 
 
 async def test_hosted_credentialless_401_keeps_oauth_challenge():

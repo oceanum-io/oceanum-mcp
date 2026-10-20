@@ -91,7 +91,10 @@ def create_http_app(
     # add_middleware inserts OUTERMOST — required: fastmcp places middleware
     # passed to http_app() inside its auth middleware, where the header
     # promotion would run only after authentication already failed.
-    app.add_middleware(DatameshHeaderMiddleware)
+    # Without a provider (OCEANUM_MCP_AUTH=none) client credentials are
+    # ignored, so they must not be promoted or checked either.
+    if provider is not None:
+        app.add_middleware(DatameshHeaderMiddleware)
     # Added last so it is outermost of all: a browser preflight carries no
     # credential, so it must be answered before auth (or the header
     # promotion) ever sees it. Credentials travel in headers, never cookies,

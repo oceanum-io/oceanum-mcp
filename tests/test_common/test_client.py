@@ -12,6 +12,7 @@ from oceanum_mcp.common.client import (
     KEYRING_SERVICE,
     KEYRING_USERNAME,
     _ClientCache,
+    _keyring_token,
     _datamesh_cache,
     _storage_cache,
     get_datamesh_connector,
@@ -141,8 +142,10 @@ def stdio_env(monkeypatch):
     """A stdio call (no auth context) with every server token source unset."""
     for key in ("DATAMESH_TOKEN", "DATAMESH_TOKEN_FILE", "DATAMESH_TOKEN_KEYRING"):
         monkeypatch.delenv(key, raising=False)
+    _keyring_token.cache_clear()
     with patch("fastmcp.server.dependencies.get_access_token", return_value=None):
         yield monkeypatch
+    _keyring_token.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -224,10 +227,12 @@ def test_token_file_empty(stdio_env, tmp_path):
         resolve_credential()
 
 
-def test_token_file_path_unresolved_variable(stdio_env):
-    stdio_env.setenv("DATAMESH_TOKEN_FILE", "${input:token-file}")
-    with pytest.raises(ValueError, match="unresolved client variable"):
+@pytest.mark.parametrize("raw", ["$HOME/.config/token", "${input:token-file}"])
+def test_token_file_path_not_expanded(stdio_env, raw):
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", raw)
+    with pytest.raises(ValueError, match="was not expanded") as exc:
         resolve_credential()
+    assert "absolute path" in str(exc.value)
 
 
 def test_token_from_keyring(stdio_env):
@@ -237,6 +242,41 @@ def test_token_from_keyring(stdio_env):
     with patch.object(keyring, "get_password", return_value="kr-token") as get:
         assert resolve_credential() == "kr-token"
     get.assert_called_once_with(KEYRING_SERVICE, KEYRING_USERNAME)
+
+
+def test_keyring_looked_up_once_per_process(stdio_env):
+    import keyring
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    with patch.object(keyring, "get_password", return_value="kr-token") as get:
+        assert resolve_credential() == "kr-token"
+        assert resolve_credential() == "kr-token"
+    get.assert_called_once()
+
+
+def test_keyring_failure_not_cached(stdio_env):
+    """Storing a missing token takes effect without a restart."""
+    import keyring
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    with patch.object(keyring, "get_password", side_effect=[None, "kr-token"]):
+        with pytest.raises(ValueError, match="no token is stored"):
+            resolve_credential()
+        assert resolve_credential() == "kr-token"
+
+
+@pytest.mark.parametrize("value", ["on", "enabled", "2"])
+def test_keyring_unrecognised_value_is_named(stdio_env, value):
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", value)
+    with pytest.raises(ValueError, match=f"must be 1/true/yes.*{value!r}"):
+        resolve_credential()
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", ""])
+def test_keyring_disabled_values(stdio_env, value):
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", value)
+    with pytest.raises(ValueError, match="No Datamesh credential"):
+        resolve_credential()
 
 
 def test_keyring_without_stored_token(stdio_env):

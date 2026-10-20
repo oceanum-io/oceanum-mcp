@@ -18,6 +18,7 @@ client forever.
 
 from __future__ import annotations
 
+import functools
 import os
 import stat
 import threading
@@ -26,7 +27,12 @@ from collections import OrderedDict
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
-from oceanum_mcp.common.config import auth_mode, datamesh_service, storage_service
+from oceanum_mcp.common.config import (
+    auth_mode,
+    datamesh_service,
+    env_flag,
+    storage_service,
+)
 
 if TYPE_CHECKING:
     from oceanum.datamesh import Connector
@@ -163,11 +169,13 @@ def _server_token() -> str | None:
     path = os.environ.get("DATAMESH_TOKEN_FILE")
     if path:
         return _read_token_file(path)
-    if os.environ.get("DATAMESH_TOKEN_KEYRING", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    ):
+    use_keyring = env_flag("DATAMESH_TOKEN_KEYRING")
+    if use_keyring is None:
+        raise ValueError(
+            "DATAMESH_TOKEN_KEYRING must be 1/true/yes or 0/false/no, got "
+            f"{os.environ['DATAMESH_TOKEN_KEYRING']!r}"
+        )
+    if use_keyring:
         return _keyring_token()
     return None
 
@@ -181,7 +189,11 @@ def _read_token_file(raw: str) -> str:
     is not exposed in the client config or to other users.
     """
     if is_unresolved_variable(raw):
-        raise ValueError(f"DATAMESH_TOKEN_FILE: {UNRESOLVED_VARIABLE_MESSAGE}")
+        raise ValueError(
+            f"DATAMESH_TOKEN_FILE {raw!r} was not expanded: MCP clients pass "
+            "env values literally. Use an absolute path, or one starting "
+            "with ~."
+        )
     path = Path(raw).expanduser()
     try:
         with path.open(encoding="utf-8") as f:
@@ -205,9 +217,15 @@ def _read_token_file(raw: str) -> str:
     return token
 
 
+@functools.cache
 def _keyring_token() -> str:
     """The token stored in the OS credential store (macOS Keychain, Secret
-    Service/libsecret, Windows Credential Manager) via the keyring package."""
+    Service/libsecret, Windows Credential Manager) via the keyring package.
+
+    Looked up once per process (a lookup can be a D-Bus or Keychain round
+    trip, or an unlock prompt), so a changed token needs a server restart.
+    Failures are not cached: storing a missing token takes effect at once.
+    """
     try:
         import keyring
         from keyring.errors import KeyringError

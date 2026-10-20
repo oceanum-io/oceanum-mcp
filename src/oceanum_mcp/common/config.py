@@ -44,16 +44,23 @@ def is_network_transport() -> bool:
     return _transport in ("http", "sse")
 
 
+def env_flag(name: str) -> bool | None:
+    """A boolean environment variable: True for 1/true/yes, False for
+    0/false/no or unset/empty, None for any other value (case-insensitive)."""
+    raw = os.environ.get(name, "").strip().lower()
+    if raw in ("1", "true", "yes"):
+        return True
+    if raw in ("", "0", "false", "no"):
+        return False
+    return None
+
+
 def is_read_only() -> bool:
     """Whether write tools (update_metadata) should be disabled.
 
     Read at server start from OCEANUM_MCP_READ_ONLY; does not require a token.
     """
-    return os.environ.get("OCEANUM_MCP_READ_ONLY", "").strip().lower() in (
-        "1",
-        "true",
-        "yes",
-    )
+    return env_flag("OCEANUM_MCP_READ_ONLY") is True
 
 
 def max_inline_bytes() -> int:

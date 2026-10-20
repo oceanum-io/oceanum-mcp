@@ -10,6 +10,7 @@ import hashlib
 import json
 import threading
 import time
+from contextvars import ContextVar
 from typing import Any
 
 import httpx2
@@ -62,6 +63,19 @@ HEADER_TOKEN_REJECTED = (
     "sign-in."
 )
 
+GATEWAY_UNAVAILABLE = (
+    "The Datamesh token in the X-DATAMESH-TOKEN header could not be verified: "
+    "the Datamesh service did not respond as expected. This is not a "
+    "problem with the token; retry shortly."
+)
+
+# A per-request holder the header middleware installs and DatameshTokenVerifier
+# marks when it failed closed on a gateway outage, so that 401 is not reported
+# as a bad token. Mutable, so the mark survives any context copy in between.
+_verification_outcome: ContextVar[dict[str, bool] | None] = ContextVar(
+    "_verification_outcome", default=None
+)
+
 
 async def _send_invalid_token(send: Send, description: str) -> None:
     """A 401 invalid_token response with no OAuth discovery challenge.
@@ -92,15 +106,39 @@ async def _send_invalid_token(send: Send, description: str) -> None:
     await send({"type": "http.response.body", "body": body.encode()})
 
 
-def _replace_401(send: Send, description: str) -> Send:
-    """Wrap send so a 401 from inside is replaced by _send_invalid_token's."""
+async def _send_unavailable(send: Send) -> None:
+    """A 503 for a header token the gateway outage left unverified."""
+    body = json.dumps(
+        {"error": "temporarily_unavailable", "error_description": GATEWAY_UNAVAILABLE}
+    ).encode()
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 503,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body)).encode()),
+                (b"retry-after", b"5"),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body})
+
+
+def _replace_401(send: Send, outcome: dict[str, bool]) -> Send:
+    """Wrap send so a header-token 401 from inside says why it failed: a 503
+    if verification failed closed on a gateway outage, else a 401 saying the
+    header token was rejected."""
     replaced = False
 
     async def wrapped(message: Message) -> None:
         nonlocal replaced
         if message["type"] == "http.response.start" and message["status"] == 401:
             replaced = True
-            await _send_invalid_token(send, description)
+            if outcome.get("gateway_unavailable"):
+                await _send_unavailable(send)
+            else:
+                await _send_invalid_token(send, HEADER_TOKEN_REJECTED)
         elif not (replaced and message["type"] == "http.response.body"):
             await send(message)
 
@@ -121,7 +159,9 @@ class DatameshHeaderMiddleware:
       "${input:datamesh-token}" is refused up front, saying so;
     - a rejected header token gets a 401 saying the header token is invalid,
       instead of FastMCP's "clear authentication tokens and reconnect" with
-      an OAuth challenge, which header-token clients cannot act on.
+      an OAuth challenge, which header-token clients cannot act on; one left
+      unverified by a gateway outage gets a 503 saying to retry.
+    Only added when an auth provider is attached (see create_http_app).
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -142,7 +182,13 @@ class DatameshHeaderMiddleware:
                         *headers,
                         (b"authorization", b"Bearer " + token),
                     ]
-                    send = _replace_401(send, HEADER_TOKEN_REJECTED)
+                    outcome: dict[str, bool] = {}
+                    reset = _verification_outcome.set(outcome)
+                    try:
+                        await self.app(scope, receive, _replace_401(send, outcome))
+                    finally:
+                        _verification_outcome.reset(reset)
+                    return
             elif authorization[:7].lower() == b"bearer " and is_unresolved_variable(
                 authorization[7:].decode("latin-1").strip()
             ):
@@ -210,6 +256,9 @@ class DatameshTokenVerifier(TokenVerifier):
         except httpx2.HTTPError:
             # Gateway unreachable or in an unexpected state: fail closed
             # without caching, so recovery is immediate.
+            outcome = _verification_outcome.get()
+            if outcome is not None:
+                outcome["gateway_unavailable"] = True
             return None
         if result is None:
             self._mark_invalid(key)

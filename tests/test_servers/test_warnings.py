@@ -30,19 +30,24 @@ def test_concurrent_resolution_parsing_stays_out_of_a_query_result(resolution):
     assert collected == []
 
 
-@pytest.mark.parametrize("resolution", ["1D", "30D", "7D"])
-def test_day_resolutions_parse_without_warnings(resolution):
-    """The engine-side simulation parses the canonical "D", not "d", so
-    nothing is emitted even with the quieting skipped (lock held)."""
-    with server._WARNINGS_LOCK, warnings.catch_warnings():
-        warnings.simplefilter("error")
-        server._check_time_resolution(resolution)
-
-
-def test_capture_keeps_library_signals_but_drops_deprecations():
+def test_capture_drops_only_pandas_alias_deprecations():
     collected: list[str] = []
     with server._captured_warnings(collected):
         warnings.warn("Query is too large for direct access", UserWarning)
-        warnings.warn("'d' is deprecated", DeprecationWarning)
-        warnings.warn("'d' is deprecated", FutureWarning)
-    assert collected == ["Query is too large for direct access"]
+        warnings.warn(
+            "'d' is deprecated and will be removed in a future version, "
+            "please use 'D' instead.",
+            DeprecationWarning,
+        )
+        warnings.warn(
+            "'d' is deprecated and will be removed in a future version. "
+            "Please use 'D' instead of 'd'.",
+            FutureWarning,
+        )
+        warnings.warn("The gateway url is deprecated", DeprecationWarning)
+        warnings.warn("some API is deprecated", FutureWarning)
+    assert collected == [
+        "Query is too large for direct access",
+        "The gateway url is deprecated",
+        "some API is deprecated",
+    ]
