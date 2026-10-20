@@ -374,3 +374,32 @@ def test_keyring_concurrent_first_calls_share_one_lookup(stdio_env):
             t.join(5)
     assert results == ["kr-token"] * 4
     get.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "content", ["tok-a\ntok-b\n", "tok a", "tok\x00a"], ids=["lines", "space", "nul"]
+)
+def test_token_file_with_whitespace_or_control_chars(stdio_env, tmp_path, content):
+    token_file = tmp_path / "token"
+    token_file.write_text(content)
+    token_file.chmod(0o600)
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    with pytest.raises(ValueError, match="whitespace or control") as exc:
+        resolve_credential()
+    assert content.strip() not in str(exc.value)  # never echo the token
+
+
+def test_env_token_stripped(stdio_env):
+    stdio_env.setenv("DATAMESH_TOKEN", "  env-token\n")
+    assert resolve_credential() == "env-token"
+
+
+def test_keyring_unexpected_backend_error_wrapped(stdio_env):
+    import keyring
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    with (
+        patch.object(keyring, "get_password", side_effect=RuntimeError("dbus")),
+        pytest.raises(ValueError, match="credential store failed: RuntimeError"),
+    ):
+        resolve_credential()

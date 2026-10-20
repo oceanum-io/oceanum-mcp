@@ -7,7 +7,6 @@ token claims under CREDENTIAL_CLAIM; common.client requires it per request.
 from __future__ import annotations
 
 import hashlib
-import json
 import threading
 import time
 from contextvars import ContextVar
@@ -23,6 +22,7 @@ from fastmcp.server.auth import (
 )
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.utilities.token_cache import TokenCache
+from starlette.responses import JSONResponse
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from oceanum_mcp.common.client import (
@@ -56,17 +56,15 @@ def _is_jwt_shaped(token: str) -> bool:
     return token.count(".") == 2
 
 
-HEADER_TOKEN_REJECTED = (
-    "The Datamesh token in the X-DATAMESH-TOKEN header was not accepted "
-    "(invalid, expired or revoked). Update the token in your MCP client "
-    "configuration (get one from https://oceanum.io); header tokens need no "
-    "sign-in."
+TOKEN_REJECTED = (
+    "The Datamesh token was not accepted (invalid, expired or revoked). "
+    "Update the token in your MCP client configuration (get one from "
+    "https://oceanum.io); Datamesh tokens need no sign-in."
 )
 
 GATEWAY_UNAVAILABLE = (
-    "The Datamesh token in the X-DATAMESH-TOKEN header could not be verified: "
-    "the Datamesh service did not respond as expected. This is not a "
-    "problem with the token; retry shortly."
+    "The Datamesh token could not be verified: the Datamesh service did not "
+    "respond as expected. This is not a problem with the token; retry shortly."
 )
 
 # A per-request holder DatameshHeaderMiddleware installs, recording why a
@@ -84,59 +82,34 @@ def _mark_outcome(result: str) -> None:
         outcome["result"] = result
 
 
-async def _send_invalid_token(send: Send, description: str) -> None:
+def _invalid_token(description: str) -> JSONResponse:
     """A 401 invalid_token response with no OAuth discovery challenge.
 
-    No resource_metadata: for a credential the client supplied itself, that
-    pointer only sends clients (VS Code) into an OAuth flow that cannot fix
-    the token. RFC 6750 §3.1 only asks for error="invalid_token" here; the
-    challenge with resource_metadata stays on credential-less 401s.
+    No resource_metadata: for a Datamesh token the client supplied itself,
+    that pointer only sends clients (VS Code) into an OAuth flow that cannot
+    fix the token. RFC 6750 §3.1 only asks for error="invalid_token" here;
+    the challenge with resource_metadata stays on credential-less 401s and
+    on JWT (OAuth) failures, which this middleware never rewrites.
     """
-    body = json.dumps({"error": "invalid_token", "error_description": description})
     # error_description must be printable ASCII without '"' or '\' (§3).
     header_description = description.replace("…", "...")
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 401,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body.encode())).encode()),
-                (
-                    b"www-authenticate",
-                    f'Bearer error="invalid_token", '
-                    f'error_description="{header_description}"'.encode(),
-                ),
-            ],
-        }
+    return JSONResponse(
+        {"error": "invalid_token", "error_description": description},
+        status_code=401,
+        headers={
+            "WWW-Authenticate": f'Bearer error="invalid_token", '
+            f'error_description="{header_description}"'
+        },
     )
-    await send({"type": "http.response.body", "body": body.encode()})
 
 
-async def _send_unavailable(send: Send) -> None:
-    """A 503 for a header token the gateway outage left unverified."""
-    body = json.dumps(
-        {"error": "temporarily_unavailable", "error_description": GATEWAY_UNAVAILABLE}
-    ).encode()
-    await send(
-        {
-            "type": "http.response.start",
-            "status": 503,
-            "headers": [
-                (b"content-type", b"application/json"),
-                (b"content-length", str(len(body)).encode()),
-                (b"retry-after", b"5"),
-            ],
-        }
-    )
-    await send({"type": "http.response.body", "body": body})
-
-
-def _replace_401(send: Send, outcome: dict[str, str], from_header: bool) -> Send:
+def _replace_401(
+    scope: Scope, receive: Receive, send: Send, outcome: dict[str, str]
+) -> Send:
     """Wrap send so a 401 from inside says why the credential failed, when
-    the reason was recorded: a placeholder credential; or, for a header
-    token, a gateway rejection (401) or a gateway outage (503). Any other
-    401 passes through untouched."""
+    the reason was recorded: a placeholder credential, a gateway rejection
+    of a Datamesh token (401), or a gateway outage (503). Any other 401
+    passes through untouched."""
     replaced = False
 
     async def wrapped(message: Message) -> None:
@@ -144,15 +117,23 @@ def _replace_401(send: Send, outcome: dict[str, str], from_header: bool) -> Send
         if message["type"] == "http.response.start" and message["status"] == 401:
             result = outcome.get("result")
             if result == "placeholder":
-                await _send_invalid_token(send, UNRESOLVED_VARIABLE_MESSAGE)
-            elif from_header and result == "rejected":
-                await _send_invalid_token(send, HEADER_TOKEN_REJECTED)
-            elif from_header and result == "unavailable":
-                await _send_unavailable(send)
+                response = _invalid_token(UNRESOLVED_VARIABLE_MESSAGE)
+            elif result == "rejected":
+                response = _invalid_token(TOKEN_REJECTED)
+            elif result == "unavailable":
+                response = JSONResponse(
+                    {
+                        "error": "temporarily_unavailable",
+                        "error_description": GATEWAY_UNAVAILABLE,
+                    },
+                    status_code=503,
+                    headers={"Retry-After": "5"},
+                )
             else:
                 await send(message)
                 return
             replaced = True
+            await response(scope, receive, send)
         elif not (replaced and message["type"] == "http.response.body"):
             await send(message)
 
@@ -173,10 +154,12 @@ class DatameshHeaderMiddleware:
     untouched:
     - a credential that is an unsubstituted client variable such as
       "${input:datamesh-token}" gets a 401 saying so;
-    - a rejected header token gets a 401 saying the header token is invalid,
-      instead of FastMCP's "clear authentication tokens and reconnect" with
-      an OAuth challenge, which header-token clients cannot act on; one left
-      unverified by a gateway outage gets a 503 saying to retry.
+    - a Datamesh token (X-DATAMESH-TOKEN header, or a non-JWT bearer) the
+      gateway rejected gets a 401 saying so, instead of FastMCP's "clear
+      authentication tokens and reconnect" with an OAuth challenge, which
+      such clients cannot act on; one left unverified by a gateway outage
+      gets a 503 saying to retry. Only DatameshTokenVerifier records these,
+      and it declines JWTs, so OAuth (JWT) 401s keep FastMCP's challenge.
     Only added when an auth provider is attached (see create_http_app).
     """
 
@@ -212,9 +195,7 @@ class DatameshHeaderMiddleware:
             outcome["result"] = "placeholder"
         reset = _verification_outcome.set(outcome)
         try:
-            await self.app(
-                scope, receive, _replace_401(send, outcome, bool(header_token))
-            )
+            await self.app(scope, receive, _replace_401(scope, receive, send, outcome))
         finally:
             _verification_outcome.reset(reset)
 

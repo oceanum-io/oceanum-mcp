@@ -172,7 +172,7 @@ retry with a supported version; GitHub Copilot did so and connected.
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
-| `OCEANUM_MCP_READ_ONLY`       | No       | Set to `1`/`true` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`) |
+| `OCEANUM_MCP_READ_ONLY`       | No       | `1`/`true`/`yes` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`); any value other than these or `0`/`false`/`no` stops the server at startup |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_MAX_INLINE_ROWS` | No       | Max rows/records previewed inline before truncation (default 100)               |
 | `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |
@@ -236,15 +236,17 @@ Notes:
   number of fetches; the response then reports them as `expires_at` and
   `max_uses`.
   Hosted exports are capped at 10 GB to bound what one link can pull.
-- A rejected `X-DATAMESH-TOKEN` header gets a 401 saying the header token
-  was not accepted, without the OAuth `resource_metadata` challenge (which
-  would send clients such as VS Code into a sign-in flow that cannot fix a
-  header token). Requests with no credential at all still get the challenge,
-  so OAuth discovery is unaffected. If the token could not be verified
-  because the Datamesh service was unreachable, the response is a 503 asking
-  to retry instead. A credential that is an unsubstituted client variable
-  (`${input:...}`) is refused up front, saying so (except with
-  `OCEANUM_MCP_AUTH=none`, where client credentials are ignored).
+- A rejected Datamesh token (in `X-DATAMESH-TOKEN`, or a non-JWT
+  `Authorization: Bearer`) gets a 401 saying the token was not accepted,
+  without the OAuth `resource_metadata` challenge (which would send clients
+  such as VS Code into a sign-in flow that cannot fix a Datamesh token).
+  Requests with no credential, and failed JWT (OAuth) bearers, still get the
+  challenge, so OAuth discovery and re-authorization are unaffected. If the
+  token could not be verified because the Datamesh service was unreachable,
+  the response is a 503 asking to retry instead. A credential that is an
+  unsubstituted client variable (`${input:...}`) gets a 401 saying so
+  (except with `OCEANUM_MCP_AUTH=none`, where client credentials are
+  ignored).
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance

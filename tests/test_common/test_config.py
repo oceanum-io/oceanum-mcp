@@ -11,6 +11,7 @@ from oceanum_mcp.common.config import (
     auth_mode,
     datamesh_service,
     is_network_transport,
+    is_read_only,
     public_url,
     set_transport,
     storage_service,
@@ -90,3 +91,37 @@ def test_transport_flag():
     finally:
         set_transport("stdio")
     assert not is_network_transport()
+
+
+@pytest.mark.parametrize("value", ["1", "TRUE", "yes"])
+def test_read_only_true_values(monkeypatch, value):
+    monkeypatch.setenv("OCEANUM_MCP_READ_ONLY", value)
+    assert is_read_only() is True
+
+
+@pytest.mark.parametrize("value", ["0", "false", "No", ""])
+def test_read_only_false_values(monkeypatch, value):
+    monkeypatch.setenv("OCEANUM_MCP_READ_ONLY", value)
+    assert is_read_only() is False
+
+
+@pytest.mark.parametrize("value", ["on", "ture", "readonly"])
+def test_read_only_unrecognised_value_fails_closed(monkeypatch, value):
+    """A misspelled flag must stop the server, not leave write tools on."""
+    monkeypatch.setenv("OCEANUM_MCP_READ_ONLY", value)
+    with pytest.raises(ValueError, match=f"OCEANUM_MCP_READ_ONLY must be.*{value!r}"):
+        is_read_only()
+
+
+def test_read_only_unrecognised_value_stops_server_start(monkeypatch):
+    import importlib
+
+    import oceanum_mcp.servers.storage.server as storage_server
+
+    monkeypatch.setenv("OCEANUM_MCP_READ_ONLY", "on")
+    try:
+        with pytest.raises(ValueError, match="OCEANUM_MCP_READ_ONLY"):
+            importlib.reload(storage_server)
+    finally:
+        monkeypatch.delenv("OCEANUM_MCP_READ_ONLY")
+        importlib.reload(storage_server)

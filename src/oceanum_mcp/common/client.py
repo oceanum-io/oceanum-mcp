@@ -161,11 +161,9 @@ def is_unresolved_variable(value: str) -> bool:
 
 def _server_token() -> str | None:
     """The server's own token, from the first token source that is set."""
-    token = os.environ.get("DATAMESH_TOKEN")
-    if token:
-        if is_unresolved_variable(token):
-            raise ValueError(f"DATAMESH_TOKEN: {UNRESOLVED_VARIABLE_MESSAGE}")
-        return token
+    token = os.environ.get("DATAMESH_TOKEN", "")
+    if token.strip():
+        return _checked_token(token, "DATAMESH_TOKEN")
     path = os.environ.get("DATAMESH_TOKEN_FILE")
     if path:
         return _read_token_file(path)
@@ -206,7 +204,7 @@ def _read_token_file(raw: str) -> str:
                     f"(mode {stat.S_IMODE(mode):04o}); restrict it with: "
                     f"chmod 600 {path}"
                 )
-            token = f.read().strip()
+            token = f.read()
     except OSError as exc:
         raise ValueError(
             f"DATAMESH_TOKEN_FILE {path} could not be read: "
@@ -214,18 +212,27 @@ def _read_token_file(raw: str) -> str:
         ) from None
     except UnicodeDecodeError:
         raise ValueError(f"DATAMESH_TOKEN_FILE {path} is not a text file") from None
-    if not token:
+    if not token.strip():
         raise ValueError(f"DATAMESH_TOKEN_FILE {path} is empty")
-    return _not_a_variable(token, f"DATAMESH_TOKEN_FILE {path}")
+    return _checked_token(token, f"DATAMESH_TOKEN_FILE {path}")
 
 
-def _not_a_variable(token: str, source: str) -> str:
-    """The token from a file or the credential store, unless it is an
-    unsubstituted variable such as ${input:...} copied from a client config."""
+def _checked_token(token: str, source: str) -> str:
+    """A server token from any source, stripped, and refused if it is an
+    unsubstituted variable such as ${input:...} or holds whitespace or
+    control characters (e.g. a multi-line file)."""
+    token = token.strip()
     if is_unresolved_variable(token):
+        if source == "DATAMESH_TOKEN":
+            raise ValueError(f"DATAMESH_TOKEN: {UNRESOLVED_VARIABLE_MESSAGE}")
         raise ValueError(
             f"The token in {source} looks like an unsubstituted variable "
             "(`${...}`), not a token: store the token itself."
+        )
+    if any(c.isspace() or not c.isprintable() for c in token):
+        raise ValueError(
+            f"The token in {source} contains whitespace or control "
+            "characters: it must hold only the token, on one line."
         )
     return token
 
@@ -263,12 +270,17 @@ def _keyring_lookup() -> str:
             f"DATAMESH_TOKEN_KEYRING is set but the OS credential store could "
             f"not be read: {exc}"
         ) from None
+    except Exception as exc:  # noqa: BLE001 - backends raise their own types
+        raise ValueError(
+            "DATAMESH_TOKEN_KEYRING is set but the OS credential store "
+            f"failed: {type(exc).__name__}: {exc}"
+        ) from None
     if not token:
         raise ValueError(
             "DATAMESH_TOKEN_KEYRING is set but no token is stored: store it "
             f"with `keyring set {KEYRING_SERVICE} {KEYRING_USERNAME}`."
         )
-    return _not_a_variable(token, "the OS credential store")
+    return _checked_token(token, "the OS credential store")
 
 
 def _get_client(

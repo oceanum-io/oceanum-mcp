@@ -59,8 +59,16 @@ def is_read_only() -> bool:
     """Whether write tools (update_metadata) should be disabled.
 
     Read at server start from OCEANUM_MCP_READ_ONLY; does not require a token.
+    Fails fast on an unrecognised value: a misspelled flag silently leaving
+    write tools enabled would fail open.
     """
-    return env_flag("OCEANUM_MCP_READ_ONLY") is True
+    read_only = env_flag("OCEANUM_MCP_READ_ONLY")
+    if read_only is None:
+        raise ValueError(
+            "OCEANUM_MCP_READ_ONLY must be 1/true/yes or 0/false/no, got "
+            f"{os.environ['OCEANUM_MCP_READ_ONLY']!r}"
+        )
+    return read_only
 
 
 def max_inline_bytes() -> int:

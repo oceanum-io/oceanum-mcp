@@ -17,7 +17,7 @@ from fastmcp.server.auth import AccessToken
 import oceanum_mcp.servers.datamesh.server as datamesh_server
 from oceanum_mcp.common.auth import (
     GATEWAY_UNAVAILABLE,
-    HEADER_TOKEN_REJECTED,
+    TOKEN_REJECTED,
     DatameshTokenVerifier,
 )
 from oceanum_mcp.common.client import (
@@ -113,28 +113,36 @@ async def test_hosted_placeholder_token_named_in_401(headers):
     gateway.assert_not_called()
 
 
-async def test_hosted_rejected_header_token_401_names_the_header():
-    """A header token the gateway rejects gets a 401 about that token, with
+# A Datamesh token sent either way: the X-DATAMESH-TOKEN header, or a non-JWT
+# Authorization bearer.
+CHANNELS = pytest.mark.parametrize(
+    "channel",
+    [
+        lambda token: {"X-DATAMESH-TOKEN": token},
+        lambda token: {"Authorization": f"Bearer {token}"},
+    ],
+    ids=["header", "bearer"],
+)
+
+
+@CHANNELS
+async def test_hosted_rejected_datamesh_token_401_says_so(channel):
+    """A Datamesh token the gateway rejects gets a 401 about that token, with
     no resource_metadata that would send VS Code into a futile OAuth flow."""
     async with hosted_client(_rejecting_gateway()) as client:
         resp = await client.post(
             "/datamesh",
             json=INIT,
-            headers={
-                **HDRS,
-                "X-DATAMESH-TOKEN": "a" * 40,
-                "Origin": "https://vscode.dev",
-            },
+            headers={**HDRS, **channel("a" * 40), "Origin": "https://vscode.dev"},
         )
     assert resp.status_code == 401
-    body = resp.json()
-    assert body == {
+    assert resp.json() == {
         "error": "invalid_token",
-        "error_description": HEADER_TOKEN_REJECTED,
+        "error_description": TOKEN_REJECTED,
     }
     assert "clear authentication tokens" not in resp.text
     challenge = resp.headers["www-authenticate"]
-    assert "X-DATAMESH-TOKEN" in challenge
+    assert "not accepted" in challenge
     assert "resource_metadata" not in challenge
     assert int(resp.headers["content-length"]) == len(resp.content)
     # Still readable by browser clients: CORS wraps the rewritten response.
@@ -150,17 +158,20 @@ def _gateway_5xx() -> httpx2.HTTPStatusError:
     )
 
 
+@CHANNELS
 @pytest.mark.parametrize(
     "failure",
     [lambda: httpx2.ConnectError("unreachable"), _gateway_5xx],
     ids=["transport-error", "gateway-5xx"],
 )
-async def test_hosted_header_token_unverified_on_gateway_outage_is_503(failure):
+async def test_hosted_datamesh_token_unverified_on_gateway_outage_is_503(
+    failure, channel
+):
     """A gateway outage fails verification closed; the valid-looking token
     must not be reported as invalid, but as unverified, to retry."""
     async with hosted_client(AsyncMock(side_effect=failure())) as client:
         resp = await client.post(
-            "/datamesh", json=INIT, headers={**HDRS, "X-DATAMESH-TOKEN": "a" * 40}
+            "/datamesh", json=INIT, headers={**HDRS, **channel("a" * 40)}
         )
     assert resp.status_code == 503
     assert resp.json() == {
@@ -206,7 +217,7 @@ async def test_unexplained_header_token_401_passes_through():
         )
     assert resp.status_code == 401
     assert "resource_metadata=" in resp.headers["www-authenticate"]
-    assert HEADER_TOKEN_REJECTED not in resp.text
+    assert TOKEN_REJECTED not in resp.text
 
 
 async def test_hosted_credentialless_401_keeps_oauth_challenge():
@@ -220,16 +231,20 @@ async def test_hosted_credentialless_401_keeps_oauth_challenge():
     assert "error=" not in challenge
 
 
-async def test_hosted_invalid_bearer_401_unchanged():
-    """An invalid Authorization bearer (an OAuth client's token) keeps
-    FastMCP's response, challenge included: re-authorizing can fix it."""
-    async with hosted_client(_rejecting_gateway()) as client:
+async def test_hosted_invalid_jwt_bearer_401_unchanged():
+    """An invalid JWT bearer (an OAuth client's token) keeps FastMCP's
+    response, challenge included: re-authorizing can fix it."""
+    gateway = _rejecting_gateway()
+    async with hosted_client(gateway) as client:
         resp = await client.post(
-            "/datamesh", json=INIT, headers={**HDRS, "Authorization": "Bearer nope"}
+            "/datamesh",
+            json=INIT,
+            headers={**HDRS, "Authorization": "Bearer aaaa.bbbb.cccc"},
         )
+    gateway.assert_not_called()
     assert resp.status_code == 401
     assert "resource_metadata=" in resp.headers["www-authenticate"]
-    assert resp.json()["error_description"] != HEADER_TOKEN_REJECTED
+    assert resp.json()["error_description"] != TOKEN_REJECTED
 
 
 async def test_hosted_valid_header_token_still_accepted():
