@@ -14,7 +14,9 @@ This package contains multiple MCP servers, selectable at runtime:
 
 ## Prerequisites
 
-Get an API token from [oceanum.io](https://oceanum.io). Set it as the `DATAMESH_TOKEN` environment variable.
+Get an API token from [oceanum.io](https://oceanum.io). Set it as the `DATAMESH_TOKEN` environment variable
+(or keep it out of the client config: see [Supplying the token without
+putting it in the client config](#supplying-the-token-without-putting-it-in-the-client-config)).
 
 ## Installation
 
@@ -107,11 +109,53 @@ Use stdio transport with the same command:
 }
 ```
 
+If the server reports that the token "looks like an unresolved client
+variable", your client passed a config variable such as
+`${input:datamesh-token}` through literally instead of substituting it.
+Restart the server from the client so it prompts for the input again, or use
+one of the options below.
+
+### Supplying the token without putting it in the client config
+
+For the stdio transport the server takes its token from the first of these
+that is set:
+
+1. `DATAMESH_TOKEN` — the token itself.
+2. `DATAMESH_TOKEN_FILE` — path to a file containing the token (`~` is
+   expanded). On macOS/Linux the file must be accessible only by you; the
+   server refuses it otherwise:
+
+   ```bash
+   install -m 600 /dev/null ~/.config/oceanum/token
+   echo "your-token-here" > ~/.config/oceanum/token
+   ```
+
+   ```json
+   "env": { "DATAMESH_TOKEN_FILE": "~/.config/oceanum/token" }
+   ```
+
+   The file is read on every call, so a replaced token takes effect without
+   restarting the server.
+3. `DATAMESH_TOKEN_KEYRING=1` — read the token from the OS credential store
+   (macOS Keychain, Secret Service/libsecret on Linux, Windows Credential
+   Manager) via the [`keyring`](https://pypi.org/project/keyring/) package,
+   under service `oceanum-mcp`, user `datamesh-token`. Store it once with:
+
+   ```bash
+   uvx keyring set oceanum-mcp datamesh-token
+   ```
+
+   `keyring` is normally installed alongside the server; if not, install the
+   `oceanum-mcp[keyring]` extra (with uvx: `uvx --python 3.13 --from
+   "oceanum-mcp[keyring]" oceanum-mcp`).
+
 ## Environment Variables
 
 | Variable                      | Required | Description                                                                     |
 | ----------------------------- | -------- | ------------------------------------------------------------------------------- |
-| `DATAMESH_TOKEN`              | Yes      | Oceanum API token (shared by all servers)                                       |
+| `DATAMESH_TOKEN`              | Yes*     | Oceanum API token (shared by all servers)                                       |
+| `DATAMESH_TOKEN_FILE`         | Yes*     | Path to a file holding the token, readable only by its owner; used when `DATAMESH_TOKEN` is unset |
+| `DATAMESH_TOKEN_KEYRING`      | Yes*     | Set to `1`/`true` to read the token from the OS credential store; used when neither of the above is set |
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
@@ -126,9 +170,10 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_PUBLIC_URL`      | No       | Externally visible base URL (e.g. `https://mcp.oceanum.io`); enables OAuth discovery metadata for claude.ai connectors |
 | `OCEANUM_MCP_CORS_ORIGINS`    | No       | Comma-separated browser origins allowed by CORS on http (default: `https://*.oceanum.io,https://*.oceanum.tech,https://vscode.dev`; empty string disables) |
 
-`DATAMESH_TOKEN` is required for the stdio transport (and for `--transport http`
-with `OCEANUM_MCP_AUTH=none`); in authenticated http mode each request carries
-its own credential and no server-side token is needed.
+\* One token source (`DATAMESH_TOKEN`, `DATAMESH_TOKEN_FILE` or
+`DATAMESH_TOKEN_KEYRING`) is required for the stdio transport (and for
+`--transport http` with `OCEANUM_MCP_AUTH=none`); in authenticated http mode
+each request carries its own credential and no server-side token is needed.
 
 ## Hosted mode (HTTP transport)
 
@@ -178,6 +223,12 @@ Notes:
   number of fetches; the response then reports them as `expires_at` and
   `max_uses`.
   Hosted exports are capped at 10 GB to bound what one link can pull.
+- A rejected `X-DATAMESH-TOKEN` header gets a 401 saying the header token
+  was not accepted, without the OAuth `resource_metadata` challenge (which
+  would send clients such as VS Code into a sign-in flow that cannot fix a
+  header token). Requests with no credential at all still get the challenge,
+  so OAuth discovery is unaffected. A credential that is an unsubstituted
+  client variable (`${input:...}`) is refused up front, saying so.
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance

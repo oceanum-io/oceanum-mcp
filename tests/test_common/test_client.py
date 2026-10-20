@@ -9,10 +9,13 @@ from fastmcp.server.auth import AccessToken
 
 from oceanum_mcp.common.client import (
     CREDENTIAL_CLAIM,
+    KEYRING_SERVICE,
+    KEYRING_USERNAME,
     _ClientCache,
     _datamesh_cache,
     _storage_cache,
     get_datamesh_connector,
+    is_unresolved_variable,
     resolve_credential,
 )
 
@@ -128,3 +131,144 @@ def test_client_cache_bounded():
     cache.get_or_create(("c", "s"), lambda: "C")
     rebuilt = cache.get_or_create(("a", "s"), lambda: "A2")
     assert a == "A" and rebuilt == "A2", "oldest entry must be evicted at the bound"
+
+
+# --- server token sources (OCE-362) ------------------------------------------
+
+
+@pytest.fixture
+def stdio_env(monkeypatch):
+    """A stdio call (no auth context) with every server token source unset."""
+    for key in ("DATAMESH_TOKEN", "DATAMESH_TOKEN_FILE", "DATAMESH_TOKEN_KEYRING"):
+        monkeypatch.delenv(key, raising=False)
+    with patch("fastmcp.server.dependencies.get_access_token", return_value=None):
+        yield monkeypatch
+
+
+@pytest.mark.parametrize(
+    "value", ["${input:datamesh-token}", "${env:DATAMESH_TOKEN}", "$DATAMESH_TOKEN"]
+)
+def test_unresolved_client_variable_is_named(stdio_env, value):
+    """VS Code passed the literal "${input:datamesh-token}" (23 chars) as the
+    token; the error must say so rather than "Invalid token"."""
+    stdio_env.setenv("DATAMESH_TOKEN", value)
+    with pytest.raises(ValueError, match="unresolved client variable") as exc:
+        resolve_credential()
+    assert "did not substitute it" in str(exc.value)
+
+
+@pytest.mark.parametrize("value", ["a" * 40, "eyJh.eyJz.c2ln", "tok-a"])
+def test_real_tokens_are_not_flagged(value):
+    assert not is_unresolved_variable(value)
+
+
+def test_token_read_from_file(stdio_env, tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("file-token\n")
+    token_file.chmod(0o600)
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    assert resolve_credential() == "file-token"
+
+
+def test_token_file_rotation_needs_no_restart(stdio_env, tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("old")
+    token_file.chmod(0o600)
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    assert resolve_credential() == "old"
+    token_file.write_text("new")
+    assert resolve_credential() == "new"
+
+
+def test_token_file_expands_home(stdio_env, tmp_path):
+    (tmp_path / "token").write_text("home-token")
+    (tmp_path / "token").chmod(0o600)
+    stdio_env.setenv("HOME", str(tmp_path))
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", "~/token")
+    assert resolve_credential() == "home-token"
+
+
+def test_datamesh_token_wins_over_file(stdio_env, tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("file-token")
+    token_file.chmod(0o600)
+    stdio_env.setenv("DATAMESH_TOKEN", "env-token")
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    assert resolve_credential() == "env-token"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX permission bits")
+@pytest.mark.parametrize("mode", [0o640, 0o604, 0o620, 0o644])
+def test_token_file_accessible_to_others_is_refused(stdio_env, tmp_path, mode):
+    token_file = tmp_path / "token"
+    token_file.write_text("secret-value")
+    token_file.chmod(mode)
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    with pytest.raises(ValueError, match="chmod 600") as exc:
+        resolve_credential()
+    assert "secret-value" not in str(exc.value)
+
+
+def test_token_file_missing(stdio_env, tmp_path):
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(tmp_path / "absent"))
+    with pytest.raises(ValueError, match="could not be read"):
+        resolve_credential()
+
+
+def test_token_file_empty(stdio_env, tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("\n")
+    token_file.chmod(0o600)
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    with pytest.raises(ValueError, match="is empty"):
+        resolve_credential()
+
+
+def test_token_file_path_unresolved_variable(stdio_env):
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", "${input:token-file}")
+    with pytest.raises(ValueError, match="unresolved client variable"):
+        resolve_credential()
+
+
+def test_token_from_keyring(stdio_env):
+    import keyring
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    with patch.object(keyring, "get_password", return_value="kr-token") as get:
+        assert resolve_credential() == "kr-token"
+    get.assert_called_once_with(KEYRING_SERVICE, KEYRING_USERNAME)
+
+
+def test_keyring_without_stored_token(stdio_env):
+    import keyring
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "true")
+    with patch.object(keyring, "get_password", return_value=None):
+        with pytest.raises(ValueError, match="keyring set oceanum-mcp"):
+            resolve_credential()
+
+
+def test_keyring_backend_failure(stdio_env):
+    import keyring
+    from keyring.errors import NoKeyringError
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    with patch.object(keyring, "get_password", side_effect=NoKeyringError("none")):
+        with pytest.raises(ValueError, match="credential store could not be read"):
+            resolve_credential()
+
+
+def test_keyring_not_installed(stdio_env):
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    with patch.dict("sys.modules", {"keyring": None}):
+        with pytest.raises(ValueError, match=r"oceanum-mcp\[keyring\]"):
+            resolve_credential()
+
+
+def test_keyring_not_consulted_unless_enabled(stdio_env):
+    import keyring
+
+    with patch.object(keyring, "get_password") as get:
+        with pytest.raises(ValueError, match="No Datamesh credential"):
+            resolve_credential()
+    get.assert_not_called()

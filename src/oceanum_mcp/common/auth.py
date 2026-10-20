@@ -7,6 +7,7 @@ token claims under CREDENTIAL_CLAIM; common.client requires it per request.
 from __future__ import annotations
 
 import hashlib
+import json
 import threading
 import time
 from typing import Any
@@ -21,9 +22,13 @@ from fastmcp.server.auth import (
 )
 from fastmcp.server.auth.providers.jwt import JWTVerifier
 from fastmcp.utilities.token_cache import TokenCache
-from starlette.types import ASGIApp, Receive, Scope, Send
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
-from oceanum_mcp.common.client import CREDENTIAL_CLAIM
+from oceanum_mcp.common.client import (
+    CREDENTIAL_CLAIM,
+    UNRESOLVED_VARIABLE_MESSAGE,
+    is_unresolved_variable,
+)
 from oceanum_mcp.common.config import (
     auth0_audience,
     auth0_domain,
@@ -50,6 +55,58 @@ def _is_jwt_shaped(token: str) -> bool:
     return token.count(".") == 2
 
 
+HEADER_TOKEN_REJECTED = (
+    "The Datamesh token in the X-DATAMESH-TOKEN header was not accepted "
+    "(invalid, expired or revoked). Update the token in your MCP client "
+    "configuration (get one from https://oceanum.io); header tokens need no "
+    "sign-in."
+)
+
+
+async def _send_invalid_token(send: Send, description: str) -> None:
+    """A 401 invalid_token response with no OAuth discovery challenge.
+
+    No resource_metadata: for a credential the client supplied itself, that
+    pointer only sends clients (VS Code) into an OAuth flow that cannot fix
+    the token. RFC 6750 §3.1 only asks for error="invalid_token" here; the
+    challenge with resource_metadata stays on credential-less 401s.
+    """
+    body = json.dumps({"error": "invalid_token", "error_description": description})
+    # error_description must be printable ASCII without '"' or '\' (§3).
+    header_description = description.replace("…", "...")
+    await send(
+        {
+            "type": "http.response.start",
+            "status": 401,
+            "headers": [
+                (b"content-type", b"application/json"),
+                (b"content-length", str(len(body.encode())).encode()),
+                (
+                    b"www-authenticate",
+                    f'Bearer error="invalid_token", '
+                    f'error_description="{header_description}"'.encode(),
+                ),
+            ],
+        }
+    )
+    await send({"type": "http.response.body", "body": body.encode()})
+
+
+def _replace_401(send: Send, description: str) -> Send:
+    """Wrap send so a 401 from inside is replaced by _send_invalid_token's."""
+    replaced = False
+
+    async def wrapped(message: Message) -> None:
+        nonlocal replaced
+        if message["type"] == "http.response.start" and message["status"] == 401:
+            replaced = True
+            await _send_invalid_token(send, description)
+        elif not (replaced and message["type"] == "http.response.body"):
+            await send(message)
+
+    return wrapped
+
+
 class DatameshHeaderMiddleware:
     """Promotes X-DATAMESH-TOKEN to the Authorization bearer FastMCP reads.
 
@@ -58,6 +115,13 @@ class DatameshHeaderMiddleware:
     Authorization bearers — so the header itself distinguishes the two
     credential types. Promotion only happens when no Authorization header is
     present, keeping the channels unambiguous when both are sent.
+
+    Also explains the 401s FastMCP's generic wording gets wrong (OCE-362):
+    - a credential that is an unsubstituted client variable such as
+      "${input:datamesh-token}" is refused up front, saying so;
+    - a rejected header token gets a 401 saying the header token is invalid,
+      instead of FastMCP's "clear authentication tokens and reconnect" with
+      an OAuth challenge, which header-token clients cannot act on.
     """
 
     def __init__(self, app: ASGIApp) -> None:
@@ -66,14 +130,24 @@ class DatameshHeaderMiddleware:
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
         if scope["type"] == "http":
             headers: list[tuple[bytes, bytes]] = scope["headers"]
-            if not any(k == b"authorization" for k, _ in headers):
+            authorization = next((v for k, v in headers if k == b"authorization"), None)
+            if authorization is None:
                 token = next((v for k, v in headers if k == b"x-datamesh-token"), None)
                 if token:
+                    if is_unresolved_variable(token.decode("latin-1").strip()):
+                        await _send_invalid_token(send, UNRESOLVED_VARIABLE_MESSAGE)
+                        return
                     scope = dict(scope)
                     scope["headers"] = [
                         *headers,
                         (b"authorization", b"Bearer " + token),
                     ]
+                    send = _replace_401(send, HEADER_TOKEN_REJECTED)
+            elif authorization[:7].lower() == b"bearer " and is_unresolved_variable(
+                authorization[7:].decode("latin-1").strip()
+            ):
+                await _send_invalid_token(send, UNRESOLVED_VARIABLE_MESSAGE)
+                return
         await self.app(scope, receive, send)
 
 
