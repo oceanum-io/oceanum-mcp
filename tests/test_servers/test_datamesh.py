@@ -1100,14 +1100,23 @@ class TestExportQueryHosted:
     def test_large_download_warns_but_returns_url(self, mock_conn):
         big = self._stage(size=5 * 10**9)
         with patch.object(server, "_download_stage", return_value=big):
-            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds", confirm_size_bytes=5 * 10**9
+                )
+            )
         assert "download_url" in parsed
         assert "warning" in parsed and "Large download" in parsed["warning"]
 
     def test_download_at_hosted_cap_still_returned(self, mock_conn):
         at_cap = self._stage(size=server.MAX_HOSTED_EXPORT_BYTES)
         with patch.object(server, "_download_stage", return_value=at_cap):
-            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds",
+                    confirm_size_bytes=server.MAX_HOSTED_EXPORT_BYTES,
+                )
+            )
         assert "download_url" in parsed
         assert "refused" not in parsed
         assert "Large download" in parsed["warning"]
@@ -1142,7 +1151,11 @@ class TestExportQueryHosted:
             as_csv = json.loads(
                 server.export_query(datasource_id="test-ds", format="csv")
             )
-            as_parquet = json.loads(server.export_query(datasource_id="test-ds"))
+            as_parquet = json.loads(
+                server.export_query(
+                    datasource_id="test-ds", confirm_size_bytes=4 * 10**9
+                )
+            )
         assert as_csv["refused"] is True
         assert "as csv" in as_csv["message"]
         assert "download_url" not in as_csv
