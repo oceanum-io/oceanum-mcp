@@ -26,6 +26,8 @@ dependencies = [
     # zarr<3 oceanum requires rejects), so every gridded load failed on
     # images that resolved oceanum<1.2.1 with xarray>=2026.9 (OCE-354).
     "oceanum>=1.2.1,<2",
+    # zarr<3 via oceanum; xarray>=2026.9 always passes zarr_format= (OCE-354).
+    "xarray<2026.9",
     # oceanum requires zarr<3, and zarr 2.x breaks at runtime with
     # numcodecs>=0.16 (blosc.cbuffer_sizes removed); oceanum does not pin this.
     # Remove once oceanum pins numcodecs itself or moves to zarr>=3.
