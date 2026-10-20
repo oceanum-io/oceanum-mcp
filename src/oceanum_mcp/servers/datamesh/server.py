@@ -105,17 +105,21 @@ MAX_EXPORT_FRAME_BYTES = 2_000_000_000
 MAX_EXPORT_DATASET_BYTES = 10_000_000_000
 
 # Above this staged size stage_query leads with narrowing, states the cost of
-# exporting as-is, and tells the agent to ask the user before exporting;
-# export_query then refuses unless confirm_size_bytes confirms the size
-# (OCE-355), and query_data refuses rather than open the result lazily.
+# exporting as-is, and tells the agent to ask the user before exporting, and
+# query_data refuses rather than open the result lazily. export_query refuses
+# an export that writes more than this (_written_bytes) unless
+# confirm_size_bytes confirms that size (OCE-355). The confirmation is
+# advisory: the server cannot see whether the user was asked; it forces an
+# explicit, size-aware step for each large export.
 LARGE_EXPORT_BYTES = 1_000_000_000
 
-# confirm_size_bytes is accepted when it is at least the export's size less
-# this fraction. The agent is shown stage_query's size (/oceanql/stage), but
-# hosted export sizes the /oceanql/download/ stage and local tabular exports
-# size the flattened table, so an exact match would refuse a confirmation the
-# user did give. A confirmation covers any export up to the confirmed size.
-_CONFIRM_TOLERANCE = 0.05
+# Hosted export sizes the /oceanql/download/ stage, but the agent was shown
+# stage_query's /oceanql/stage size, which may differ slightly; a hosted
+# confirm_size_bytes within this fraction of the export's size is accepted.
+# Local sizes are computed here from the same stage the agent is told about,
+# so a local confirmation must match exactly. The window is bounded on both
+# sides so that one huge value cannot confirm every export.
+_HOSTED_CONFIRM_TOLERANCE = 0.05
 
 # Appended to every export-cap refusal (OCE-357): an agent read the per-call
 # hosted cap as a file-size limit and proposed 24 monthly exports to get under
@@ -924,16 +928,7 @@ def _limit_result(data: Any, limit: int, coordkeys: dict[str, str]) -> tuple[Any
     )
 
 
-def _stage_summary(stage: Stage | dict[str, Any]) -> dict[str, Any]:
-    if isinstance(stage, dict):
-        # A gateway download stage (_download_stage), its size already
-        # validated by the caller.
-        size = int(stage["size"])
-        return {
-            "container": stage.get("container"),
-            "size_bytes": size,
-            "size_human": human_bytes(size),
-        }
+def _stage_summary(stage: Stage) -> dict[str, Any]:
     return {
         "container": stage.container.value,
         "size_bytes": stage.size,
@@ -942,10 +937,22 @@ def _stage_summary(stage: Stage | dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _refusal(stage: Stage | dict[str, Any], message: str, **extra: Any) -> str:
-    return to_json(
-        {"refused": True, **_stage_summary(stage), "message": message, **extra}
-    )
+def _download_summary(stage: dict[str, Any], size: int) -> dict[str, Any]:
+    """_stage_summary for a gateway download stage (_download_stage), whose
+    size the caller has already validated."""
+    return {
+        "container": stage.get("container"),
+        "size_bytes": size,
+        "size_human": human_bytes(size),
+    }
+
+
+def _summary_refusal(summary: dict[str, Any], message: str, **extra: Any) -> str:
+    return to_json({"refused": True, **summary, "message": message, **extra})
+
+
+def _refusal(stage: Stage, message: str, **extra: Any) -> str:
+    return _summary_refusal(_stage_summary(stage), message, **extra)
 
 
 def _variable_dims(stage: Stage) -> dict[str, list[str]]:
@@ -968,9 +975,11 @@ def _inline_records(stage: Stage, client_limit: int | None) -> int | None:
     when every variable's dims are a subset of one variable's (coordmap); a
     dataset whose variables span different dims flattens to more records.
     A client-side limit (applied after resampling) keeps the last N rows of
-    a table or time steps of a dataset; the count after it is only known for
-    tables, time-only series, and a limit too large to bring the count under
-    query_data's inline cap.
+    a table, or the last N steps along each of a dataset's time, ensemble
+    and quantile dims (coordinate keys t, e, q, as _limit_result does); the
+    count after it is only known for tables, datasets on a single one of
+    those dims, and a limit too large to bring the count under query_data's
+    inline cap.
     """
     is_dataset = stage.container == Container.Dataset
     dimsets = [set(str(code)) for code in (stage.coordmap or {}).values()]
@@ -979,7 +988,8 @@ def _inline_records(stage: Stage, client_limit: int | None) -> int | None:
         records = None
     if client_limit is None or records is None:
         return records
-    if not is_dataset or all(d <= {"t"} for d in dimsets):
+    union = set().union(*dimsets)
+    if not is_dataset or (len(union) == 1 and union <= set(_LIMIT_COORD_KEYS)):
         return min(records, client_limit)
     if records <= max_inline_rows() or client_limit > max_inline_rows():
         # Unchanged below the cap; or at least min(records, client_limit),
@@ -1002,11 +1012,7 @@ def _large_result_advice(stage: Stage, client_limit: int | None) -> str:
     query_data's refusal (OCE-355).
     """
     size = human_bytes(stage.size)
-    confirm = (
-        "ask the user before exporting, and only if they agree pass "
-        f"confirm_size_bytes={stage.size} to export_query. "
-        f"{_CONFIRM_WHOLE_REQUEST}"
-    )
+    confirm = f"ask the user before exporting. {_confirm_advice(stage)}"
     local_cap = (
         MAX_EXPORT_DATASET_BYTES
         if stage.container == Container.Dataset
@@ -1055,34 +1061,65 @@ def _large_result_advice(stage: Stage, client_limit: int | None) -> str:
     return f"Large result ({size}). Narrow it first: {_NARROWING}. {cost}"
 
 
-def _needs_confirmation(nbytes: int, confirm_size_bytes: int | None) -> bool:
-    """Whether an export of nbytes still needs the user's confirmation: it
-    is above LARGE_EXPORT_BYTES and confirm_size_bytes is missing or below
-    nbytes less _CONFIRM_TOLERANCE."""
-    if nbytes <= LARGE_EXPORT_BYTES:
-        return False
-    return confirm_size_bytes is None or confirm_size_bytes < nbytes * (
-        1 - _CONFIRM_TOLERANCE
+def _written_bytes(nbytes: int, fmt: str) -> int:
+    """Bytes an export of nbytes (in memory) writes as fmt: the estimate the
+    hosted cap applies and the size export_query asks the user to confirm.
+    NetCDF/Parquet land at or below the in-memory size; CSV text runs about
+    _EXPORT_DISK_FACTOR["csv"] times it."""
+    return int(nbytes * _EXPORT_DISK_FACTOR["csv"]) if fmt == "csv" else nbytes
+
+
+def _confirm_advice(stage: Stage) -> str:
+    """How to confirm exporting a staged result, in the size export_query
+    checks (_written_bytes): the staged size for the default format; other
+    formats are re-estimated at export, and the refusal states their value."""
+    if is_network_transport():
+        formats = "any format but CSV (CSV text is about 3x)"
+    elif stage.container == Container.Dataset:
+        formats = (
+            "NetCDF (CSV/Parquet of gridded data is sized as the flattened "
+            "table, and CSV text is about 3x that)"
+        )
+    else:
+        formats = "Parquet (CSV text is about 3x)"
+    return (
+        f"Only if they agree, pass confirm_size_bytes={stage.size} to "
+        f"export_query for {formats}; for another format the refusal states "
+        f"the value to confirm. {_CONFIRM_WHOLE_REQUEST}"
     )
 
 
-def _confirmation_message(nbytes: int, confirm_size_bytes: int | None) -> str:
-    """Refusal message for an export above LARGE_EXPORT_BYTES that was not
-    confirmed (OCE-355), stating the exact value to confirm."""
+def _needs_confirmation(
+    written: int, confirm_size_bytes: int | None, tolerance: float = 0.0
+) -> bool:
+    """Whether an export writing `written` bytes still needs the user's
+    confirmation: it is above LARGE_EXPORT_BYTES and confirm_size_bytes is
+    missing or outside written +/- tolerance (a fraction)."""
+    if written <= LARGE_EXPORT_BYTES:
+        return False
+    if confirm_size_bytes is None:
+        return True
+    low, high = written * (1 - tolerance), written * (1 + tolerance)
+    return not low <= confirm_size_bytes <= high
+
+
+def _confirmation_message(written: int, confirm_size_bytes: int | None) -> str:
+    """Refusal message for an export writing more than LARGE_EXPORT_BYTES
+    that was not confirmed (OCE-355), stating the exact value to confirm."""
     mismatch = (
-        f"confirm_size_bytes={confirm_size_bytes} is less than this export's "
-        "size (it may have been confirmed for a different query, format or "
-        "time). "
+        f"confirm_size_bytes={confirm_size_bytes} does not match this "
+        "export's size (it may have been confirmed for a different query, "
+        "format or time). "
         if confirm_size_bytes is not None
         else ""
     )
     return (
-        f"{mismatch}This export is {human_bytes(nbytes)} ({nbytes} bytes), "
-        f"above {human_bytes(LARGE_EXPORT_BYTES)}, so nothing was exported. "
-        f"Narrowing it first is usually better: {_NARROWING}. To export it "
-        "as-is, ask the user; only if they agree, call export_query again "
-        f"with the same parameters plus confirm_size_bytes={nbytes}. "
-        f"{_CONFIRM_WHOLE_REQUEST}"
+        f"{mismatch}This export writes about {human_bytes(written)} "
+        f"({written} bytes), above {human_bytes(LARGE_EXPORT_BYTES)}, so "
+        "nothing was exported. Narrowing it first is usually better: "
+        f"{_NARROWING}. To export it as-is, ask the user; only if they agree, "
+        "call export_query again with the same parameters plus "
+        f"confirm_size_bytes={written}. {_CONFIRM_WHOLE_REQUEST}"
     )
 
 
@@ -1676,6 +1713,20 @@ def stage_query(
             f"Larger than the inline limit ({human_bytes(inline_limit)}): "
             f"{detail}{export_clause()}."
         )
+        if _written_bytes(stage.size, "csv") > LARGE_EXPORT_BYTES:
+            # Below the threshold as staged, but not necessarily as written.
+            out["recommendation"] += (
+                " export_query asks the user to confirm exports that write "
+                f"more than {human_bytes(LARGE_EXPORT_BYTES)}, which this can "
+                "as CSV (about 3x)"
+                + (
+                    " or, for gridded data, as a flattened CSV/Parquet table"
+                    if stage.container == Container.Dataset
+                    and not is_network_transport()
+                    else ""
+                )
+                + "; the refusal then states the size to confirm."
+            )
     if _resamples_or_aggregates(query):
         # The staged size is the reduced output; computing it still reads
         # every native record selected (OCE-358).
@@ -1809,12 +1860,14 @@ def query_data(
             # huge result lazily (a whole-grid query ran into the timeout);
             # its shape comes from the stage instead. With a client-side
             # limit the lazy slice below may still be small.
+            # (The stage names each variable's dims but not their lengths.)
+            shape = {"variable_dims": _variable_dims(stage)}
             return _refusal(
                 stage,
                 "Too large to return inline (inline limit "
                 f"{human_bytes(inline_limit)}); nothing was downloaded. "
                 + _large_result_advice(stage, None),
-                variable_dims=_variable_dims(stage),
+                **(shape if shape["variable_dims"] else {}),
                 query=_query_echo(query),
             )
         if stage.size > inline_limit:
@@ -1942,22 +1995,25 @@ def _export_download_url(
         )
     # size is the staged (in-memory) size, which NetCDF/Parquet land at or
     # below; CSV text runs well above it, so the cap applies to its estimate.
-    est = int(size * _EXPORT_DISK_FACTOR["csv"]) if fmt == "csv" else size
+    est = _written_bytes(size, fmt)
     # Refusals withhold the URL: it is a bearer credential (OCE-299).
+    summary = _download_summary(stage, size)
     if est > MAX_HOSTED_EXPORT_BYTES:
         as_fmt = f" (about {human_bytes(est)} as {fmt})" if fmt == "csv" else ""
-        return _refusal(
-            stage,
+        return _summary_refusal(
+            summary,
             f"Result is {human_bytes(size)}{as_fmt}, above the hosted export "
             f"limit of {human_bytes(MAX_HOSTED_EXPORT_BYTES)}. Narrow the "
             f"query: {_NARROWING}. {_CAP_WHOLE_REQUEST}",
             query=_query_echo(query),
         )
-    if _needs_confirmation(size, confirm_size_bytes):
-        return _refusal(
-            stage,
-            _confirmation_message(size, confirm_size_bytes),
+    if _needs_confirmation(est, confirm_size_bytes, _HOSTED_CONFIRM_TOLERANCE):
+        return _summary_refusal(
+            summary,
+            _confirmation_message(est, confirm_size_bytes),
             confirmation_required=True,
+            export_size_bytes=est,
+            format=fmt,
             query=_query_echo(query),
         )
     # The URL is a capability: append the format token, keeping its
@@ -2053,18 +2109,24 @@ def _dataset_cap_refusal(stage: Stage, nbytes: int, query: Query) -> str:
 
 
 def _confirmation_refusal(
-    stage: Stage, nbytes: int, confirm_size_bytes: int | None, query: Query
+    stage: Stage,
+    nbytes: int,
+    fmt: str,
+    confirm_size_bytes: int | None,
+    query: Query,
 ) -> str | None:
-    """Refusal JSON if a local export of nbytes still needs the user's
-    confirmation (OCE-355), else None. Checked before writing a byte."""
-    if not _needs_confirmation(nbytes, confirm_size_bytes):
+    """Refusal JSON if a local export of nbytes (in memory) as fmt still
+    needs the user's confirmation (OCE-355), else None. Checked on the bytes
+    written (_written_bytes), exactly, before writing a byte."""
+    written = _written_bytes(nbytes, fmt)
+    if not _needs_confirmation(written, confirm_size_bytes):
         return None
-    extra = {} if nbytes == stage.size else {"export_size_bytes": nbytes}
     return _refusal(
         stage,
-        _confirmation_message(nbytes, confirm_size_bytes),
+        _confirmation_message(written, confirm_size_bytes),
         confirmation_required=True,
-        **extra,
+        export_size_bytes=written,
+        format=fmt,
         query=_query_echo(query),
     )
 
@@ -2281,13 +2343,15 @@ def export_query(
       are written.
 
     The size is checked before anything is exported, whether or not
-    stage_query was called. Above 1 GB the export is refused unless
-    confirm_size_bytes is at least its size in bytes (less 5%): ask the user
-    first. A dataset written as CSV/Parquet is sized as the flattened table,
-    and a limited one on its limited slice; the refusal states the exact
-    value to pass. The
-    export caps limit the transfer, not the size of each file: never split a
-    refused request into parts to get under them.
+    stage_query was called. An export writing more than 1 GB in the chosen
+    format (CSV text is about 3x; locally, a dataset written as CSV/Parquet
+    is sized as the flattened table, and a limited one on its limited slice)
+    is refused unless confirm_size_bytes equals that size (on hosted, within
+    5%, since the download stage is sized separately): ask the user first.
+    The refusal states the exact value. The server cannot see whether the
+    user was asked, so this is advisory: it forces an explicit, size-aware
+    step. The export caps limit the transfer, not the size of each file:
+    never split a refused request into parts to get under them.
 
     A variable given as the exact CF standard_name of exactly one of the
     datasource's variables (e.g. "sea_surface_wave_significant_height" for
@@ -2397,7 +2461,9 @@ def export_query(
             refusal = _disk_refusal(stage, dest, fmt, stage.size, query) or (
                 None
                 if flattens
-                else _confirmation_refusal(stage, stage.size, confirm_size_bytes, query)
+                else _confirmation_refusal(
+                    stage, stage.size, fmt, confirm_size_bytes, query
+                )
             )
             if refusal is not None:
                 return refusal
@@ -2445,7 +2511,9 @@ def export_query(
             if not flattens:
                 refusal = _disk_refusal(
                     stage, dest, fmt, nbytes, query
-                ) or _confirmation_refusal(stage, nbytes, confirm_size_bytes, query)
+                ) or _confirmation_refusal(
+                    stage, nbytes, fmt, confirm_size_bytes, query
+                )
                 if refusal is not None:
                     return refusal
 
@@ -2457,7 +2525,7 @@ def export_query(
             return _flatten_refusal(stage, flat_bytes, fmt, query)
         refusal = _disk_refusal(
             stage, dest, fmt, flat_bytes, query
-        ) or _confirmation_refusal(stage, flat_bytes, confirm_size_bytes, query)
+        ) or _confirmation_refusal(stage, flat_bytes, fmt, confirm_size_bytes, query)
         if refusal is not None:
             return refusal
         try:
@@ -2561,7 +2629,7 @@ _append_doc_sections(
         path: Local (stdio) destination file path (required on stdio; parent directories are created; confined to OCEANUM_MCP_EXPORT_DIR when set). Ignored on hosted servers, which return a download URL.
         format: Output format: netcdf (datasets), parquet or csv (tabular, or datasets small enough to flatten into a table such as point time series). Defaults by container: dataset -> netcdf, tabular -> parquet.
         overwrite: Overwrite an existing local file (default false). Local export only.
-        confirm_size_bytes: Required for results above 1 GB: the size in bytes the user has agreed to export (size_bytes from stage_query, or the value a refusal states). Accepted if at least the export's size less 5%. Ignored for smaller results.
+        confirm_size_bytes: Required for results above 1 GB: the size in bytes, in the chosen format, the user has agreed to export (stage_query's size_bytes for the default format, or export_size_bytes from a refusal). Must match exactly (within 5% on hosted servers). Ignored for exports of 1 GB or less.
 {_QUERY_PARAM_DOCS}
 
     Returns:
@@ -2569,9 +2637,9 @@ _append_doc_sections(
         available_formats (or a refused object, with no URL, above the hosted
         cap). Local: JSON with the written path, format, bytes_written, a
         structure summary, and any limit_note. Neither returns inline values.
-        An unconfirmed result above 1 GB returns a refused object with
-        confirmation_required (and, locally, export_size_bytes when the
-        flattened table or limited slice differs from size_bytes).
+        An unconfirmed export above 1 GB returns a refused object with
+        confirmation_required, the format, and export_size_bytes (the value
+        to confirm).
     """,
 )
 

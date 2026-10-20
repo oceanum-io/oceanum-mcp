@@ -149,7 +149,7 @@ class TestExportQueryLocal:
             )
         )
         assert parsed["confirmation_required"] is True
-        assert f"confirm_size_bytes={4 * GB} is less than" in parsed["message"]
+        assert f"confirm_size_bytes={4 * GB} does not match" in parsed["message"]
         assert f"confirm_size_bytes={5 * GB}." in parsed["message"]
         mock_conn.query.assert_not_called()
 
@@ -458,8 +458,10 @@ class TestConfirmationTolerance:
         [
             (5 * GB, True),
             (int(5 * GB * 0.96), True),  # within the 5% tolerance
-            (6 * GB, True),  # the user agreed to more
+            (int(5 * GB * 1.04), True),
             (int(5 * GB * 0.94), False),
+            (int(5 * GB * 1.06), False),  # bounded above: no blanket value
+            (10**12, False),
             (1, False),
         ],
     )
@@ -509,14 +511,16 @@ class TestFlattenedExportConfirmation:
             {"hs": (("i",), da.zeros(rows, chunks=10_000_000))}
         )
         flat = rows * 2 * 8
+        written = flat * 3  # CSV text, the estimate the caps use
         dest = tmp_path / "out.csv"
 
         parsed = json.loads(
             server.export_query(datasource_id="test-ds", path=str(dest), format="csv")
         )
         assert parsed["confirmation_required"] is True
-        assert parsed["export_size_bytes"] == flat
-        assert f"confirm_size_bytes={flat}." in parsed["message"]
+        assert parsed["export_size_bytes"] == written
+        assert parsed["format"] == "csv"
+        assert f"confirm_size_bytes={written}." in parsed["message"]
         # Confirming the staged size does not cover the flattened table.
         parsed = json.loads(
             server.export_query(
@@ -673,3 +677,138 @@ class TestQueryDataRefusalShape:
             "v10": ["time", "latitude", "longitude"],
         }
         mock_conn.query.assert_not_called()
+
+
+class TestWrittenBytesConfirmation:
+    """OCE-355 review round 2: the 1 GB threshold, the refusal and the check
+    all use the bytes written in the chosen format, exactly on stdio."""
+
+    def test_local_confirmation_must_match_exactly(
+        self, mock_conn, mock_stage, tmp_path, roomy_disk
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=5 * GB)
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds",
+                path=str(tmp_path / "out.nc"),
+                confirm_size_bytes=5 * GB + 1,
+            )
+        )
+        assert parsed["confirmation_required"] is True
+        assert parsed["export_size_bytes"] == 5 * GB
+        mock_conn.query.assert_not_called()
+
+    def test_local_table_as_csv_confirmed_on_text_size(
+        self, mock_conn, mock_stage, tmp_path, roomy_disk
+    ):
+        # 400 MB staged: below the threshold as Parquet, ~1.2 GB as CSV.
+        mock_stage.return_value = make_stage(Container.DataFrame, size=400_000_000)
+        mock_conn.query.return_value = pd.DataFrame({"x": [1.0]})
+
+        as_csv = json.loads(
+            server.export_query(
+                datasource_id="test-ds", path=str(tmp_path / "o.csv"), format="csv"
+            )
+        )
+        assert as_csv["confirmation_required"] is True
+        assert as_csv["export_size_bytes"] == 1_200_000_000
+        assert as_csv["size_bytes"] == 400_000_000
+
+        as_parquet = json.loads(
+            server.export_query(
+                datasource_id="test-ds", path=str(tmp_path / "o.parquet")
+            )
+        )
+        assert "refused" not in as_parquet
+
+        confirmed = json.loads(
+            server.export_query(
+                datasource_id="test-ds",
+                path=str(tmp_path / "o.csv"),
+                format="csv",
+                confirm_size_bytes=1_200_000_000,
+            )
+        )
+        assert "refused" not in confirmed
+
+    def test_hosted_csv_confirmed_on_text_size(self, mock_conn, hosted):
+        stage = _download_stage(400_000_000)
+        with patch.object(server, "_download_stage", return_value=stage):
+            as_csv = json.loads(
+                server.export_query(datasource_id="test-ds", format="csv")
+            )
+            as_nc = json.loads(server.export_query(datasource_id="test-ds"))
+            confirmed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds",
+                    format="csv",
+                    confirm_size_bytes=1_200_000_000,
+                )
+            )
+        assert as_csv["confirmation_required"] is True
+        assert as_csv["export_size_bytes"] == 1_200_000_000
+        assert "download_url" not in as_csv
+        assert "download_url" in as_nc
+        assert "download_url" in confirmed
+
+    def test_stage_advice_names_the_value_export_checks(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.Dataset, size=5 * GB)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert f"confirm_size_bytes={5 * GB} to export_query for NetCDF" in rec
+        assert "flattened" in rec
+        assert "the refusal states the value to confirm" in rec
+
+    def test_hosted_stage_advice_names_csv_exception(
+        self, mock_conn, mock_stage, hosted
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=5 * GB)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "for any format but CSV" in rec
+
+    def test_midsize_stage_warns_csv_may_need_confirmation(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=400_000_000)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "confirm" in rec
+        assert "as CSV" in rec
+
+    def test_small_midsize_stage_has_no_confirmation_note(self, mock_conn, mock_stage):
+        mock_stage.return_value = make_stage(Container.DataFrame, size=100_000_000)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "confirm" not in rec
+
+
+class TestLimitDims:
+    """OCE-358 review round 2: limit is counted only on recognised dims."""
+
+    @staticmethod
+    def _rec(limit: int) -> str:
+        return json.loads(
+            server.stage_query(
+                datasource_id="test-ds",
+                time_start="2020-01-01",
+                time_end="2020-12-31",
+                time_resolution="1D",
+                limit=limit,
+            )
+        )["recommendation"]
+
+    def test_ensemble_only_counted(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(dlen=500, coordmap={"hs": "e"})
+        assert self._rec(50).startswith("Small enough")
+
+    def test_unrecognised_dim_not_counted(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(dlen=500, coordmap={"hs": "z"})
+        assert "not known" in self._rec(50)
+
+
+def test_table_refusal_has_no_empty_variable_dims(mock_conn, mock_stage):
+    mock_stage.return_value = _stage(Container.DataFrame, size=73 * GB, coordmap={})
+
+    parsed = json.loads(server.query_data(datasource_id="test-ds"))
+    assert parsed["refused"] is True
+    assert "variable_dims" not in parsed

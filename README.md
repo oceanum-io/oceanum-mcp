@@ -368,12 +368,15 @@ large to return inline. Behaviour depends on transport:
 `export_query` sizes the result itself, whether or not `stage_query` was
 called, and refuses before anything is exported. Results above the export cap
 are refused outright: the cap limits the transfer, so splitting the request
-into parts is not a way round it. Results above 1 GB are refused unless
-`confirm_size_bytes` is at least their size in bytes (less 5%: hosted exports
-are sized on the download stage, not the `stage_query` stage), which the agent
-should pass only after the user has agreed. Locally, a dataset written as
-CSV/Parquet is sized as the flattened table and a limited one on its limited
-slice; the refusal states the exact value to pass.
+into parts is not a way round it. An export that writes more than 1 GB in the
+chosen format (CSV text is estimated at about 3x the staged size; locally, a
+dataset written as CSV/Parquet is sized as the flattened table, and a limited
+one on its limited slice) is refused unless `confirm_size_bytes` equals that
+size. On hosted servers a value within 5% is accepted, because the download
+stage is sized separately from `stage_query`'s stage. The refusal reports the
+exact value as `export_size_bytes`. The agent should pass it only after the
+user has agreed. The server cannot see whether the user was asked, so the check
+is advisory: it forces an explicit, size-aware step for each large export.
 
 Accepts the same query parameters as `query_data` plus:
 
@@ -382,7 +385,7 @@ Accepts the same query parameters as `query_data` plus:
 | `path`      | string | Destination file path (parent directories are created)                   |
 | `format`    | string | `netcdf` (datasets), `parquet` or `csv` (tabular); sensible default      |
 | `overwrite` | bool   | Overwrite an existing file (default false)                               |
-| `confirm_size_bytes` | int | Bytes the user agreed to export; required above 1 GB (accepted if at least the export's size less 5%) |
+| `confirm_size_bytes` | int | Bytes (in the chosen format) the user agreed to export; required above 1 GB; exact match (within 5% on hosted) |
 
 ### `load_datasource`
 
