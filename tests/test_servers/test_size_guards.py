@@ -46,6 +46,22 @@ def _small_dataset() -> xr.Dataset:
     )
 
 
+def _stage(
+    container: Container = Container.Dataset,
+    size: int = 1000,
+    dlen: int = 10,
+    coordmap: dict[str, str] | None = None,
+):
+    """A stage whose variables have the given dims (coordmap codes)."""
+    stage = make_stage(container, size=size, dlen=dlen)
+    return stage.model_copy(
+        update={
+            "coordmap": {"hs": "t"} if coordmap is None else coordmap,
+            "coordkeys": {"t": "time", "x": "longitude", "y": "latitude"},
+        }
+    )
+
+
 def _download_stage(size: int, container: str = "dataset") -> dict:
     return {
         "container": container,
@@ -133,7 +149,8 @@ class TestExportQueryLocal:
             )
         )
         assert parsed["confirmation_required"] is True
-        assert f"confirm_size_bytes={4 * GB} does not match" in parsed["message"]
+        assert f"confirm_size_bytes={4 * GB} is less than" in parsed["message"]
+        assert f"confirm_size_bytes={5 * GB}." in parsed["message"]
         mock_conn.query.assert_not_called()
 
     def test_confirmed_large_export_proceeds(
@@ -226,8 +243,8 @@ class TestExportQueryLocal:
         assert parsed["export_size_bytes"] == slice_bytes
         assert f"confirm_size_bytes={slice_bytes}" in parsed["message"]
 
-        # Confirming the unlimited staged size does not confirm the slice.
-        parsed = json.loads(server.export_query(**kwargs, confirm_size_bytes=73 * GB))
+        # A confirmation below the slice (less tolerance) does not cover it.
+        parsed = json.loads(server.export_query(**kwargs, confirm_size_bytes=1 * GB))
         assert parsed["confirmation_required"] is True
         assert list(tmp_path.iterdir()) == []
 
@@ -284,7 +301,8 @@ class TestExportQueryHosted:
         assert parsed["refused"] is True
         assert "confirmation_required" not in parsed
         assert NOT_PER_PART in parsed["message"]
-        assert "oceanum Python library" in parsed["message"]
+        assert "Narrow the query" in parsed["message"]
+        assert "library" not in parsed["message"]
 
 
 class TestQueryDataFailsFast:
@@ -377,7 +395,7 @@ class TestStageInlineAdvice:
 
     def test_744_record_series_not_recommended_inline(self, mock_conn, mock_stage):
         # The observed point series: 744 hourly steps, 11.9 kB.
-        mock_stage.return_value = make_stage(Container.Dataset, size=11_928, dlen=744)
+        mock_stage.return_value = _stage(size=11_928, dlen=744)
 
         rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
         assert "Small enough to return inline" not in rec
@@ -388,14 +406,14 @@ class TestStageInlineAdvice:
             assert alternative in rec
 
     def test_at_record_cap_recommended_inline(self, mock_conn, mock_stage):
-        mock_stage.return_value = make_stage(Container.Dataset, size=1600, dlen=100)
+        mock_stage.return_value = _stage(size=1600, dlen=100)
 
         rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
         assert rec.startswith("Small enough to return inline")
 
     def test_follows_configured_record_cap(self, mock_conn, mock_stage, monkeypatch):
         monkeypatch.setenv("OCEANUM_MCP_MAX_INLINE_ROWS", "1000")
-        mock_stage.return_value = make_stage(Container.Dataset, size=11_928, dlen=744)
+        mock_stage.return_value = _stage(size=11_928, dlen=744)
 
         rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
         assert rec.startswith("Small enough to return inline")
@@ -409,7 +427,7 @@ class TestStageInlineAdvice:
     def test_reduction_carries_compute_caveat(self, mock_conn, mock_stage):
         # The observed timeout: a small global annual mean that could not be
         # computed before the client gave up.
-        mock_stage.return_value = make_stage(Container.Dataset, size=16_600, dlen=1)
+        mock_stage.return_value = _stage(size=16_600, dlen=1, coordmap={"u10_mean": ""})
 
         rec = json.loads(
             server.stage_query(
@@ -424,7 +442,234 @@ class TestStageInlineAdvice:
         assert "timeout" in rec
 
     def test_plain_query_has_no_compute_caveat(self, mock_conn, mock_stage):
-        mock_stage.return_value = make_stage(Container.Dataset, size=1000, dlen=10)
+        mock_stage.return_value = _stage(size=1000, dlen=10)
 
         rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
         assert "native record" not in rec
+
+
+class TestConfirmationTolerance:
+    """OCE-355 review: the confirmed size may come from a different endpoint
+    (stage_query) than the one export_query sizes, so it need not match
+    exactly; a confirmation covers any export up to the confirmed size."""
+
+    @pytest.mark.parametrize(
+        ("confirmed", "accepted"),
+        [
+            (5 * GB, True),
+            (int(5 * GB * 0.96), True),  # within the 5% tolerance
+            (6 * GB, True),  # the user agreed to more
+            (int(5 * GB * 0.94), False),
+            (1, False),
+        ],
+    )
+    def test_hosted(self, mock_conn, hosted, confirmed, accepted):
+        with patch.object(
+            server, "_download_stage", return_value=_download_stage(5 * GB)
+        ):
+            parsed = json.loads(
+                server.export_query(
+                    datasource_id="test-ds", confirm_size_bytes=confirmed
+                )
+            )
+        assert ("download_url" in parsed) is accepted
+        if not accepted:
+            # The refusal states the exact value to pass.
+            assert f"confirm_size_bytes={5 * GB}." in parsed["message"]
+
+    def test_hosted_confirmation_refusal_reuses_refusal_shape(self, mock_conn, hosted):
+        with patch.object(
+            server, "_download_stage", return_value=_download_stage(5 * GB)
+        ):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert parsed["refused"] is True
+        assert parsed["container"] == "dataset"
+        assert parsed["size_human"] == "5.0 GB"
+        assert parsed["query"]["datasource"] == "test-ds"
+
+    def test_confirmation_cannot_be_avoided_by_splitting(self, mock_conn, hosted):
+        with patch.object(
+            server, "_download_stage", return_value=_download_stage(5 * GB)
+        ):
+            parsed = json.loads(server.export_query(datasource_id="test-ds"))
+        assert "splitting it into parts" in parsed["message"]
+
+
+class TestFlattenedExportConfirmation:
+    """OCE-355 review: a dataset written as CSV/Parquet is confirmed on its
+    flattened table size, which can far exceed the staged size."""
+
+    def test_main_path_confirms_flattened_size(
+        self, mock_conn, mock_stage, tmp_path, roomy_disk
+    ):
+        # 600 MB staged, but 70M rows x 2 columns x 8 bytes = 1.12 GB flat.
+        rows = 70_000_000
+        mock_stage.return_value = make_stage(Container.Dataset, size=600_000_000)
+        mock_conn.query.return_value = xr.Dataset(
+            {"hs": (("i",), da.zeros(rows, chunks=10_000_000))}
+        )
+        flat = rows * 2 * 8
+        dest = tmp_path / "out.csv"
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(dest), format="csv")
+        )
+        assert parsed["confirmation_required"] is True
+        assert parsed["export_size_bytes"] == flat
+        assert f"confirm_size_bytes={flat}." in parsed["message"]
+        # Confirming the staged size does not cover the flattened table.
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds",
+                path=str(dest),
+                format="csv",
+                confirm_size_bytes=600_000_000,
+            )
+        )
+        assert parsed["confirmation_required"] is True
+        assert list(tmp_path.iterdir()) == []
+
+    def test_netcdf_of_same_dataset_needs_no_confirmation(
+        self, mock_conn, mock_stage, tmp_path, roomy_disk
+    ):
+        mock_stage.return_value = make_stage(Container.Dataset, size=600_000_000)
+        mock_conn.query.return_value = _small_dataset()
+
+        parsed = json.loads(
+            server.export_query(datasource_id="test-ds", path=str(tmp_path / "o.nc"))
+        )
+        assert "refused" not in parsed
+
+    def test_limited_slice_confirms_flattened_size(
+        self, mock_conn, mock_stage, tmp_path, roomy_disk
+    ):
+        # The limited slice is ~400 MB as a dataset, ~1.2 GB as a table.
+        width = 333_334
+        mock_stage.return_value = make_stage(Container.Dataset, size=73 * GB)
+        mock_conn.query.return_value = xr.Dataset(
+            {
+                "hs": (
+                    ("time", "i"),
+                    da.zeros((366, width), chunks=(1, width)),
+                )
+            },
+            coords={"time": pd.date_range("2020-01-01", periods=366, freq="D")},
+        )
+        flat = 150 * width * 3 * 8  # time, i and hs columns
+
+        parsed = json.loads(
+            server.export_query(
+                datasource_id="test-ds",
+                path=str(tmp_path / "out.parquet"),
+                format="parquet",
+                time_start="2020-01-01",
+                time_end="2020-12-31",
+                time_resolution="1D",
+                limit=150,
+            )
+        )
+        assert parsed["confirmation_required"] is True
+        assert parsed["export_size_bytes"] == flat
+        assert list(tmp_path.iterdir()) == []
+
+
+class TestStageRecordCount:
+    """OCE-358 review: records are counted as query_data counts them (the
+    product of ALL a dataset's dims), and conservatively when unknown."""
+
+    @staticmethod
+    def _rec(**kwargs) -> str:
+        return json.loads(server.stage_query(datasource_id="test-ds", **kwargs))[
+            "recommendation"
+        ]
+
+    def test_gridded_variables_sharing_dims_counted_by_dlen(
+        self, mock_conn, mock_stage
+    ):
+        # A 9x9 grid at one time: u10 on (t, y, x), a mask on (y, x).
+        mock_stage.return_value = _stage(dlen=81, coordmap={"u10": "tyx", "lsm": "yx"})
+        assert self._rec().startswith("Small enough to return inline")
+
+    def test_gridded_over_record_cap(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(dlen=60_264, coordmap={"u10": "tyx"})
+        rec = self._rec()
+        assert "60264 records" in rec
+        assert "Small enough" not in rec
+
+    def test_gridded_variables_on_different_dims_not_called_inline(
+        self, mock_conn, mock_stage
+    ):
+        # 50 points per variable, but flattened to records over the union of
+        # (t, x) and (t, y) the count is unknown and can exceed the cap.
+        mock_stage.return_value = _stage(dlen=50, coordmap={"a": "tx", "b": "ty"})
+        rec = self._rec()
+        assert "Small enough" not in rec
+        assert "not known" in rec
+        assert "preview" in rec
+
+    def test_dataset_without_coordmap_not_called_inline(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(dlen=10, coordmap={})
+        assert "Small enough" not in self._rec()
+
+    def test_limit_on_time_series_counted(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(dlen=366)
+        resampled = {
+            "time_start": "2020-01-01",
+            "time_end": "2020-12-31",
+            "time_resolution": "1D",
+        }
+        assert self._rec(**resampled, limit=50).startswith("Small enough")
+        assert "200 records" in self._rec(**resampled, limit=200)
+
+    def test_limit_above_cap_on_grid_still_a_preview(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(dlen=60_264, coordmap={"u10": "tyx"})
+        rec = self._rec(
+            time_start="2020-01-01",
+            time_end="2020-01-31",
+            time_resolution="1D",
+            limit=500,
+        )
+        assert "60264 records" in rec
+
+    def test_small_limit_on_grid_is_unknown(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(dlen=60_264, coordmap={"u10": "tyx"})
+        rec = self._rec(
+            time_start="2020-01-01",
+            time_end="2020-01-31",
+            time_resolution="1D",
+            limit=10,
+        )
+        assert "not known" in rec
+
+    def test_limited_table_counted(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(Container.DataFrame, dlen=5000, coordmap={})
+        rec = self._rec(
+            time_start="2020-01-01",
+            time_end="2020-12-31",
+            aggregate_operations=["mean"],
+            limit=20,
+        )
+        assert rec.startswith("Small enough")
+
+    @pytest.mark.parametrize("size", [500_000_000, 5 * GB])
+    def test_compute_caveat_on_larger_branches(self, mock_conn, mock_stage, size):
+        mock_stage.return_value = _stage(size=size, dlen=10**8)
+        rec = self._rec(
+            time_start="2020-01-01", time_end="2020-12-31", time_resolution="1D"
+        )
+        assert "reads every native record" in rec
+
+
+class TestQueryDataRefusalShape:
+    def test_refusal_reports_variable_dims_from_stage(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(
+            size=73 * GB, dlen=9_119_900_160, coordmap={"u10": "tyx", "v10": "tyx"}
+        )
+
+        parsed = json.loads(server.query_data(datasource_id="test-ds"))
+        assert parsed["refused"] is True
+        assert parsed["variable_dims"] == {
+            "u10": ["time", "latitude", "longitude"],
+            "v10": ["time", "latitude", "longitude"],
+        }
+        mock_conn.query.assert_not_called()

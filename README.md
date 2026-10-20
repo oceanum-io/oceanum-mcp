@@ -310,8 +310,10 @@ Query a datasource with filters and return small results inline as
 coordinate-attributed JSON records with explicit `truncated`/`lazy` flags.
 The query is staged first: gridded results above the inline limit are
 summarized lazily (structure only); tabular results above the limit, and any
-result above 1 GB, are refused with the staged size and alternatives. Library
-warnings (e.g. the
+result above 1 GB, are refused with the staged size and alternatives (the
+1 GB refusal also lists each variable's dims). The exception is `limit`
+combined with `time_resolution` or `aggregate_operations`: the limited slice
+may be small, so it is still opened lazily. Library warnings (e.g. the
 2,000,000-row cap on tabular queries) are included in the response.
 
 | Parameter              | Type         | Description                                                        |
@@ -367,8 +369,11 @@ large to return inline. Behaviour depends on transport:
 called, and refuses before anything is exported. Results above the export cap
 are refused outright: the cap limits the transfer, so splitting the request
 into parts is not a way round it. Results above 1 GB are refused unless
-`confirm_size_bytes` equals their exact size in bytes, which the agent should
-pass only after the user has agreed.
+`confirm_size_bytes` is at least their size in bytes (less 5%: hosted exports
+are sized on the download stage, not the `stage_query` stage), which the agent
+should pass only after the user has agreed. Locally, a dataset written as
+CSV/Parquet is sized as the flattened table and a limited one on its limited
+slice; the refusal states the exact value to pass.
 
 Accepts the same query parameters as `query_data` plus:
 
@@ -377,7 +382,7 @@ Accepts the same query parameters as `query_data` plus:
 | `path`      | string | Destination file path (parent directories are created)                   |
 | `format`    | string | `netcdf` (datasets), `parquet` or `csv` (tabular); sensible default      |
 | `overwrite` | bool   | Overwrite an existing file (default false)                               |
-| `confirm_size_bytes` | int | The result's exact size in bytes; required above 1 GB, after the user agrees |
+| `confirm_size_bytes` | int | Bytes the user agreed to export; required above 1 GB (accepted if at least the export's size less 5%) |
 
 ### `load_datasource`
 
