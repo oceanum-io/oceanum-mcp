@@ -239,6 +239,18 @@ The Auth0 tenant must allow client registration for Claude (Dynamic Client
 Registration, or a pre-registered application) and issue JWT access tokens
 for the configured audience. Header/bearer clients are unaffected either way.
 
+### Post-deploy smoke test
+
+`scripts/smoke_hosted.py` opens real gridded datasources through a deployed
+server (`load_datasource`, and a whole-grid `query_data`), which catches a
+broken data stack in the image that `tools/list` does not:
+
+```bash
+DATAMESH_TOKEN=<token> uv run python scripts/smoke_hosted.py https://mcp.oceanum.io/datamesh
+```
+
+It exits non-zero if any call fails.
+
 ## Datamesh Tools
 
 The intended workflow is: `search_catalog` → `get_datasource_info` → `stage_query`

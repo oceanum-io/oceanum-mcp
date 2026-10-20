@@ -26,6 +26,11 @@ dependencies = [
     # numcodecs>=0.16 (blosc.cbuffer_sizes removed); oceanum does not pin this.
     # Remove once oceanum pins numcodecs itself or moves to zarr>=3.
     "numcodecs<0.16",
+    # xarray>=2026.9 dropped zarr 2 support: it passes zarr_format= to
+    # zarr.open_group, which zarr 2.x rejects, so every gridded load fails
+    # (OCE-354). Only oceanum>=1.2.1 pins this; oceanum 1.1.x-1.2.0 do not.
+    # Remove together with the numcodecs pin once oceanum moves to zarr>=3.
+    "xarray<2026.9",
 ]
 
 [project.optional-dependencies]
