@@ -253,10 +253,12 @@ DATAMESH_TOKEN=<token> uv run python scripts/smoke_hosted.py https://mcp.oceanum
 
 The token must be valid for the gateway the server uses. `--load-datasource`,
 `--query-datasource` and `--query-variable` override the default datasets.
-Exit status: `0` all checks passed; `1` a check failed, or the server was
-unreachable or rejected the token; `2` usage error (e.g. `DATAMESH_TOKEN`
-unset); `3` inconclusive (a datasource was not found or not shared, or the
-query was small enough to be downloaded instead of opened over zarr).
+The URL must be https unless the host is local, since the token is sent with
+every request. Exit status: `0` all checks passed; `1` a check failed, or the
+server was unreachable or rejected the token; `2` usage error
+(`DATAMESH_TOKEN` unset, or a non-https remote URL); `3` inconclusive (a
+datasource was not found, not shared or empty, the query was refused, or it
+was small enough to be downloaded instead of opened over zarr).
 
 The hosted image installs this package from the source checkout
 (`pip install .`), not from PyPI, so dependency fixes take effect on the next

@@ -9,44 +9,47 @@ every deploy_cloudrun*.sh:
     DATAMESH_TOKEN=... uv run python scripts/smoke_hosted.py [URL]
 
 URL defaults to https://mcp.oceanum.io/datamesh; pass the service's run.app
-URL + /datamesh for dev. The token is sent as X-DATAMESH-TOKEN and must be a
-token for the gateway the server is deployed against. Datasources default to
-the OCE-354 repro calls; see --help to override them.
+URL + /datamesh for dev. It must be https unless the host is local. The token
+is sent as X-DATAMESH-TOKEN and must be a token for the gateway the server is
+deployed against. Datasources default to the OCE-354 repro calls; see --help
+to override them.
 
 Exit status:
     0  every check passed
     1  a check failed, or the server could not be reached or rejected the token
-    2  usage error (e.g. DATAMESH_TOKEN unset)
+    2  usage error (e.g. DATAMESH_TOKEN unset, or a non-https remote URL)
     3  inconclusive: no failure, but a check could not exercise the zarr path
-       (datasource not found or not shared, or the result was not lazy)
+       (datasource not found, not shared or empty, the query was refused, or
+       the result was not opened lazily)
 """
 
 import argparse
 import asyncio
 import json
 import os
-import re
 import sys
 from typing import Any
+from urllib.parse import urlparse
 
 import httpx2
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
-from mcp.shared.exceptions import MCPError
+from fastmcp.exceptions import MCPError
 
 DEFAULT_URL = "https://mcp.oceanum.io/datamesh"
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 
-# The server's wording for a datasource that is missing or not shared with
-# the caller: a bad smoke-test input, not a broken image.
-_UNAVAILABLE_RE = re.compile(
-    r"not found|not accessible|don't have access|not authorized", re.IGNORECASE
-)
+# Errors the client raises for an unreachable server, a rejected token, a
+# failed MCP handshake, or a call that times out.
+_CLIENT_ERRORS = (MCPError, RuntimeError, OSError, httpx2.HTTPError)
 
-# Errors raised by the client for an unreachable server, a rejected token or
-# a failed MCP handshake.
-_CONNECT_ERRORS = (MCPError, RuntimeError, OSError, httpx2.HTTPError)
+# What each check proves when its dataset comes back opened lazily (over zarr).
+_NOT_LAZY = {
+    "load_datasource": "datasource was not opened lazily over zarr",
+    "query_data": "query did not reach the zarr path (result was downloaded)",
+}
 
 
 def build_checks(args: argparse.Namespace) -> list[tuple[str, dict[str, Any]]]:
@@ -68,7 +71,19 @@ def build_checks(args: argparse.Namespace) -> list[tuple[str, dict[str, Any]]]:
     ]
 
 
-def check_result(is_error: bool, text: str) -> tuple[str, str]:
+def _unavailable(error: str, datasource_id: str) -> bool:
+    """Whether error is the server's own wording (datamesh server.py
+    _metadata_error_fields) for a datasource that is missing or not shared
+    with the caller: a bad smoke-test input, not a broken image. Anything
+    else, e.g. a zarr group or file not found, is a failure."""
+    missing = f"Datasource {datasource_id!r} not found or not accessible"
+    not_shared = f"You don't have access to datasource {datasource_id!r}"
+    return error.startswith((missing, not_shared))
+
+
+def check_result(
+    tool: str, datasource_id: str, is_error: bool, text: str
+) -> tuple[str, str]:
     """Classify a tool result as (PASS | FAIL | INCONCLUSIVE, detail)."""
     if is_error:
         return FAIL, text
@@ -80,15 +95,16 @@ def check_result(is_error: bool, text: str) -> tuple[str, str]:
         return FAIL, f"unexpected payload: {text[:200]}"
     if "error" in payload:
         error = str(payload["error"])
-        if _UNAVAILABLE_RE.search(error):
+        if _unavailable(error, datasource_id):
             return INCONCLUSIVE, f"datasource unavailable: {error}"
         return FAIL, error
+    if payload.get("status") == "no_data" or payload.get("refused"):
+        return INCONCLUSIVE, f"no dataset to open: {payload.get('message')}"
     if payload.get("container") != "dataset" or not payload.get("dims"):
         return FAIL, f"not a dataset summary: {text[:200]}"
     if payload.get("lazy") is not True:
         return INCONCLUSIVE, (
-            "query did not reach the zarr path (result was downloaded, not "
-            f"opened lazily; staged_size_bytes={payload.get('staged_size_bytes')})"
+            f"{_NOT_LAZY[tool]} (staged_size_bytes={payload.get('staged_size_bytes')})"
         )
     return PASS, str(payload["dims"])
 
@@ -99,13 +115,23 @@ async def run(url: str, token: str, checks: list[tuple[str, dict[str, Any]]]) ->
     try:
         async with Client(transport, timeout=300) as client:
             for tool, args in checks:
-                result = await client.call_tool(tool, args, raise_on_error=False)
-                text = "".join(getattr(block, "text", "") for block in result.content)
-                outcome, detail = check_result(result.is_error, text)
+                datasource_id = args["datasource_id"]
+                try:
+                    result = await client.call_tool(tool, args, raise_on_error=False)
+                except _CLIENT_ERRORS as exc:
+                    outcome, detail = FAIL, f"{type(exc).__name__}: {exc}"
+                else:
+                    text = "".join(
+                        getattr(block, "text", "") for block in result.content
+                    )
+                    outcome, detail = check_result(
+                        tool, datasource_id, result.is_error, text
+                    )
                 outcomes.append(outcome)
-                print(f"{outcome} {tool} {args['datasource_id']}: {detail}")
-    except _CONNECT_ERRORS as exc:
-        print(f"FAIL {url}: {type(exc).__name__}: {exc} (check the URL and token)")
+                print(f"{outcome} {tool} {datasource_id}: {detail}")
+    except _CLIENT_ERRORS as exc:
+        hint = "" if outcomes else " (could not connect: check the URL and token)"
+        print(f"FAIL {url}: {type(exc).__name__}: {exc}{hint}")
         return 1
     if FAIL in outcomes:
         return 1
@@ -136,6 +162,14 @@ def main(argv: list[str] | None = None) -> int:
         help="variable for query_data (default: %(default)s)",
     )
     args = parser.parse_args(argv)
+    parsed = urlparse(args.url)
+    if parsed.scheme != "https" and parsed.hostname not in LOCAL_HOSTS:
+        print(
+            f"Refusing to send the token to {args.url}: use https (plain http "
+            "is only allowed for localhost).",
+            file=sys.stderr,
+        )
+        return 2
     token = os.environ.get("DATAMESH_TOKEN")
     if not token:
         print("Set DATAMESH_TOKEN to a Datamesh token.", file=sys.stderr)
