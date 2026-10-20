@@ -257,6 +257,23 @@ class TestDatasourceSuggestionThreshold:
             "oceanum_wave_nzpar_era5_grid",
         }
 
+    @pytest.mark.parametrize(
+        "wanted",
+        [
+            "Oceanum New Zealand 5km ERA5 wave parameters",
+            "Oceanum New Zealand 5km ERA5 wave paramters",
+        ],
+    )
+    def test_display_name_or_near_miss_of_one_suggests_its_id(self, mock_conn, wanted):
+        ids = _suggested(mock_conn, wanted, WAVE_IDS)
+        assert ids[0] == "oceanum_wave_nzpar_era5_grid"
+        assert "oceanum_wave_waika_era5_grid" not in ids
+
+    def test_far_miss_of_a_name_suggests_nothing(self, mock_conn):
+        assert (
+            _suggested(mock_conn, "Oceanum Fake ERA5 wave parameters", WAVE_IDS) == []
+        )
+
     def test_edit_distance_counts_adjacent_swap_as_one(self):
         assert server._edit_distance("nzpar", "nzpra") == 1
         assert server._edit_distance("grd", "grid") == 1

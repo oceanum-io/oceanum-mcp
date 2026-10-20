@@ -11,6 +11,7 @@ from __future__ import annotations
 import json
 import math
 import sys
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -353,6 +354,7 @@ def format_datasource(ds: Any) -> dict[str, Any]:
 SUMMARY_DESCRIPTION_CHARS = 200
 SUMMARY_MAX_VARIABLES = 20
 SUMMARY_MAX_TAGS = 5
+SUMMARY_TAG_CHARS = 60  # per tag
 # Decimal places kept in summary bounds, rounded outward so coverage never
 # shrinks: ~10 m, and drops float32 noise (e.g. -38.599998474121094).
 SUMMARY_BOUNDS_DECIMALS = 4
@@ -361,8 +363,9 @@ SUMMARY_BOUNDS_DECIMALS = 4
 INFO_DESCRIPTION_CHARS = 1000
 INFO_MAX_GLOBAL_ATTRS = 25  # global attributes, and info entries
 INFO_VALUE_CHARS = 200  # longest attribute value shown before clipping
-# Ceiling on the serialized summary. Past it, trailing variables (then
-# coordinates) are left out and counted in variables_omitted/coords_omitted.
+# Target for the serialized summary. Past it, attributes and per-variable
+# details are shed in stages (_FIT_STAGES); every variable name always stays,
+# as a query needs it, so a record with very many variables can still exceed it.
 INFO_BUDGET_CHARS = 30_000
 
 # The only attributes a variable or coordinate keeps in the summary view.
@@ -376,10 +379,6 @@ _SUMMARY_NOTE = (
     "schema.data_vars/attrs are omitted as duplicates of "
     'variables/attributes. Pass detail="full" for the complete record, with '
     "every attribute."
-)
-_TRUNCATED_NOTE = (
-    " This record is too large to list every variable here: see "
-    'variables_omitted/coords_omitted, and pass detail="full" for all of them.'
 )
 
 
@@ -436,13 +435,16 @@ def _summary_entries(entries: dict[str, Any]) -> dict[str, Any]:
     return {str(n): _summary_entry(e) for n, e in entries.items()}
 
 
-def _round_out(value: float, up: bool) -> float:
-    """value rounded to SUMMARY_BOUNDS_DECIMALS, away from the box's inside."""
+def _round_out(value: float, up: bool) -> float | None:
+    """value rounded to SUMMARY_BOUNDS_DECIMALS, away from the box's inside;
+    None (JSON null) if it is not finite."""
+    if not math.isfinite(value):
+        return None
     scale = 10**SUMMARY_BOUNDS_DECIMALS
     # round() first: a float product such as 1650000.0000000002 must not
     # step to the next unit.
     step = math.ceil if up else math.floor
-    return step(round(value * scale, 6)) / scale
+    return step(round(value * scale, 6)) / scale + 0.0  # + 0.0: no -0.0
 
 
 def format_datasource_summary(ds: Any) -> dict[str, Any]:
@@ -477,7 +479,7 @@ def format_datasource_summary(ds: Any) -> dict[str, Any]:
 
     tags = [str(t) for t in ds.tags or []]
     if tags:
-        result["tags"] = tags[:SUMMARY_MAX_TAGS]
+        result["tags"] = [_clip(t, SUMMARY_TAG_CHARS) for t in tags[:SUMMARY_MAX_TAGS]]
     if len(tags) > SUMMARY_MAX_TAGS:
         result["tags_total"] = len(tags)
     return result
@@ -490,8 +492,8 @@ def format_datasource_bounded(ds: Any) -> dict[str, Any]:
     units/long_name/standard_name only. The description and long attribute
     values are clipped and global attribute lists capped. schema.data_vars
     and schema.attrs are dropped when they duplicate variables/attributes.
-    Past INFO_BUDGET_CHARS, trailing variables and coordinates are left out
-    and counted.
+    Past INFO_BUDGET_CHARS, attributes and then per-variable details are
+    shed (see _fit_budget); every variable name stays.
     """
     full = format_datasource(ds)
     out = dict(full)
@@ -522,32 +524,82 @@ def format_datasource_bounded(ds: Any) -> dict[str, Any]:
     return out
 
 
-def _fit_budget(out: dict[str, Any]) -> None:
-    """Drop trailing entries of out's variable listings (variables, then
-    schema.data_vars, then schema.coords) until it serializes within
-    INFO_BUDGET_CHARS, counting them in *_omitted."""
-    size = len(to_compact_json(out))
-    if size <= INFO_BUDGET_CHARS:
+def _shed_attrs(entries: Any, keep: tuple[str, ...]) -> None:
+    """Drop the attributes of each schema entry not in keep, in place,
+    adding them to its attrs_omitted count."""
+    if not isinstance(entries, dict):
         return
-    out["note"] += _TRUNCATED_NOTE
-    # The note's addition, plus room for the *_omitted counts.
-    size += len(_TRUNCATED_NOTE) + 64
-    schema = out.get("schema") or {}
-    listings = [
-        (out, "variables", out, "variables_omitted"),
-        (schema, "data_vars", out, "variables_omitted"),
-        (schema, "coords", out, "coords_omitted"),
-    ]
-    for parent, key, counter, count_key in listings:
-        entries = parent.get(key)
+    for entry in entries.values():
+        attrs = entry.get("attrs") if isinstance(entry, dict) else None
+        if not isinstance(attrs, dict):
+            continue
+        dropped = [k for k in attrs if k not in keep]
+        for k in dropped:
+            del attrs[k]
+        if dropped:
+            entry["attrs_omitted"] = entry.get("attrs_omitted", 0) + len(dropped)
+
+
+def _shed_global_attrs(out: dict[str, Any]) -> None:
+    for parent, key, count_key in (
+        (out, "attributes", "attributes_omitted"),
+        (out, "info", "info_omitted"),
+        (out.get("schema") or {}, "attrs", None),
+    ):
+        if isinstance(parent.get(key), dict) and parent[key]:
+            if count_key:
+                out[count_key] = out.get(count_key, 0) + len(parent[key])
+            parent[key] = {}
+
+
+def _variable_listings(out: dict[str, Any]) -> list[Any]:
+    return [out.get("variables"), (out.get("schema") or {}).get("data_vars")]
+
+
+def _shed_variable_attrs(out: dict[str, Any]) -> None:
+    for entries in _variable_listings(out):
+        _shed_attrs(entries, ("units",))
+
+
+def _shed_variable_fields(out: dict[str, Any], keep: tuple[str, ...]) -> None:
+    """Reduce each variable entry to the keys in keep, in place."""
+    for entries in _variable_listings(out):
         if not isinstance(entries, dict):
             continue
-        kept = dict(entries)
-        while kept and size > INFO_BUDGET_CHARS:
-            name, entry = kept.popitem()
-            # The entry, its key and separators; the count field is small.
-            size -= len(to_compact_json({name: entry})) - 1
-            counter[count_key] = counter.get(count_key, 0) + 1
-        parent[key] = kept
-        if size <= INFO_BUDGET_CHARS:
+        for name, entry in entries.items():
+            if isinstance(entry, dict):
+                entries[name] = {k: v for k, v in entry.items() if k in keep}
+
+
+# What _fit_budget sheds, in order, until the summary fits: cheapest loss
+# first, and never a variable name.
+_FIT_STAGES: tuple[tuple[str, Callable[[dict[str, Any]], None]], ...] = (
+    ("global attributes", _shed_global_attrs),
+    (
+        "coordinate attributes",
+        lambda out: _shed_attrs((out.get("schema") or {}).get("coords"), ()),
+    ),
+    ("variable attributes other than units", _shed_variable_attrs),
+    (
+        "variable shapes and dtypes",
+        lambda out: _shed_variable_fields(out, ("dims", "attrs")),
+    ),
+    ("variable details", lambda out: _shed_variable_fields(out, ())),
+)
+
+
+def _fit_budget(out: dict[str, Any]) -> None:
+    """Shed _FIT_STAGES from out, in order, until it serializes within
+    INFO_BUDGET_CHARS, naming the stages applied in its note."""
+    base_note = out["note"]
+    shed: list[str] = []
+    for label, stage in _FIT_STAGES:
+        if len(to_compact_json(out)) <= INFO_BUDGET_CHARS:
             return
+        stage(out)
+        shed.append(label)
+        out["note"] = (
+            f"{base_note} This record is large, so its {', '.join(shed)} are "
+            "also left out (see the *_omitted counts); every variable is "
+            'still listed. Pass detail="full" for them.'
+        )

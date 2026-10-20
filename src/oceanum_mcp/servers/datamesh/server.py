@@ -574,16 +574,17 @@ def _differing_words(a: list[str], b: list[str]) -> tuple[str, str]:
 
 
 def _id_rank(wanted: str, candidate: str) -> tuple[int, float] | None:
-    """Sort key ranking candidate (a datasource id) as a suggestion for the
-    unknown id wanted, fewest edits first; None if it is neither a near miss
-    nor an extension of wanted (see _ID_CHARS_PER_EDIT)."""
+    """Sort key ranking candidate (a datasource id or name) as a suggestion
+    for the unknown id wanted, fewest edits first; None if it is neither a
+    near miss nor an extension of wanted (see _ID_CHARS_PER_EDIT)."""
     a, b = _norm(wanted), _norm(candidate)
     if not a or not b:
         return None
-    ratio = difflib.SequenceMatcher(None, a, b).ratio()
     words = a.split("_")
-    if len(words) >= 2 and set(words) <= set(b.split("_")) and ratio >= _SUGGEST_CUTOFF:
-        return _edit_distance(a, b), -ratio
+    if len(words) >= 2 and set(words) <= set(b.split("_")):
+        ratio = difflib.SequenceMatcher(None, a, b).ratio()
+        if ratio >= _SUGGEST_CUTOFF:
+            return _edit_distance(a, b), -ratio
     # A cheap lower bound on the edit distance first: most candidates differ
     # in length by more than the allowed edits.
     allowed = min(_MAX_ID_EDITS, max(1, len(a) // _ID_CHARS_PER_EDIT))
@@ -595,13 +596,14 @@ def _id_rank(wanted: str, candidate: str) -> tuple[int, float] | None:
     core_a, core_b = _differing_words(words, b.split("_"))
     if difflib.SequenceMatcher(None, core_a, core_b).ratio() < _ID_CORE_CUTOFF:
         return None
-    return edits, -ratio
+    return edits, -difflib.SequenceMatcher(None, a, b).ratio()
 
 
 def _datasource_suggestions(
     conn: Connector, datasource_id: str
 ) -> list[dict[str, Any]]:
-    """Visible datasources whose id resembles datasource_id (see _id_rank).
+    """Visible datasources whose id or name resembles datasource_id (see
+    _id_rank; a request may be a near miss of a display name too).
 
     One bounded catalog search on the id's words (OR-ed, so a single typo'd
     word does not empty a keyword search); the catalog only lists datasources
@@ -619,7 +621,13 @@ def _datasource_suggestions(
     for ds in catalog:
         if ds is not None and ds.id != datasource_id:
             names[ds.id] = ds.name or ""
-    ranks = {i: _id_rank(datasource_id, i) for i in names}
+    ranks = {
+        i: min(
+            (r for r in (_id_rank(datasource_id, i), _id_rank(datasource_id, n)) if r),
+            default=None,
+        )
+        for i, n in names.items()
+    }
     ranked = sorted((r, i) for i, r in ranks.items() if r is not None)
     return [{"id": i, "name": names[i]} for _, i in ranked[:MAX_SUGGESTIONS]]
 
@@ -1289,9 +1297,10 @@ SEARCH_BUDGET_CHARS = {"summary": 20_000, "full": 100_000}
 # Characters of the budget kept for the fields around "results" (count,
 # notes, scope, hint): ~1.3 kB at most.
 _SEARCH_ENVELOPE_CHARS = 1_500
-# With search text that no result contains, only this many of the catalog's
-# fuzzy matches are shown (OCE-359).
-ZERO_TEXT_MATCH_SHOWN = 5
+# With search text that no result contains literally, every result is shown
+# as just these fields (OCE-359): the agent sees what the catalog ranked
+# closest without a page of unrelated summaries.
+_ZERO_TEXT_MATCH_FIELDS = ("id", "name")
 
 _SEARCH_HINT = (
     "These are summaries. Call get_datasource_info(datasource_id) for one "
@@ -1394,7 +1403,7 @@ def search_catalog(
         with search text "text_matches" counts the results whose id, name,
         description, tags or variable names contain the search words, and
         results that do not are marked "text_match": false. If none does,
-        only the first few fuzzy matches are shown, with a note.
+        every result is listed by id and name only, with a note.
     """
     if limit < 1:
         raise ToolError("limit must be at least 1.")
@@ -1430,11 +1439,11 @@ def search_catalog(
         hits = [_matches_text(ds, terms) for ds in datasources]
     text_matches = sum(hits) if terms else None
     fetched = len(datasources)
-    if text_matches == 0:
-        datasources = datasources[:ZERO_TEXT_MATCH_SHOWN]
 
     formatter = format_datasource if detail == "full" else format_datasource_summary
     results = [formatter(ds) for ds in datasources]
+    if text_matches == 0:
+        results = [{k: r.get(k) for k in _ZERO_TEXT_MATCH_FIELDS} for r in results]
     if text_matches:
         for result, hit in zip(results, hits):
             if not hit:
@@ -1447,22 +1456,24 @@ def search_catalog(
     # Ahead of the results, so it is read before them.
     if text_matches == 0 and results:
         out["text_note"] = (
-            f"None of the catalog's {fetched} closest results contains the "
-            f"search words of {search!r} in its id, name, description, tags or "
-            f"variable names. Showing only the first {len(results)}: they are "
-            "the catalog's fuzzy matches, not text matches, and may be "
-            "unrelated. Rephrase the search, or raise limit to look further "
-            "down the catalog's ranking."
+            f"None of the catalog's {fetched} closest results contains all the "
+            f"words of {search!r} literally (in its id, name, description, "
+            "tags or variable names), so they are listed by id and name only. "
+            "The catalog also matches word stems and other fields, so some may "
+            "still be relevant: check one with get_datasource_info, or rephrase "
+            "the search."
         )
     elif text_matches and text_matches < fetched:
         out["text_note"] = (
             f"{text_matches} of the catalog's {fetched} closest results contain "
-            "the search words; those marked text_match: false are fuzzy "
-            "matches and may be unrelated."
+            "all the search words literally; those marked text_match: false "
+            "may still match on word stems or other fields, or be unrelated."
         )
     out["results"] = results[:shown]
-    if not omitted and len(results) < limit:
-        # Empty or short: the page looks exhaustive, so state its scope.
+    # Empty or short: the page looks exhaustive, so state its scope. Not on
+    # a page that withheld anything (omitted results, or results listed by
+    # id and name only): its scope note would read as "nothing else exists".
+    if not results or (not omitted and len(results) < limit and text_matches != 0):
         out["scope"] = _ACCESS_SCOPE
     if not results:
         out["message"] = "No datasources found matching the search criteria."
@@ -1509,8 +1520,9 @@ def get_datasource_info(
     The default view keeps every field of the full record but reduces each
     variable and coordinate to its dims, shape, dtype, units, long_name and
     standard_name, clips the description and long attribute values, caps
-    global attributes, and on very large records lists only the leading
-    variables (counting the rest in "variables_omitted").
+    global attributes. On very large records it sheds attributes and then
+    per-variable details (the note says which), but every variable name is
+    always listed.
 
     Args:
         datasource_id: The unique ID of the datasource.

@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 from pathlib import Path
 from typing import Any
 
@@ -24,7 +25,7 @@ from oceanum.datamesh.datasource import Datasource
 import oceanum_mcp.servers.datamesh.server as server
 from oceanum_mcp.common import formatting
 from oceanum_mcp.common.formatting import format_datasource, to_compact_json, to_json
-from tests.test_servers.test_datamesh import _mock_catalog
+from tests.test_servers.test_datamesh import _mock_catalog, _mock_datasource
 
 N_VARIABLES = 120
 
@@ -264,6 +265,27 @@ class TestSearchCatalogSummary:
         for b in hit["bounds"]:
             assert round(b, 4) == b
 
+    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
+    def test_non_finite_bounds_are_null(self, mock_conn, bad):
+        ds = _mock_datasource(geom={"type": "Point"}, bounds=(bad, -48.0, 179.0, bad))
+        hit = _search(mock_conn, [ds])["results"][0]
+        assert hit["bounds"] == [None, -48.0, 179.0, None]
+
+    def test_no_negative_zero_bounds(self, mock_conn):
+        ds = _mock_datasource(geom={"type": "Point"}, bounds=(-0.0, -1e-9, 1e-9, 0.0))
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+        bounds = json.loads(server.search_catalog())["results"][0]["bounds"]
+        assert bounds == [0.0, -0.0001, 0.0001, 0.0]
+        assert math.copysign(1, bounds[0]) == 1
+        assert math.copysign(1, bounds[3]) == 1
+
+    def test_long_tags_clipped(self, mock_conn):
+        ds = make_datasource(detail=False)
+        ds.tags = ["x" * 500, "wave"]
+        hit = _search(mock_conn, [ds])["results"][0]
+        assert len(hit["tags"][0]) <= formatting.SUMMARY_TAG_CHARS + 3
+        assert hit["tags"][1] == "wave"
+
     def test_exact_bounds_unchanged(self, mock_conn):
         hit = _search(mock_conn, [make_datasource(detail=False)])["results"][0]
         assert hit["bounds"] == [165.0, -48.0, 179.0, -34.0]
@@ -478,21 +500,47 @@ class TestGetDatasourceInfoDetail:
         assert "variables_omitted" not in out
         assert "too large" not in out["note"]
 
-    def test_large_record_truncated_within_budget(self, mock_conn):
-        n = 400
+    @pytest.mark.parametrize("n", [400, 1_000])
+    def test_large_record_sheds_details_but_lists_every_variable(self, mock_conn, n):
         ds = make_datasource(n_variables=n)
         mock_conn.get_datasource.return_value = ds
         raw = server.get_datasource_info(ds.id)
         out = json.loads(raw)
-        assert len(raw) <= formatting.INFO_BUDGET_CHARS
-        kept = list(out["variables"])
-        # The leading variables are kept whole, in order; the rest counted.
-        assert kept == [f"hs_part{i}" for i in range(len(kept))]
-        assert out["variables"]["hs_part0"]["attrs"]["units"] == "m"
-        assert out["variables_omitted"] == n - len(kept) > 0
+        assert list(out["variables"]) == [f"hs_part{i}" for i in range(n)]
         assert set(out["schema"]["coords"]) == {"time", "latitude", "longitude"}
+        assert out["attributes"] == {}
+        assert out["attributes_omitted"] == 152
+        assert "every variable is still listed" in out["note"]
         assert 'detail="full"' in out["note"]
-        assert "variables_omitted" in out["note"]
+
+    def test_large_record_keeps_dims_and_units_when_they_fit(self, mock_conn):
+        ds = make_datasource(n_variables=250)
+        mock_conn.get_datasource.return_value = ds
+        raw = server.get_datasource_info(ds.id)
+        out = json.loads(raw)
+        assert len(raw) <= formatting.INFO_BUDGET_CHARS
+        var = out["variables"]["hs_part249"]
+        assert var == {
+            "dims": ["time", "latitude", "longitude"],
+            "attrs": {"units": "m"},
+        }
+        assert "coordinate attributes" in out["note"]
+        assert "shapes and dtypes" in out["note"]
+        assert "variable details" not in out["note"]
+        assert out["schema"]["coords"]["latitude"]["attrs"] == {}
+
+    def test_shedding_stops_once_it_fits(self, mock_conn, monkeypatch):
+        # Only the global attributes need to go: nothing per variable does.
+        ds = make_datasource(n_variables=10)
+        mock_conn.get_datasource.return_value = ds
+        whole = len(server.get_datasource_info(ds.id))
+        monkeypatch.setattr(formatting, "INFO_BUDGET_CHARS", whole - 100)
+        out = json.loads(server.get_datasource_info(ds.id))
+        assert out["attributes"] == {}
+        assert "global attributes are also left out" in out["note"]
+        var = out["variables"]["hs_part0"]
+        assert var["attrs"]["standard_name"] == "sea_surface_wave_significant_height"
+        assert var["shape"] == [292897, 281, 301]
 
     def test_description_clipped(self, mock_conn):
         out = self._info(mock_conn)

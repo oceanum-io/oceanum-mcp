@@ -193,24 +193,41 @@ class TestSearchCatalogTextMatches:
     @pytest.mark.parametrize(
         "search", ["qzxvbn", "fake", "wave_fake", '"oceanum_wave_fake_v9"']
     )
-    def test_zero_matches_shrinks_to_a_few_fuzzy_results(self, mock_conn, search):
+    def test_zero_matches_list_every_result_compactly(self, mock_conn, search):
         mock_conn.get_catalog.return_value = _mock_catalog(FUZZY_PAGE)
 
         out = server.search_catalog(search=search)
         parsed = json.loads(out)
 
         assert parsed["text_matches"] == 0
-        assert parsed["count"] == server.ZERO_TEXT_MATCH_SHOWN
-        assert [r["id"] for r in parsed["results"]] == [
-            f"buoy-{i}" for i in range(server.ZERO_TEXT_MATCH_SHOWN)
+        assert parsed["count"] == 20
+        assert parsed["results"] == [
+            {"id": f"buoy-{i}", "name": f"Buoy station {i}"} for i in range(20)
         ]
         note = parsed["text_note"]
         assert "None of the catalog's 20 closest results" in note
-        assert "not text matches" in note
-        assert "raise limit" in note
-        keys = list(parsed)
-        assert keys.index("text_note") < keys.index("results")
-        assert len(out) < 3_000
+        assert "literally" in note
+        assert list(parsed)[:3] == ["count", "text_matches", "text_note"]
+        # Nothing was withheld as "does not exist": no scope claim.
+        assert "scope" not in parsed
+        assert len(out) < 2_500
+
+    def test_zero_matches_compact_page_stays_small(self, mock_conn):
+        # 20 live-sized names and ids, as for "fake" on the live catalog.
+        page = [
+            _mock_datasource(
+                id=f"cmems_mod_glo_wav_my_0-2deg-climatology_p1m-m-{i}",
+                name="CMEMS Monthly climatology of wave height and period "
+                "from Global Ocean Waves Reanalysis",
+                description="x" * 2_000,
+            )
+            for i in range(20)
+        ]
+        mock_conn.get_catalog.return_value = _mock_catalog(page)
+
+        out = server.search_catalog(search="qzxvbn")
+
+        assert len(out) < 4_000
 
     def test_zero_matches_on_empty_catalog(self, mock_conn):
         mock_conn.get_catalog.return_value = _mock_catalog([])

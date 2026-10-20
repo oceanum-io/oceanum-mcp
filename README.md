@@ -258,7 +258,8 @@ or which inaccessible datasources exist.
 By default each result is a compact summary: `id`, `name`, a `description`
 cut to 200 characters, `tstart`/`tend`, `bounds` (rounded outward to 4
 decimals), variable names when the catalog provides them (first 20, with
-`variables_total`), and the first 5 `tags` (with `tags_total`).
+`variables_total`), and the first 5 `tags` (each clipped to 60 characters,
+with `tags_total`). Non-finite bounds are `null`.
 `detail="full"` returns each datasource's complete catalog record instead.
 The response is compact JSON, and its total size is bounded (~20k characters
 for summaries, ~100k for full records): matches beyond the bound are dropped,
@@ -272,9 +273,8 @@ or variable names. `or` separates alternatives and negated words (`-era5`,
 `not era5`) are ignored. This count is only a signal: no result is dropped
 for failing it, but results that fail are marked `"text_match": false`, and
 a `text_note` ahead of the results explains. If no result contains the text
-(`text_matches: 0`), only the catalog's first 5 results are shown, with a
-note that they are fuzzy matches and that rephrasing or a larger `limit` may
-help.
+literally (`text_matches: 0`), every result is still returned but as `id` and
+`name` only, with a `text_note` first and no `scope` note.
 
 | Parameter    | Type        | Description                                      |
 | ------------ | ----------- | ------------------------------------------------ |
@@ -297,13 +297,15 @@ attributes are counted in `attrs_omitted`); the description is clipped to
 1,000 characters, global `attributes` and `info` are capped at 25 entries
 (with `*_omitted` counts), and long values are clipped to 200 characters.
 `schema.data_vars`/`schema.attrs` are omitted as duplicates of
-`variables`/`attributes`. The summary is bounded at ~30k characters: past
-that, trailing variables (then coordinates) are left out and counted in
-`variables_omitted`/`coords_omitted`. `detail="full"` returns the complete
-record. Both are compact JSON.
+`variables`/`attributes`. Past ~30k characters the summary sheds, in order
+and only as far as needed: global attributes, coordinate attributes,
+variable attributes other than `units`, variable `shape`/`dtype`, and finally
+per-variable details; the `note` names what was shed. Every variable name is
+always listed. `detail="full"` returns the complete record. Both are compact
+JSON.
 
-An unknown id adds `suggestions`: visible datasources whose id differs from
-the requested one by a typo (at most one character edit per 7 characters, up
+An unknown id adds `suggestions`: visible datasources whose id or name
+differs from the requested one by a typo (at most one character edit per 7 characters, up
 to 3, with the differing words still similar), or extends a request of two
 or more words. An id that merely shares generic words such as
 `oceanum_wave_..._era5`, or a single word such as `wave`, is never
