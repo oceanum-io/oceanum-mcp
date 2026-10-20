@@ -69,12 +69,19 @@ GATEWAY_UNAVAILABLE = (
     "problem with the token; retry shortly."
 )
 
-# A per-request holder the header middleware installs and DatameshTokenVerifier
-# marks when it failed closed on a gateway outage, so that 401 is not reported
-# as a bad token. Mutable, so the mark survives any context copy in between.
-_verification_outcome: ContextVar[dict[str, bool] | None] = ContextVar(
+# A per-request holder DatameshHeaderMiddleware installs, recording why a
+# credential failed: "placeholder" (set by the middleware), or "rejected" /
+# "unavailable" (set by DatameshTokenVerifier). Only a 401 with a recorded
+# reason is rewritten. Mutable, so marks survive any context copy in between.
+_verification_outcome: ContextVar[dict[str, str] | None] = ContextVar(
     "_verification_outcome", default=None
 )
+
+
+def _mark_outcome(result: str) -> None:
+    outcome = _verification_outcome.get()
+    if outcome is not None:
+        outcome["result"] = result
 
 
 async def _send_invalid_token(send: Send, description: str) -> None:
@@ -125,20 +132,27 @@ async def _send_unavailable(send: Send) -> None:
     await send({"type": "http.response.body", "body": body})
 
 
-def _replace_401(send: Send, outcome: dict[str, bool]) -> Send:
-    """Wrap send so a header-token 401 from inside says why it failed: a 503
-    if verification failed closed on a gateway outage, else a 401 saying the
-    header token was rejected."""
+def _replace_401(send: Send, outcome: dict[str, str], from_header: bool) -> Send:
+    """Wrap send so a 401 from inside says why the credential failed, when
+    the reason was recorded: a placeholder credential; or, for a header
+    token, a gateway rejection (401) or a gateway outage (503). Any other
+    401 passes through untouched."""
     replaced = False
 
     async def wrapped(message: Message) -> None:
         nonlocal replaced
         if message["type"] == "http.response.start" and message["status"] == 401:
-            replaced = True
-            if outcome.get("gateway_unavailable"):
+            result = outcome.get("result")
+            if result == "placeholder":
+                await _send_invalid_token(send, UNRESOLVED_VARIABLE_MESSAGE)
+            elif from_header and result == "rejected":
+                await _send_invalid_token(send, HEADER_TOKEN_REJECTED)
+            elif from_header and result == "unavailable":
                 await _send_unavailable(send)
             else:
-                await _send_invalid_token(send, HEADER_TOKEN_REJECTED)
+                await send(message)
+                return
+            replaced = True
         elif not (replaced and message["type"] == "http.response.body"):
             await send(message)
 
@@ -154,9 +168,11 @@ class DatameshHeaderMiddleware:
     credential types. Promotion only happens when no Authorization header is
     present, keeping the channels unambiguous when both are sent.
 
-    Also explains the 401s FastMCP's generic wording gets wrong (OCE-362):
+    Also explains the 401s FastMCP's generic wording gets wrong (OCE-362);
+    requests that end in no 401 (e.g. public /.well-known routes) are
+    untouched:
     - a credential that is an unsubstituted client variable such as
-      "${input:datamesh-token}" is refused up front, saying so;
+      "${input:datamesh-token}" gets a 401 saying so;
     - a rejected header token gets a 401 saying the header token is invalid,
       instead of FastMCP's "clear authentication tokens and reconnect" with
       an OAuth challenge, which header-token clients cannot act on; one left
@@ -168,33 +184,39 @@ class DatameshHeaderMiddleware:
         self.app = app
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
-        if scope["type"] == "http":
-            headers: list[tuple[bytes, bytes]] = scope["headers"]
-            authorization = next((v for k, v in headers if k == b"authorization"), None)
-            if authorization is None:
-                token = next((v for k, v in headers if k == b"x-datamesh-token"), None)
-                if token:
-                    if is_unresolved_variable(token.decode("latin-1").strip()):
-                        await _send_invalid_token(send, UNRESOLVED_VARIABLE_MESSAGE)
-                        return
-                    scope = dict(scope)
-                    scope["headers"] = [
-                        *headers,
-                        (b"authorization", b"Bearer " + token),
-                    ]
-                    outcome: dict[str, bool] = {}
-                    reset = _verification_outcome.set(outcome)
-                    try:
-                        await self.app(scope, receive, _replace_401(send, outcome))
-                    finally:
-                        _verification_outcome.reset(reset)
-                    return
-            elif authorization[:7].lower() == b"bearer " and is_unresolved_variable(
-                authorization[7:].decode("latin-1").strip()
-            ):
-                await _send_invalid_token(send, UNRESOLVED_VARIABLE_MESSAGE)
-                return
-        await self.app(scope, receive, send)
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers: list[tuple[bytes, bytes]] = scope["headers"]
+        authorization = next((v for k, v in headers if k == b"authorization"), None)
+        header_token = None
+        if authorization is None:
+            header_token = next(
+                (v for k, v in headers if k == b"x-datamesh-token"), None
+            )
+            if header_token:
+                scope = dict(scope)
+                scope["headers"] = [
+                    *headers,
+                    (b"authorization", b"Bearer " + header_token),
+                ]
+        if header_token:
+            credential = header_token
+        elif authorization is not None and authorization[:7].lower() == b"bearer ":
+            credential = authorization[7:]
+        else:
+            await self.app(scope, receive, send)
+            return
+        outcome: dict[str, str] = {}
+        if is_unresolved_variable(credential.decode("latin-1").strip()):
+            outcome["result"] = "placeholder"
+        reset = _verification_outcome.set(outcome)
+        try:
+            await self.app(
+                scope, receive, _replace_401(send, outcome, bool(header_token))
+            )
+        finally:
+            _verification_outcome.reset(reset)
 
 
 class DatameshTokenVerifier(TokenVerifier):
@@ -245,22 +267,26 @@ class DatameshTokenVerifier(TokenVerifier):
             # and leave the negative cache unpolluted (matters in auto mode,
             # where MultiAuth consults this verifier after the JWT one).
             return None
+        if is_unresolved_variable(token):
+            # Never a token (DatameshHeaderMiddleware reports it): skip the
+            # gateway round trip and the negative cache.
+            return None
         hit, cached = self._valid.get(token)
         if hit:
             return cached
         key = self._key(token)
         if self._is_known_invalid(key):
+            _mark_outcome("rejected")
             return None
         try:
             result = await self._verify_with_gateway(token)
         except httpx2.HTTPError:
             # Gateway unreachable or in an unexpected state: fail closed
             # without caching, so recovery is immediate.
-            outcome = _verification_outcome.get()
-            if outcome is not None:
-                outcome["gateway_unavailable"] = True
+            _mark_outcome("unavailable")
             return None
         if result is None:
+            _mark_outcome("rejected")
             self._mark_invalid(key)
         else:
             self._valid.set(token, result)

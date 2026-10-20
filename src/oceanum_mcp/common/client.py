@@ -196,7 +196,8 @@ def _read_token_file(raw: str) -> str:
         )
     path = Path(raw).expanduser()
     try:
-        with path.open(encoding="utf-8") as f:
+        # utf-8-sig: Windows editors may prepend a byte-order mark.
+        with path.open(encoding="utf-8-sig") as f:
             # fstat on the open file: no window to swap the file after a check.
             mode = os.fstat(f.fileno()).st_mode
             if os.name == "posix" and mode & 0o077:
@@ -208,16 +209,30 @@ def _read_token_file(raw: str) -> str:
             token = f.read().strip()
     except OSError as exc:
         raise ValueError(
-            f"DATAMESH_TOKEN_FILE {path} could not be read: {exc.strerror}"
+            f"DATAMESH_TOKEN_FILE {path} could not be read: "
+            f"{exc.strerror or type(exc).__name__}"
         ) from None
     except UnicodeDecodeError:
         raise ValueError(f"DATAMESH_TOKEN_FILE {path} is not a text file") from None
     if not token:
         raise ValueError(f"DATAMESH_TOKEN_FILE {path} is empty")
+    return _not_a_variable(token, f"DATAMESH_TOKEN_FILE {path}")
+
+
+def _not_a_variable(token: str, source: str) -> str:
+    """The token from a file or the credential store, unless it is an
+    unsubstituted variable such as ${input:...} copied from a client config."""
+    if is_unresolved_variable(token):
+        raise ValueError(
+            f"The token in {source} looks like an unsubstituted variable "
+            "(`${...}`), not a token: store the token itself."
+        )
     return token
 
 
-@functools.cache
+_KEYRING_LOCK = threading.Lock()
+
+
 def _keyring_token() -> str:
     """The token stored in the OS credential store (macOS Keychain, Secret
     Service/libsecret, Windows Credential Manager) via the keyring package.
@@ -225,7 +240,14 @@ def _keyring_token() -> str:
     Looked up once per process (a lookup can be a D-Bus or Keychain round
     trip, or an unlock prompt), so a changed token needs a server restart.
     Failures are not cached: storing a missing token takes effect at once.
+    The lock makes concurrent first calls share one lookup (one prompt).
     """
+    with _KEYRING_LOCK:
+        return _keyring_lookup()
+
+
+@functools.cache
+def _keyring_lookup() -> str:
     try:
         import keyring
         from keyring.errors import KeyringError
@@ -246,7 +268,7 @@ def _keyring_token() -> str:
             "DATAMESH_TOKEN_KEYRING is set but no token is stored: store it "
             f"with `keyring set {KEYRING_SERVICE} {KEYRING_USERNAME}`."
         )
-    return token
+    return _not_a_variable(token, "the OS credential store")
 
 
 def _get_client(

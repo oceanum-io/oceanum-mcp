@@ -146,19 +146,21 @@ that is set:
    ```
 
    The token is looked up once per server process, so restart the server
-   after changing it. `keyring` is normally installed alongside the server;
-   if not, install the `oceanum-mcp[keyring]` extra (with uvx:
+   after changing it. `keyring` currently arrives as an indirect dependency
+   of `fastmcp`, which is not guaranteed to last: to be sure, install the
+   `oceanum-mcp[keyring]` extra (with uvx:
    `uvx --python 3.13 --from "oceanum-mcp[keyring]" oceanum-mcp`).
 
 ### Troubleshooting: `-32022` on the first `initialize`
 
 A client may log "connection is serving the 2026-07-28 protocol; the
 initialize handshake is not accepted" (error `-32022`) once on connect. This
-is MCP SDK behaviour, not a server fault: a connection's first request fixes
-its protocol version, so a client that first probes with the 2026-07-28
-protocol and then sends the older `initialize` handshake on the same
-connection is refused, with the supported versions in the error. Clients
-retry with a supported version and connect normally.
+comes from the MCP Python SDK, not from this server's code: in SDK 2.3.0
+(`mcp/server/runner.py`, `serve_dual_era_loop`) a connection's first request
+fixes its protocol era. A client that opens with a 2026-07-28 request and
+then sends the older `initialize` handshake on the same connection is
+refused, with the supported versions in the error. Clients are expected to
+retry with a supported version; GitHub Copilot did so and connected.
 
 ## Environment Variables
 

@@ -187,6 +187,28 @@ async def test_auth_none_ignores_placeholder_client_credentials():
     gateway.assert_not_called()
 
 
+async def test_placeholder_credential_does_not_block_public_routes():
+    """Only a 401 is rewritten: routes that need no auth still answer."""
+    async with hosted_client(_rejecting_gateway()) as client:
+        resp = await client.get(
+            "/.well-known/oauth-protected-resource/datamesh",
+            headers={"X-DATAMESH-TOKEN": PLACEHOLDER},
+        )
+    assert resp.status_code == 200
+
+
+async def test_unexplained_header_token_401_passes_through():
+    """A 401 the Datamesh verifier did not explain (here: auth0 mode, where
+    only JWTs are accepted) is left as FastMCP sent it."""
+    async with hosted_client(_rejecting_gateway(), mode="auth0") as client:
+        resp = await client.post(
+            "/datamesh", json=INIT, headers={**HDRS, "X-DATAMESH-TOKEN": "a" * 40}
+        )
+    assert resp.status_code == 401
+    assert "resource_metadata=" in resp.headers["www-authenticate"]
+    assert HEADER_TOKEN_REJECTED not in resp.text
+
+
 async def test_hosted_credentialless_401_keeps_oauth_challenge():
     """OAuth discovery (claude.ai) depends on the challenge when no
     credential at all was sent: that 401 is left untouched."""

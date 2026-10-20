@@ -12,7 +12,7 @@ from oceanum_mcp.common.client import (
     KEYRING_SERVICE,
     KEYRING_USERNAME,
     _ClientCache,
-    _keyring_token,
+    _keyring_lookup,
     _datamesh_cache,
     _storage_cache,
     get_datamesh_connector,
@@ -142,10 +142,10 @@ def stdio_env(monkeypatch):
     """A stdio call (no auth context) with every server token source unset."""
     for key in ("DATAMESH_TOKEN", "DATAMESH_TOKEN_FILE", "DATAMESH_TOKEN_KEYRING"):
         monkeypatch.delenv(key, raising=False)
-    _keyring_token.cache_clear()
+    _keyring_lookup.cache_clear()
     with patch("fastmcp.server.dependencies.get_access_token", return_value=None):
         yield monkeypatch
-    _keyring_token.cache_clear()
+    _keyring_lookup.cache_clear()
 
 
 @pytest.mark.parametrize(
@@ -320,3 +320,57 @@ def test_keyring_not_consulted_unless_enabled(stdio_env):
     ):
         resolve_credential()
     get.assert_not_called()
+
+
+def test_token_file_with_byte_order_mark(stdio_env, tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_bytes("﻿file-token\r\n".encode())
+    token_file.chmod(0o600)
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    assert resolve_credential() == "file-token"
+
+
+def test_token_file_holding_a_variable(stdio_env, tmp_path):
+    token_file = tmp_path / "token"
+    token_file.write_text("${input:datamesh-token}")
+    token_file.chmod(0o600)
+    stdio_env.setenv("DATAMESH_TOKEN_FILE", str(token_file))
+    with pytest.raises(ValueError, match="unsubstituted variable"):
+        resolve_credential()
+
+
+def test_keyring_holding_a_variable(stdio_env):
+    import keyring
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    with (
+        patch.object(keyring, "get_password", return_value="$DATAMESH_TOKEN"),
+        pytest.raises(ValueError, match="unsubstituted variable"),
+    ):
+        resolve_credential()
+
+
+def test_keyring_concurrent_first_calls_share_one_lookup(stdio_env):
+    """Concurrent first calls must not each hit the store (one prompt)."""
+    import threading
+    import time
+
+    import keyring
+
+    def slow_lookup(*_: str) -> str:
+        time.sleep(0.05)
+        return "kr-token"
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
+    results: list[str] = []
+    with patch.object(keyring, "get_password", side_effect=slow_lookup) as get:
+        threads = [
+            threading.Thread(target=lambda: results.append(resolve_credential()))
+            for _ in range(4)
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(5)
+    assert results == ["kr-token"] * 4
+    get.assert_called_once()
