@@ -1,25 +1,29 @@
-"""Catalog output size and detail levels (OCE-309).
+"""Catalog output size and detail levels (OCE-309, OCE-360).
 
 search_catalog returns compact summaries by default and get_datasource_info a
-bounded structured view; detail="full" on either returns the complete record.
-Fixtures are real oceanum Datasource objects shaped like live Datamesh
-records: long descriptions, many tags, GRIB-style per-variable attribute
-blobs, model-parameter global attributes, and 100+ variables.
+summary view; detail="full" on either returns the complete record. Fixtures
+are real oceanum Datasource objects shaped like live Datamesh records: long
+descriptions, many tags, GRIB-style per-variable attribute blobs,
+model-parameter global attributes, and 100+ variables; plus one recorded live
+record (tests/fixtures/oceanum_wave_nzpar_era5_grid.json, storage args
+removed).
 """
 
 from __future__ import annotations
 
 import datetime
 import json
+from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pytest
 
 from oceanum.datamesh.datasource import Datasource
 
 import oceanum_mcp.servers.datamesh.server as server
 from oceanum_mcp.common import formatting
-from oceanum_mcp.common.formatting import format_datasource, to_json
+from oceanum_mcp.common.formatting import format_datasource, to_compact_json, to_json
 from tests.test_servers.test_datamesh import _mock_catalog
 
 N_VARIABLES = 120
@@ -121,9 +125,58 @@ def make_datasource(
     return ds
 
 
+NZPAR_FIXTURE = (
+    Path(__file__).parent.parent / "fixtures" / "oceanum_wave_nzpar_era5_grid.json"
+)
+
+
+def nzpar_datasource() -> Datasource:
+    """The recorded live oceanum_wave_nzpar_era5_grid record, as
+    get_datasource returns it."""
+    ds = Datasource(**json.loads(NZPAR_FIXTURE.read_text()))
+    ds._detail = True
+    return ds
+
+
+def _float32(x: float) -> float:
+    # Live catalog bounds carry float32 noise, e.g. -38.599998474121094.
+    return float(np.float32(x + 0.01))
+
+
+def nz_wave_hit(i: int) -> Datasource:
+    """A catalog hit shaped like the live NZ wave bbox search's (OCE-360):
+    ~60-character name, long description, float32 bounds, a dozen tags, no
+    schema."""
+    lon, lat = 165.1 + i * 0.37, -47.3 + i * 0.29
+    ds = Datasource(
+        id=f"oceanum_wave_region{i}_era5_spec_nowcast",
+        name=f"Oceanum region {i} 1km ECMWF wave nowcast spectra (hourly)",
+        description=_DESCRIPTION,
+        geom={
+            "type": "Polygon",
+            "coordinates": [
+                [
+                    [_float32(lon), _float32(lat)],
+                    [_float32(lon + 1.3), _float32(lat)],
+                    [_float32(lon + 1.3), _float32(lat + 1.4)],
+                    [_float32(lon), _float32(lat + 1.4)],
+                    [_float32(lon), _float32(lat)],
+                ]
+            ],
+        },
+        tstart=datetime.datetime(1993, 1, 1, tzinfo=datetime.timezone.utc),
+        tend=datetime.datetime(2026, 5, 31, 21, tzinfo=datetime.timezone.utc),
+        tags=["era5", "forecast", "hindcast", "model", "new_zealand", "nowcast"]
+        + ["oceania", "oceanum", "spectra", "swan", "wave", "waves"],
+        driver="onzarr",
+    )
+    ds._detail = False
+    return ds
+
+
 def _results_chars(out: dict[str, Any]) -> int:
     """Characters the "results" array occupies in the serialized response."""
-    return len(to_json(out)) - len(to_json({**out, "results": []}))
+    return len(to_compact_json(out)) - len(to_compact_json({**out, "results": []}))
 
 
 def _search(mock_conn, datasources, **kwargs) -> dict[str, Any]:
@@ -144,8 +197,6 @@ class TestSearchCatalogSummary:
             "tend",
             "variables",
             "variables_total",
-            "tags",
-            "tags_total",
         }
         for dumped in ("schema", "attributes", "info", "coordinates", "labels"):
             assert dumped not in hit
@@ -187,11 +238,20 @@ class TestSearchCatalogSummary:
         hit = _search(mock_conn, [ds])["results"][0]
         assert "variables" not in hit
 
-    def test_tags_capped_with_total(self, mock_conn):
+    def test_tags_left_out(self, mock_conn):
         hit = _search(mock_conn, [make_datasource(detail=False)])["results"][0]
-        assert 0 < len(hit["tags"]) < 30
-        assert sum(len(t) for t in hit["tags"]) <= formatting.SUMMARY_TAG_CHARS
-        assert hit["tags_total"] == 30
+        assert "tags" not in hit
+        assert "tags_total" not in hit
+
+    def test_bounds_rounded(self, mock_conn):
+        hit = _search(mock_conn, [nz_wave_hit(0)])["results"][0]
+        assert hit["bounds"] == [165.11, -47.29, 166.41, -45.89]
+
+    def test_response_is_compact_json(self, mock_conn):
+        mock_conn.get_catalog.return_value = _mock_catalog([nz_wave_hit(0)])
+        out = server.search_catalog()
+        assert "\n" not in out
+        assert out == to_compact_json(json.loads(out))
 
     def test_full_detail_is_todays_output(self, mock_conn):
         ds = make_datasource(detail=False)
@@ -270,9 +330,59 @@ class TestSearchCatalogTotalBound:
         assert len(summary) * 20 < len(full_unbounded)
 
 
+class TestOutputSizeBudget:
+    """OCE-360: responses short enough for clients to use inline."""
+
+    # Before -> after: 17,070 -> 9,213 characters on these fixtures; live
+    # (20 hits) 15,484 -> 8,438.
+    NZ_WAVE_SEARCH_CHARS = 10_000
+    # Before -> after: 20,911 -> 7,896 characters, fixture and live alike.
+    NZPAR_SUMMARY_CHARS = 9_000
+
+    def test_nz_wave_search(self, mock_conn):
+        mock_conn.get_catalog.return_value = _mock_catalog(
+            [nz_wave_hit(i) for i in range(20)]
+        )
+        out = server.search_catalog(search="wave", bbox=[165, -48, 179, -34])
+        parsed = json.loads(out)
+        assert parsed["count"] == 20
+        assert parsed["text_matches"] == 20
+        assert len(out) <= self.NZ_WAVE_SEARCH_CHARS
+
+    def test_nzpar_summary(self, mock_conn):
+        ds = nzpar_datasource()
+        mock_conn.get_datasource.return_value = ds
+        out = server.get_datasource_info(ds.id)
+        assert len(out) <= self.NZPAR_SUMMARY_CHARS
+        parsed = json.loads(out)
+        assert len(parsed["variables"]) == 38
+        assert parsed["variables"]["hs"] == {
+            "dims": ["time", "latitude", "longitude"],
+            "attrs": {
+                "units": "m",
+                "long_name": "significant height of wind and swell waves",
+            },
+        }
+        assert parsed["bounds"] == [165.0, -48.0, 180.0, -34.0]
+        assert parsed["tstart"].startswith("1993-01-01")
+        assert parsed["schema"]["dims"] == {
+            "time": 292897,
+            "latitude": 281,
+            "longitude": 301,
+        }
+
+    def test_nzpar_full_keeps_every_attribute(self, mock_conn):
+        ds = nzpar_datasource()
+        mock_conn.get_datasource.return_value = ds
+        parsed = json.loads(server.get_datasource_info(ds.id, detail="full"))
+        hs = parsed["variables"]["hs"]
+        assert hs["attrs"]["standard_name"] == "sea_surface_wave_significant_height"
+        assert hs["attrs"]["valid_max"] == 50.0
+        assert hs["shape"] == [292897, 281, 301]
+
+
 class TestGetDatasourceInfoDetail:
     def _info(self, mock_conn, n_variables=10, **kwargs) -> dict[str, Any]:
-        # 10 variables fit INFO_BUDGET_CHARS; N_VARIABLES does not.
         ds = make_datasource(n_variables=n_variables)
         mock_conn.get_datasource.return_value = ds
         return json.loads(server.get_datasource_info(ds.id, **kwargs))
@@ -283,15 +393,12 @@ class TestGetDatasourceInfoDetail:
         out = json.loads(server.get_datasource_info(ds.id, detail="full"))
         assert out == json.loads(to_json(format_datasource(ds)))
 
-    def test_default_keeps_per_variable_metadata(self, mock_conn):
+    def test_default_keeps_dims_units_and_long_name_per_variable(self, mock_conn):
         out = self._info(mock_conn)
-        var = out["variables"]["hs_part0"]
-        assert var["dims"] == ["time", "latitude", "longitude"]
-        assert var["shape"] == [292897, 281, 301]
-        assert var["dtype"] == "float32"
-        assert var["attrs"]["units"] == "m"
-        assert var["attrs"]["long_name"] == "significant height of partition 0"
-        assert var["attrs"]["standard_name"] == "sea_surface_wave_significant_height"
+        assert out["variables"]["hs_part0"] == {
+            "dims": ["time", "latitude", "longitude"],
+            "attrs": {"units": "m", "long_name": "significant height of partition 0"},
+        }
 
     def test_default_keeps_record_fields(self, mock_conn):
         out = self._info(mock_conn)
@@ -313,18 +420,14 @@ class TestGetDatasourceInfoDetail:
             "latitude": 281,
             "longitude": 301,
         }
-        lat = out["schema"]["coords"]["latitude"]
-        assert lat["shape"] == [281]
-        assert lat["attrs"]["units"] == "degrees_north"
+        assert out["schema"]["coords"]["latitude"] == {
+            "dims": ["latitude"],
+            "attrs": {"units": "degrees_north", "long_name": "latitude"},
+        }
         assert 'detail="full"' in out["note"]
 
     def test_default_caps_attribute_blobs(self, mock_conn):
         out = self._info(mock_conn)
-        var = out["variables"]["hs_part0"]
-        assert len(var["attrs"]) == formatting.INFO_MAX_ATTRS
-        assert var["attrs_omitted"] > 0
-        pv = var["attrs"].get("GRIB_pv")
-        assert pv is None or len(pv) <= formatting.INFO_VALUE_CHARS + 3
         assert len(out["attributes"]) == formatting.INFO_MAX_GLOBAL_ATTRS
         assert out["attributes_omitted"] == 152 - formatting.INFO_MAX_GLOBAL_ATTRS
         assert len(out["info"]["citation"]) <= formatting.INFO_VALUE_CHARS + 3
@@ -335,22 +438,20 @@ class TestGetDatasourceInfoDetail:
         out = self._info(mock_conn)
         assert set(out["schema"]) == {"dims", "coords"}
 
-    def test_large_record_goes_lean_but_keeps_every_variable(self, mock_conn):
+    def test_large_record_keeps_every_variable(self, mock_conn):
         # oceanum-ai's compact_datasource reads only variables[*]: every name
         # must stay there, with dims and units, however large the record.
         out = self._info(mock_conn, n_variables=N_VARIABLES)
         assert list(out["variables"]) == [f"hs_part{i}" for i in range(N_VARIABLES)]
         for var in out["variables"].values():
             assert var["dims"] == ["time", "latitude", "longitude"]
-            assert set(var["attrs"]) == {"units", "long_name", "standard_name"}
-            assert var["attrs_omitted"] > 0
-        assert "large record" in out["note"]
-        assert len(to_json(out)) <= formatting.INFO_BUDGET_CHARS
+            assert set(var["attrs"]) == {"units", "long_name"}
 
-    def test_normal_record_within_budget_not_lean(self, mock_conn):
+    def test_description_clipped(self, mock_conn):
         out = self._info(mock_conn)
-        assert len(to_json(out)) <= formatting.INFO_BUDGET_CHARS
-        assert "large record" not in out["note"]
+        assert len(out["description"]) <= formatting.INFO_DESCRIPTION_CHARS + 3
+        assert out["description"].endswith("...")
+        assert out["description"].startswith("## Global wave hindcast\n\n")
 
     def test_undetailed_record_keeps_schema_variables(self, mock_conn):
         # data_vars/attrs are only duplicates when variables/attributes exist.

@@ -256,12 +256,21 @@ not exist or is not accessible with these credentials; it never reveals whether,
 or which inaccessible datasources exist.
 
 By default each result is a compact summary: `id`, `name`, a `description`
-cut to 200 characters, `tstart`/`tend`, `bounds`, variable names when the
-catalog provides them (first 20, with `variables_total`), and short `tags`
-(with `tags_total`). `detail="full"` returns each datasource's complete
-catalog record instead. The total output is bounded (~30k characters for
-summaries, ~100k for full records): matches beyond the bound are dropped,
-counted in `omitted`, and a note asks to refine the search.
+cut to 200 characters, `tstart`/`tend`, `bounds` (rounded to 4 decimals), and
+variable names when the catalog provides them (first 20, with
+`variables_total`). `detail="full"` returns each datasource's complete
+catalog record instead. The response is compact JSON, and its total size is
+bounded (~16k characters for summaries, ~100k for full records): matches
+beyond the bound are dropped, counted in `omitted`, and a note asks to refine
+the search.
+
+The catalog ranks datasources by fuzzy similarity to the search text and
+returns the closest ones even when none contains it. With search text, the
+response therefore carries `text_matches`, the number of results whose id,
+name, description or tags contain every search word (`or` separates
+alternatives); those results come first, and a `text_note` flags the fuzzy
+ones after them. If no result contains the text, none is returned: `count`
+and `text_matches` are 0 and a `message` says so.
 
 | Parameter    | Type        | Description                                      |
 | ------------ | ----------- | ------------------------------------------------ |
@@ -277,16 +286,21 @@ counted in `omitted`, and a note asks to refine the search.
 Get the metadata for a datasource: coverage, schema dims and coordinates,
 variables, and attributes.
 
-The default (`detail="summary"`) is a bounded view with the same fields and
-shape as the full record. Each variable and coordinate keeps its `dims`,
-`shape`, `dtype` and `units`/`long_name`/`standard_name`; other attributes are
-capped at 8 per variable (with `attrs_omitted`), global `attributes` and
-`info` at 25 entries, and long values are clipped to 200 characters. If the
-view still exceeds ~60k characters, each variable and coordinate keeps only
-`dims`, `shape`, `dtype` and `units`/`long_name`/`standard_name`; every
-variable is listed either way. `schema.data_vars`/`schema.attrs` are omitted
+The default (`detail="summary"`) is a compact view with the same fields as
+the full record. Every variable and coordinate is listed with only its `dims`
+and its `units`/`long_name` attributes (`schema.dims` gives each dim's size);
+the description is clipped to 1,000 characters, global `attributes` and
+`info` are capped at 25 entries (with `*_omitted` counts), and long values
+are clipped to 200 characters. `schema.data_vars`/`schema.attrs` are omitted
 as duplicates of `variables`/`attributes`. `detail="full"` returns the
-complete record.
+complete record, including each variable's `shape`, `dtype`,
+`standard_name` and other attributes. Both are compact JSON.
+
+An unknown id adds `suggestions`: visible datasources whose id contains every
+word of the requested one, or differs from it by a typo (at most one
+character edit per 7 characters, up to 3, with the differing words still
+similar). An id that merely shares generic words such as
+`oceanum_wave_..._era5` is never suggested.
 
 | Parameter       | Type   | Description                   |
 | --------------- | ------ | ----------------------------- |

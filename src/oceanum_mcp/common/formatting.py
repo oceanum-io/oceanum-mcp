@@ -25,6 +25,12 @@ def to_json(obj: Any) -> str:
     return json.dumps(obj, indent=2, default=str)
 
 
+def to_compact_json(obj: Any) -> str:
+    """to_json without whitespace, for catalog metadata: it is mostly nested
+    lists and dicts, which indentation roughly doubles (OCE-360)."""
+    return json.dumps(obj, separators=(",", ":"), default=str)
+
+
 def export_clause() -> str:
     """Trailing clause pointing at export_query, in the current transport's terms.
 
@@ -346,32 +352,27 @@ def format_datasource(ds: Any) -> dict[str, Any]:
 # search_catalog summaries.
 SUMMARY_DESCRIPTION_CHARS = 200
 SUMMARY_MAX_VARIABLES = 20
-SUMMARY_TAG_CHARS = 120
+# Decimal places kept in summary bounds: ~10 m, and drops float32 noise
+# (e.g. -38.599998474121094).
+SUMMARY_BOUNDS_DECIMALS = 4
 
-# get_datasource_info bounded view.
-INFO_MAX_ATTRS = 8  # attributes per variable / coordinate
+# get_datasource_info summary view (OCE-360).
+INFO_DESCRIPTION_CHARS = 1000
 INFO_MAX_GLOBAL_ATTRS = 25  # global attributes, and info entries
 INFO_VALUE_CHARS = 200  # longest attribute value shown before clipping
-# Above this serialized size the view is rebuilt lean: every variable and
-# coordinate keeps only dims/shape/dtype and its priority attributes. Every
-# variable stays listed either way: its exact name is what a query needs.
-INFO_BUDGET_CHARS = 60_000
 
 # Kept first, so a capped attribute list still carries what code needs.
 _PRIORITY_ATTRS = ("units", "long_name", "standard_name")
+# The only attributes a variable or coordinate keeps in the summary view.
+_SUMMARY_ATTRS = ("units", "long_name")
 
-_BOUNDED_NOTE = (
-    "Bounded view: long attribute values are clipped (ending in ...), attribute "
-    "lists are capped (see *_omitted counts), and schema.data_vars/attrs are "
-    'omitted as duplicates of variables/attributes. Pass detail="full" for '
-    "the complete record."
-)
-_LEAN_NOTE = (
-    "Bounded view of a large record: each variable and coordinate keeps only "
-    "dims, shape, dtype and units/long_name/standard_name (see attrs_omitted "
-    "counts), global attribute lists are capped, long values are clipped "
-    "(ending in ...), and schema.data_vars/attrs are omitted as duplicates of "
-    'variables/attributes. Pass detail="full" for the complete record.'
+_SUMMARY_NOTE = (
+    "Summary view: each variable and coordinate keeps only its dims, units and "
+    "long_name (schema.dims gives every dim's size), the description and long "
+    "attribute values are clipped (ending in ...), global attribute lists are "
+    "capped (see *_omitted counts), and schema.data_vars/attrs are omitted as "
+    'duplicates of variables/attributes. Pass detail="full" for the complete '
+    "record, with every attribute."
 )
 
 
@@ -401,41 +402,41 @@ def _bounded_attrs(attrs: dict[str, Any], max_items: int) -> tuple[dict, int]:
     return kept, len(attrs) - len(kept)
 
 
-def _bounded_entry(entry: Any, max_attrs: int) -> Any:
-    """A schema variable/coordinate entry with its attributes bounded.
-
-    dims, shape and dtype pass through unchanged: they are small, and clients
-    index them structurally.
-    """
+def _summary_entry(entry: Any) -> Any:
+    """A schema variable/coordinate entry reduced to its dims and
+    _SUMMARY_ATTRS. dims is kept as is: clients index it structurally."""
     if not isinstance(entry, dict):
         return entry
     out: dict[str, Any] = {}
-    for key, value in entry.items():
-        if key == "attrs" and isinstance(value, dict):
-            out["attrs"], omitted = _bounded_attrs(value, max_attrs)
-            if omitted:
-                out["attrs_omitted"] = omitted
-        else:
-            out[key] = value
+    if "dims" in entry:
+        out["dims"] = entry["dims"]
+    attrs = entry.get("attrs")
+    if isinstance(attrs, dict):
+        out["attrs"] = {
+            k: _clip_value(attrs[k], INFO_VALUE_CHARS)
+            for k in _SUMMARY_ATTRS
+            if k in attrs
+        }
     return out
 
 
-def _bounded_entries(entries: dict[str, Any], max_attrs: int) -> dict[str, Any]:
-    return {str(n): _bounded_entry(e, max_attrs) for n, e in entries.items()}
+def _summary_entries(entries: dict[str, Any]) -> dict[str, Any]:
+    return {str(n): _summary_entry(e) for n, e in entries.items()}
 
 
 def format_datasource_summary(ds: Any) -> dict[str, Any]:
     """A compact search_catalog hit: identity, coverage and variable names.
 
     Catalog hits from the gateway usually carry no schema, so variable names
-    appear only when the record includes them.
+    appear only when the record includes them. Tags are left out (OCE-360):
+    they run to ~20% of a summary, and the description says the same.
     """
     description = ds.description
     if isinstance(description, str):
         description = _clip(" ".join(description.split()), SUMMARY_DESCRIPTION_CHARS)
     result: dict[str, Any] = {"id": ds.id, "name": ds.name, "description": description}
     if ds.geom is not None:
-        result["bounds"] = list(ds.bounds)
+        result["bounds"] = [round(b, SUMMARY_BOUNDS_DECIMALS) for b in ds.bounds]
     if ds.tstart is not None:
         result["tstart"] = ds.tstart.isoformat()
     if ds.tend is not None:
@@ -447,59 +448,41 @@ def format_datasource_summary(ds: Any) -> dict[str, Any]:
         result["variables"] = names[:SUMMARY_MAX_VARIABLES]
         if len(names) > SUMMARY_MAX_VARIABLES:
             result["variables_total"] = len(names)
-
-    tags = [str(t) for t in ds.tags or []]
-    shown: list[str] = []
-    for tag in tags:
-        if sum(map(len, shown)) + len(tag) > SUMMARY_TAG_CHARS:
-            break
-        shown.append(tag)
-    if shown:
-        result["tags"] = shown
-    if len(shown) < len(tags):
-        result["tags_total"] = len(tags)
     return result
 
 
-def _bounded_view(full: dict[str, Any], max_attrs: int) -> dict[str, Any]:
+def format_datasource_bounded(ds: Any) -> dict[str, Any]:
+    """The full record's fields, with every large section reduced.
+
+    Every variable and coordinate stays listed (its exact name is what a
+    query needs) with only its dims, units and long_name. The description
+    and long attribute values are clipped and global attribute lists capped.
+    schema.data_vars and schema.attrs are dropped when they duplicate
+    variables/attributes.
+    """
+    full = format_datasource(ds)
     out = dict(full)
+    if isinstance(full.get("description"), str):
+        out["description"] = _clip(full["description"], INFO_DESCRIPTION_CHARS)
     for key in ("attributes", "info"):
         if isinstance(full.get(key), dict):
             out[key], omitted = _bounded_attrs(full[key], INFO_MAX_GLOBAL_ATTRS)
             if omitted:
                 out[f"{key}_omitted"] = omitted
     if isinstance(full.get("variables"), dict):
-        out["variables"] = _bounded_entries(full["variables"], max_attrs)
+        out["variables"] = _summary_entries(full["variables"])
     if isinstance(full.get("schema"), dict):
         schema = full["schema"]
         bounded: dict[str, Any] = {
             "dims": schema.get("dims"),
-            "coords": _bounded_entries(schema.get("coords") or {}, max_attrs),
+            "coords": _summary_entries(schema.get("coords") or {}),
         }
         # data_vars/attrs duplicate variables/attributes only on a detailed
-        # record; keep them (bounded) when the record has no such fields.
+        # record; keep them (reduced) when the record has no such fields.
         if "variables" not in full and schema.get("data_vars"):
-            bounded["data_vars"] = _bounded_entries(schema["data_vars"], max_attrs)
+            bounded["data_vars"] = _summary_entries(schema["data_vars"])
         if "attributes" not in full and schema.get("attrs"):
             bounded["attrs"], _ = _bounded_attrs(schema["attrs"], INFO_MAX_GLOBAL_ATTRS)
         out["schema"] = bounded
-    return out
-
-
-def format_datasource_bounded(ds: Any) -> dict[str, Any]:
-    """The full record's fields and shape, with every large section bounded.
-
-    Every variable and coordinate is kept with its dims, shape, dtype and
-    priority attributes (units, long_name, standard_name); up to
-    INFO_MAX_ATTRS attributes in all, with long values clipped. If that still
-    serializes past INFO_BUDGET_CHARS, entries keep only the priority
-    attributes. schema.data_vars and schema.attrs are dropped when they
-    duplicate variables/attributes.
-    """
-    full = format_datasource(ds)
-    out = _bounded_view(full, INFO_MAX_ATTRS)
-    out["note"] = _BOUNDED_NOTE
-    if len(to_json(out)) > INFO_BUDGET_CHARS:
-        out = _bounded_view(full, 0)
-        out["note"] = _LEAN_NOTE
+    out["note"] = _SUMMARY_NOTE
     return out
