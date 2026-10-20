@@ -28,6 +28,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable
 
 from oceanum_mcp.common.config import (
+    FLAG_VALUES,
     auth_mode,
     datamesh_service,
     env_flag,
@@ -169,10 +170,7 @@ def _server_token() -> str | None:
         return _read_token_file(path)
     use_keyring = env_flag("DATAMESH_TOKEN_KEYRING")
     if use_keyring is None:
-        raise ValueError(
-            "DATAMESH_TOKEN_KEYRING must be 1/true/yes or 0/false/no, got "
-            f"{os.environ['DATAMESH_TOKEN_KEYRING']!r}"
-        )
+        raise ValueError(f"DATAMESH_TOKEN_KEYRING must be {FLAG_VALUES}")
     if use_keyring:
         return _keyring_token()
     return None

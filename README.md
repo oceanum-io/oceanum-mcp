@@ -168,11 +168,11 @@ retry with a supported version; GitHub Copilot did so and connected.
 | ----------------------------- | -------- | ------------------------------------------------------------------------------- |
 | `DATAMESH_TOKEN`              | Yes*     | Oceanum API token (shared by all servers)                                       |
 | `DATAMESH_TOKEN_FILE`         | Yes*     | Path to a file holding the token, readable only by its owner; used when `DATAMESH_TOKEN` is unset |
-| `DATAMESH_TOKEN_KEYRING`      | Yes*     | `1`/`true`/`yes` to read the token from the OS credential store (once per process); used when neither of the above is set |
+| `DATAMESH_TOKEN_KEYRING`      | Yes*     | `1`/`true`/`yes`/`on` to read the token from the OS credential store (once per process); used when neither of the above is set |
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
-| `OCEANUM_MCP_READ_ONLY`       | No       | `1`/`true`/`yes` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`); any value other than these or `0`/`false`/`no` stops the server at startup |
+| `OCEANUM_MCP_READ_ONLY`       | No       | `1`/`true`/`yes`/`on` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`); any value other than these or `0`/`false`/`no`/`off` stops the server at startup |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_MAX_INLINE_ROWS` | No       | Max rows/records previewed inline before truncation (default 100)               |
 | `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |

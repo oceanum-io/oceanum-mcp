@@ -44,13 +44,19 @@ def is_network_transport() -> bool:
     return _transport in ("http", "sse")
 
 
+# Accepted env_flag values, for error messages. Those messages never echo the
+# value itself: a token pasted into the wrong variable would reach the LLM.
+FLAG_VALUES = "1/true/yes/on or 0/false/no/off"
+
+
 def env_flag(name: str) -> bool | None:
-    """A boolean environment variable: True for 1/true/yes, False for
-    0/false/no or unset/empty, None for any other value (case-insensitive)."""
+    """A boolean environment variable: True for 1/true/yes/on, False for
+    0/false/no/off or unset/empty, None for any other value (case-insensitive,
+    surrounding whitespace ignored)."""
     raw = os.environ.get(name, "").strip().lower()
-    if raw in ("1", "true", "yes"):
+    if raw in ("1", "true", "yes", "on"):
         return True
-    if raw in ("", "0", "false", "no"):
+    if raw in ("", "0", "false", "no", "off"):
         return False
     return None
 
@@ -64,10 +70,7 @@ def is_read_only() -> bool:
     """
     read_only = env_flag("OCEANUM_MCP_READ_ONLY")
     if read_only is None:
-        raise ValueError(
-            "OCEANUM_MCP_READ_ONLY must be 1/true/yes or 0/false/no, got "
-            f"{os.environ['OCEANUM_MCP_READ_ONLY']!r}"
-        )
+        raise ValueError(f"OCEANUM_MCP_READ_ONLY must be {FLAG_VALUES}")
     return read_only
 
 

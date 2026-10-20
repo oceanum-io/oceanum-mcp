@@ -265,14 +265,24 @@ def test_keyring_failure_not_cached(stdio_env):
         assert resolve_credential() == "kr-token"
 
 
-@pytest.mark.parametrize("value", ["on", "enabled", "2"])
-def test_keyring_unrecognised_value_is_named(stdio_env, value):
+@pytest.mark.parametrize("value", ["disabled", "enabled", "2", "a" * 40])
+def test_keyring_unrecognised_value_is_refused_without_echo(stdio_env, value):
     stdio_env.setenv("DATAMESH_TOKEN_KEYRING", value)
-    with pytest.raises(ValueError, match=f"must be 1/true/yes.*{value!r}"):
+    with pytest.raises(ValueError, match="DATAMESH_TOKEN_KEYRING must be") as exc:
         resolve_credential()
+    assert value not in str(exc.value)
 
 
-@pytest.mark.parametrize("value", ["0", "false", "no", ""])
+@pytest.mark.parametrize("value", ["on", " On "])
+def test_keyring_on_enables_lookup(stdio_env, value):
+    import keyring
+
+    stdio_env.setenv("DATAMESH_TOKEN_KEYRING", value)
+    with patch.object(keyring, "get_password", return_value="kr-token"):
+        assert resolve_credential() == "kr-token"
+
+
+@pytest.mark.parametrize("value", ["0", "false", "no", "", "off", "Off"])
 def test_keyring_disabled_values(stdio_env, value):
     stdio_env.setenv("DATAMESH_TOKEN_KEYRING", value)
     with pytest.raises(ValueError, match="No Datamesh credential"):
