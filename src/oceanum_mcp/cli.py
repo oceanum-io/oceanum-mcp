@@ -1,6 +1,7 @@
 """CLI argument parsing and server dispatch for Oceanum MCP."""
 
 import argparse
+import os
 import sys
 from typing import Any, TextIO
 
@@ -36,12 +37,16 @@ def _run_stdio(mcp_server: Any) -> None:
     """Serve over stdio with nothing but JSON-RPC on stdout.
 
     No banner: stdio clients surface stderr output as warnings, and the
-    banner also triggers a PyPI update check on every launch.
+    banner also triggers a PyPI update check on every launch. For the same
+    reason FastMCP logs at WARNING (its INFO "Starting MCP server ..." line
+    is noise there; warnings and errors still show), unless the user chose a
+    level with FASTMCP_LOG_LEVEL.
     """
+    log_level = None if os.environ.get("FASTMCP_LOG_LEVEL") else "WARNING"
     real_stdout = sys.stdout
     sys.stdout = _StdoutGuard(real_stdout, sys.stderr)
     try:
-        mcp_server.run(transport="stdio", show_banner=False)
+        mcp_server.run(transport="stdio", show_banner=False, log_level=log_level)
     finally:
         sys.stdout = real_stdout
 

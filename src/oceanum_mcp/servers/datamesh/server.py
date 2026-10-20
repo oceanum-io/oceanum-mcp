@@ -66,6 +66,7 @@ from oceanum.datamesh.utils import (
     DATAMESH_STAGE_READ_TIMEOUT,
 )
 
+from oceanum_mcp import __version__
 from oceanum_mcp.common.client import get_datamesh_connector
 from oceanum_mcp.common.config import (
     export_dir,
@@ -152,6 +153,7 @@ _ACCESS_SCOPE = (
 # transport-specific string at import.
 mcp = FastMCP(
     "Oceanum Datamesh",
+    version=__version__,
     instructions=(
         "Access the Oceanum Datamesh platform for ocean and environmental data.\n"
         "Workflow: search_catalog to discover datasets -> get_datasource_info for "
@@ -181,12 +183,22 @@ def _captured_warnings(collected: list[str]) -> Iterator[None]:
     via warnings.warn, which would otherwise be lost to stderr.
     catch_warnings mutates process-global state and FastMCP runs sync tools
     in worker threads, so captures are serialized with a lock.
+
+    Deprecation notices (DeprecationWarning, FutureWarning) are dropped: they
+    address the server's maintainers, not the caller. Being process-global,
+    a capture also records warnings raised by other threads meanwhile, e.g. a
+    pandas "'d' is deprecated" from a concurrent call's parameter parsing,
+    which once surfaced in a query_data result (OCE-366).
     """
     with _WARNINGS_LOCK:
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
             yield
-        collected.extend(str(w.message) for w in caught)
+        collected.extend(
+            str(w.message)
+            for w in caught
+            if not issubclass(w.category, (DeprecationWarning, FutureWarning))
+        )
 
 
 class GatewayTimeout(DatameshConnectError):
@@ -1047,8 +1059,15 @@ def _check_time_resolution(resolution: str) -> None:
             offset = to_offset(resolution)
         except ValueError:
             offset = None
+        # The engine's lower-casing turns "1D" into "1d": the same offset,
+        # but deprecated on pandas 3 ("'d' is deprecated", OCE-366). Parse
+        # the canonical "D" so the common day resolutions warn nothing, even
+        # when the quieting above is skipped.
+        engine_resolution = _ALIAS_TOKEN_RE.sub(
+            lambda m: "D" if m[0] == "d" else m[0], resolution.lower()
+        )
         try:
-            engine_offset = to_offset(resolution.lower())
+            engine_offset = to_offset(engine_resolution)
         except ValueError:
             engine_offset = None
     if offset is None and engine_offset is None:
