@@ -243,9 +243,11 @@ def test_keyring_without_stored_token(stdio_env):
     import keyring
 
     stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "true")
-    with patch.object(keyring, "get_password", return_value=None):
-        with pytest.raises(ValueError, match="keyring set oceanum-mcp"):
-            resolve_credential()
+    with (
+        patch.object(keyring, "get_password", return_value=None),
+        pytest.raises(ValueError, match="keyring set oceanum-mcp"),
+    ):
+        resolve_credential()
 
 
 def test_keyring_backend_failure(stdio_env):
@@ -253,22 +255,28 @@ def test_keyring_backend_failure(stdio_env):
     from keyring.errors import NoKeyringError
 
     stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
-    with patch.object(keyring, "get_password", side_effect=NoKeyringError("none")):
-        with pytest.raises(ValueError, match="credential store could not be read"):
-            resolve_credential()
+    with (
+        patch.object(keyring, "get_password", side_effect=NoKeyringError("none")),
+        pytest.raises(ValueError, match="credential store could not be read"),
+    ):
+        resolve_credential()
 
 
 def test_keyring_not_installed(stdio_env):
     stdio_env.setenv("DATAMESH_TOKEN_KEYRING", "1")
-    with patch.dict("sys.modules", {"keyring": None}):
-        with pytest.raises(ValueError, match=r"oceanum-mcp\[keyring\]"):
-            resolve_credential()
+    with (
+        patch.dict("sys.modules", {"keyring": None}),
+        pytest.raises(ValueError, match=r"oceanum-mcp\[keyring\]"),
+    ):
+        resolve_credential()
 
 
 def test_keyring_not_consulted_unless_enabled(stdio_env):
     import keyring
 
-    with patch.object(keyring, "get_password") as get:
-        with pytest.raises(ValueError, match="No Datamesh credential"):
-            resolve_credential()
+    with (
+        patch.object(keyring, "get_password") as get,
+        pytest.raises(ValueError, match="No Datamesh credential"),
+    ):
+        resolve_credential()
     get.assert_not_called()
