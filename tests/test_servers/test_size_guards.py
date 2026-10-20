@@ -494,7 +494,8 @@ class TestConfirmationTolerance:
             server, "_download_stage", return_value=_download_stage(5 * GB)
         ):
             parsed = json.loads(server.export_query(datasource_id="test-ds"))
-        assert "splitting it into parts" in parsed["message"]
+        assert "do not split it into parts" in parsed["message"]
+        assert "ask the user before retrying" in parsed["message"]
 
 
 class TestFlattenedExportConfirmation:
@@ -812,3 +813,55 @@ def test_table_refusal_has_no_empty_variable_dims(mock_conn, mock_stage):
     parsed = json.loads(server.query_data(datasource_id="test-ds"))
     assert parsed["refused"] is True
     assert "variable_dims" not in parsed
+
+
+class TestStageRecordCapConfig:
+    """OCE-358 review round 3: a bad OCEANUM_MCP_MAX_INLINE_ROWS must not
+    break the dry run."""
+
+    @pytest.mark.parametrize("raw", ["abc", "0", "-5"])
+    def test_invalid_cap_falls_back_to_default(
+        self, mock_conn, mock_stage, monkeypatch, raw
+    ):
+        monkeypatch.setenv("OCEANUM_MCP_MAX_INLINE_ROWS", raw)
+        mock_stage.return_value = _stage(size=1000, dlen=10)
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert parsed["staged"] is True
+        assert parsed["recommendation"].startswith("Small enough")
+        assert "OCEANUM_MCP_MAX_INLINE_ROWS" in parsed["config_warning"]
+        assert "default (100)" in parsed["config_warning"]
+
+    def test_invalid_cap_still_counts_against_default(
+        self, mock_conn, mock_stage, monkeypatch
+    ):
+        monkeypatch.setenv("OCEANUM_MCP_MAX_INLINE_ROWS", "abc")
+        mock_stage.return_value = _stage(size=11_928, dlen=744)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "744 records" in rec
+        assert "first 100" in rec
+
+    def test_valid_cap_has_no_config_warning(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(size=1000, dlen=10)
+
+        parsed = json.loads(server.stage_query(datasource_id="test-ds"))
+        assert "config_warning" not in parsed
+
+
+class TestMidsizeFlattenNote:
+    """OCE-355 review round 3: a gridded result may exceed 1 GB as a
+    flattened table even when 3x its staged size does not."""
+
+    def test_local_dataset_notes_flattened_table(self, mock_conn, mock_stage):
+        mock_stage.return_value = _stage(size=100_000_000, dlen=10**7)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "as a flattened CSV/Parquet table" in rec
+        assert "as CSV (about 3x)" not in rec
+
+    def test_hosted_dataset_has_no_flatten_note(self, mock_conn, mock_stage, hosted):
+        mock_stage.return_value = _stage(size=100_000_000, dlen=10**7)
+
+        rec = json.loads(server.stage_query(datasource_id="test-ds"))["recommendation"]
+        assert "confirm" not in rec

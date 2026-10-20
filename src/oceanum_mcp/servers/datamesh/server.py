@@ -68,6 +68,7 @@ from oceanum.datamesh.utils import (
 
 from oceanum_mcp.common.client import get_datamesh_connector
 from oceanum_mcp.common.config import (
+    DEFAULT_MAX_INLINE_ROWS,
     export_dir,
     is_network_transport,
     is_read_only,
@@ -104,13 +105,14 @@ MAX_EXPORT_FRAME_BYTES = 2_000_000_000
 # on the hosted download link or in direct oceanum library code.
 MAX_EXPORT_DATASET_BYTES = 10_000_000_000
 
-# Above this staged size stage_query leads with narrowing, states the cost of
-# exporting as-is, and tells the agent to ask the user before exporting, and
-# query_data refuses rather than open the result lazily. export_query refuses
-# an export that writes more than this (_written_bytes) unless
-# confirm_size_bytes confirms that size (OCE-355). The confirmation is
-# advisory: the server cannot see whether the user was asked; it forces an
-# explicit, size-aware step for each large export.
+# The "ask the user first" threshold (OCE-355).
+# - stage_query: above this staged size it leads with narrowing, states the
+#   cost of exporting as-is, and tells the agent to ask the user.
+# - query_data: above it, refuses instead of opening the result lazily.
+# - export_query: refuses an export that writes more than this
+#   (_written_bytes) unless confirm_size_bytes confirms that size.
+# The confirmation is advisory (the server cannot see whether the user was
+# asked); it forces an explicit, size-aware step for each large export.
 LARGE_EXPORT_BYTES = 1_000_000_000
 
 # Hosted export sizes the /oceanql/download/ stage, but the agent was shown
@@ -129,10 +131,11 @@ _CAP_WHOLE_REQUEST = (
     "is not a way round it."
 )
 
-# The same for the LARGE_EXPORT_BYTES confirmation.
+# The same for the LARGE_EXPORT_BYTES confirmation. Each call is checked on
+# its own, so this is an instruction to the agent, not a server guarantee.
 _CONFIRM_WHOLE_REQUEST = (
-    "This applies to the whole request: splitting it into parts below "
-    f"{LARGE_EXPORT_BYTES // 1_000_000_000} GB does not avoid asking the user."
+    "Ask the user about the whole request: do not split it into parts below "
+    f"{LARGE_EXPORT_BYTES // 1_000_000_000} GB to avoid asking."
 )
 
 # Free space required before a local export writes, as a multiple of the staged
@@ -965,7 +968,9 @@ def _variable_dims(stage: Stage) -> dict[str, list[str]]:
     }
 
 
-def _inline_records(stage: Stage, client_limit: int | None) -> int | None:
+def _inline_records(
+    stage: Stage, client_limit: int | None, max_records: int
+) -> int | None:
     """Records query_data would count for this stage's result (_record_count:
     the rows of a table, the product of ALL a dataset's dims), or None if
     staging does not tell.
@@ -978,8 +983,8 @@ def _inline_records(stage: Stage, client_limit: int | None) -> int | None:
     a table, or the last N steps along each of a dataset's time, ensemble
     and quantile dims (coordinate keys t, e, q, as _limit_result does); the
     count after it is only known for tables, datasets on a single one of
-    those dims, and a limit too large to bring the count under query_data's
-    inline cap.
+    those dims, and a limit too large to bring the count under max_records
+    (query_data's inline record cap).
     """
     is_dataset = stage.container == Container.Dataset
     dimsets = [set(str(code)) for code in (stage.coordmap or {}).values()]
@@ -991,7 +996,7 @@ def _inline_records(stage: Stage, client_limit: int | None) -> int | None:
     union = set().union(*dimsets)
     if not is_dataset or (len(union) == 1 and union <= set(_LIMIT_COORD_KEYS)):
         return min(records, client_limit)
-    if records <= max_inline_rows() or client_limit > max_inline_rows():
+    if records <= max_records or client_limit > max_records:
         # Unchanged below the cap; or at least min(records, client_limit),
         # which is above the cap whenever records is.
         return records
@@ -1012,7 +1017,6 @@ def _large_result_advice(stage: Stage, client_limit: int | None) -> str:
     query_data's refusal (OCE-355).
     """
     size = human_bytes(stage.size)
-    confirm = f"ask the user before exporting. {_confirm_advice(stage)}"
     local_cap = (
         MAX_EXPORT_DATASET_BYTES
         if stage.container == Container.Dataset
@@ -1032,7 +1036,7 @@ def _large_result_advice(stage: Stage, client_limit: int | None) -> str:
         else:
             cost = (
                 f"Exporting as-is makes export_query return a {size} "
-                f"download; {confirm}"
+                f"download; ask the user before exporting. {_confirm_advice(stage)}"
             )
     elif client_limit is not None and stage.container == Container.Dataset:
         # OCE-326: export_query sizes a limited dataset on the sliced
@@ -1056,7 +1060,8 @@ def _large_result_advice(stage: Stage, client_limit: int | None) -> str:
     else:
         cost = (
             f"Exporting as-is makes export_query write about {size} to the "
-            f"user's disk (several times more as CSV); {confirm}"
+            "user's disk (several times more as CSV); ask the user before "
+            f"exporting. {_confirm_advice(stage)}"
         )
     return f"Large result ({size}). Narrow it first: {_NARROWING}. {cost}"
 
@@ -1117,7 +1122,8 @@ def _confirmation_message(written: int, confirm_size_bytes: int | None) -> str:
         f"{mismatch}This export writes about {human_bytes(written)} "
         f"({written} bytes), above {human_bytes(LARGE_EXPORT_BYTES)}, so "
         "nothing was exported. Narrowing it first is usually better: "
-        f"{_NARROWING}. To export it as-is, ask the user; only if they agree, "
+        f"{_NARROWING}. To export it as-is, ask the user before retrying; only "
+        "if they agree, "
         "call export_query again with the same parameters plus "
         f"confirm_size_bytes={written}. {_CONFIRM_WHOLE_REQUEST}"
     )
@@ -1674,8 +1680,16 @@ def stage_query(
     if stage.size <= inline_limit:
         # OCE-358: query_data caps inline values by record count, not bytes,
         # so a small but long result comes back as a preview.
-        max_records = max_inline_rows()
-        records = _inline_records(stage, client_limit)
+        try:
+            max_records = max_inline_rows()
+        except ValueError as exc:
+            # A misconfigured cap must not break the dry run (query_data
+            # still fails on it, loudly).
+            max_records = DEFAULT_MAX_INLINE_ROWS
+            out["config_warning"] = (
+                f"{exc}; record advice assumes the default ({DEFAULT_MAX_INLINE_ROWS})."
+            )
+        records = _inline_records(stage, client_limit, max_records)
         reduce = (
             "which is NOT the full result (never compute statistics from it). "
             f"To get every value inline, reduce it to at most {max_records} "
@@ -1713,19 +1727,21 @@ def stage_query(
             f"Larger than the inline limit ({human_bytes(inline_limit)}): "
             f"{detail}{export_clause()}."
         )
-        if _written_bytes(stage.size, "csv") > LARGE_EXPORT_BYTES:
-            # Below the threshold as staged, but not necessarily as written.
+        # Below the threshold as staged, but not necessarily as written: as
+        # CSV text, or (locally) as a flattened table, whose size is only
+        # known at export.
+        as_csv = _written_bytes(stage.size, "csv") > LARGE_EXPORT_BYTES
+        as_table = stage.container == Container.Dataset and not is_network_transport()
+        if as_csv or as_table:
+            ways = [
+                *(["as CSV (about 3x)"] if as_csv else []),
+                *(["as a flattened CSV/Parquet table"] if as_table else []),
+            ]
             out["recommendation"] += (
                 " export_query asks the user to confirm exports that write "
                 f"more than {human_bytes(LARGE_EXPORT_BYTES)}, which this can "
-                "as CSV (about 3x)"
-                + (
-                    " or, for gridded data, as a flattened CSV/Parquet table"
-                    if stage.container == Container.Dataset
-                    and not is_network_transport()
-                    else ""
-                )
-                + "; the refusal then states the size to confirm."
+                f"{' or '.join(ways)}; the refusal then states the size to "
+                "confirm."
             )
     if _resamples_or_aggregates(query):
         # The staged size is the reduced output; computing it still reads
