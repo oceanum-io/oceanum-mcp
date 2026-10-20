@@ -21,16 +21,15 @@ dependencies = [
     "httpx2>=2.5,<3",
     # <2 pin guards the private Connector._stage_request/Session usage in the
     # datamesh server's staging helper (no public staging API in oceanum 1.x).
-    "oceanum>=1.1,<2",
+    # >=1.2.1: the first release to pin xarray<2026.9. Later xarray drops
+    # zarr 2 support (passes zarr_format= to zarr.open_group, which the
+    # zarr<3 oceanum requires rejects), so every gridded load failed on
+    # images that resolved oceanum<1.2.1 with xarray>=2026.9 (OCE-354).
+    "oceanum>=1.2.1,<2",
     # oceanum requires zarr<3, and zarr 2.x breaks at runtime with
     # numcodecs>=0.16 (blosc.cbuffer_sizes removed); oceanum does not pin this.
     # Remove once oceanum pins numcodecs itself or moves to zarr>=3.
     "numcodecs<0.16",
-    # xarray>=2026.9 dropped zarr 2 support: it passes zarr_format= to
-    # zarr.open_group, which zarr 2.x rejects, so every gridded load fails
-    # (OCE-354). Only oceanum>=1.2.1 pins this; oceanum 1.1.x-1.2.0 do not.
-    # Remove together with the numcodecs pin once oceanum moves to zarr>=3.
-    "xarray<2026.9",
 ]
 
 [project.optional-dependencies]
