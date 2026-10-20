@@ -265,11 +265,20 @@ class TestSearchCatalogSummary:
         for b in hit["bounds"]:
             assert round(b, 4) == b
 
-    @pytest.mark.parametrize("bad", [float("nan"), float("inf")])
-    def test_non_finite_bounds_are_null(self, mock_conn, bad):
-        ds = _mock_datasource(geom={"type": "Point"}, bounds=(bad, -48.0, 179.0, bad))
-        hit = _search(mock_conn, [ds])["results"][0]
-        assert hit["bounds"] == [None, -48.0, 179.0, None]
+    @pytest.mark.parametrize(
+        "bad",
+        [
+            (float("nan"), -48.0, 179.0, -34.0),
+            (165.0, -48.0, float("inf"), -34.0),
+            (1e305, -48.0, 179.0, -34.0),  # overflows when scaled
+            (),  # shapely < 2 on an empty geometry
+        ],
+    )
+    def test_unusable_bounds_are_null_for_that_record_only(self, mock_conn, bad):
+        odd = _mock_datasource(id="odd", geom={"type": "Point"}, bounds=bad)
+        hits = _search(mock_conn, [odd, make_datasource(detail=False)])["results"]
+        assert hits[0]["bounds"] is None
+        assert hits[1]["bounds"] == [165.0, -48.0, 179.0, -34.0]
 
     def test_no_negative_zero_bounds(self, mock_conn):
         ds = _mock_datasource(geom={"type": "Point"}, bounds=(-0.0, -1e-9, 1e-9, 0.0))
@@ -512,6 +521,30 @@ class TestGetDatasourceInfoDetail:
         assert out["attributes_omitted"] == 152
         assert "every variable is still listed" in out["note"]
         assert 'detail="full"' in out["note"]
+        assert ("budget_exceeded" in out) == (len(raw) > formatting.INFO_BUDGET_CHARS)
+
+    def test_budget_exceeded_flag_when_names_alone_do_not_fit(
+        self, mock_conn, monkeypatch
+    ):
+        monkeypatch.setattr(formatting, "INFO_BUDGET_CHARS", 500)
+        ds = make_datasource(n_variables=50)
+        mock_conn.get_datasource.return_value = ds
+        out = json.loads(server.get_datasource_info(ds.id))
+        assert out["budget_exceeded"] is True
+        assert len(out["variables"]) == 50
+        assert set(out["variables"]["hs_part0"]) == set()
+
+    def test_no_op_stages_not_named(self, mock_conn, monkeypatch):
+        # No global attributes or info: that stage removes nothing.
+        ds = make_datasource(n_variables=10)
+        ds.info = None
+        ds.dataschema.attrs = {}
+        mock_conn.get_datasource.return_value = ds
+        whole = len(server.get_datasource_info(ds.id))
+        monkeypatch.setattr(formatting, "INFO_BUDGET_CHARS", whole - 100)
+        out = json.loads(server.get_datasource_info(ds.id))
+        assert "global attributes" not in out["note"]
+        assert "coordinate attributes" in out["note"]
 
     def test_large_record_keeps_dims_and_units_when_they_fit(self, mock_conn):
         ds = make_datasource(n_variables=250)
@@ -523,6 +556,7 @@ class TestGetDatasourceInfoDetail:
         assert var == {
             "dims": ["time", "latitude", "longitude"],
             "attrs": {"units": "m"},
+            "attrs_omitted": 16,
         }
         assert "coordinate attributes" in out["note"]
         assert "shapes and dtypes" in out["note"]

@@ -581,6 +581,7 @@ def _id_rank(wanted: str, candidate: str) -> tuple[int, float] | None:
     if not a or not b:
         return None
     words = a.split("_")
+    ratio = None
     if len(words) >= 2 and set(words) <= set(b.split("_")):
         ratio = difflib.SequenceMatcher(None, a, b).ratio()
         if ratio >= _SUGGEST_CUTOFF:
@@ -596,7 +597,9 @@ def _id_rank(wanted: str, candidate: str) -> tuple[int, float] | None:
     core_a, core_b = _differing_words(words, b.split("_"))
     if difflib.SequenceMatcher(None, core_a, core_b).ratio() < _ID_CORE_CUTOFF:
         return None
-    return edits, -difflib.SequenceMatcher(None, a, b).ratio()
+    if ratio is None:
+        ratio = difflib.SequenceMatcher(None, a, b).ratio()
+    return edits, -ratio
 
 
 def _datasource_suggestions(
@@ -1328,19 +1331,25 @@ def _within_budget(results: list[dict[str, Any]], budget: int) -> int:
 def _search_terms(search: str) -> list[list[str]]:
     """search as alternatives, each a list of words a text match must all
     contain, following the catalog's websearch syntax: "or" separates
-    alternatives; negated words ("-era5", "not era5") and "and" are dropped;
-    quotes and punctuation only separate words."""
+    alternatives; negated words and quoted phrases ("-era5", "not era5",
+    '-"era5 grid"') and "and" are dropped; quotes and punctuation otherwise
+    only separate words."""
     groups: list[list[str]] = [[]]
     negate_next = False
-    for token in search.lower().split():
+    for token in re.findall(r'-?"[^"]*"?|\S+', search.lower()):
         negated = negate_next or token.startswith("-")
         negate_next = token == "not"
         if token in ("or", "and", "not") or negated:
             if token == "or":
                 groups.append([])
             continue
-        groups[-1] += re.findall(r"[^\W_]+", token)
+        groups[-1] += _words(token)
     return [g for g in groups if g]
+
+
+def _words(text: str) -> list[str]:
+    """The words of text: runs of letters and digits ("_" separates)."""
+    return re.findall(r"[^\W_]+", text.lower())
 
 
 def _word_forms(word: str) -> tuple[str, ...]:
@@ -1359,16 +1368,19 @@ def _word_forms(word: str) -> tuple[str, ...]:
 
 def _matches_text(ds: Any, terms: list[list[str]]) -> bool:
     """Whether ds's id, name, description, tags, labels or variable names
-    contain every word (or its singular) of one of the alternatives in terms,
-    case-insensitively. Only a signal: the catalog matches on more than this
+    have every word of one of the alternatives in terms as a whole word,
+    case-insensitively, singular and plural alike ("sea" is not in
+    "research"). Only a signal: the catalog matches on more than this
     (OCE-359)."""
     data_vars = getattr(ds.dataschema, "data_vars", None)
     fields = [ds.id, ds.name, ds.description, *(ds.tags or []), *(ds.labels or [])]
     if isinstance(data_vars, dict):
         fields += list(data_vars)
-    text = " ".join(str(f) for f in fields if f).lower()
+    forms = {
+        form for f in fields if f for w in _words(str(f)) for form in _word_forms(w)
+    }
     return any(
-        all(any(form in text for form in _word_forms(w)) for w in group)
+        all(any(form in forms for form in _word_forms(w)) for w in group)
         for group in terms
     )
 
@@ -1442,7 +1454,9 @@ def search_catalog(
 
     formatter = format_datasource if detail == "full" else format_datasource_summary
     results = [formatter(ds) for ds in datasources]
-    if text_matches == 0:
+    # Summaries only: detail="full" asked for complete records.
+    compacted = text_matches == 0 and detail == "summary"
+    if compacted:
         results = [{k: r.get(k) for k in _ZERO_TEXT_MATCH_FIELDS} for r in results]
     if text_matches:
         for result, hit in zip(results, hits):
@@ -1458,10 +1472,11 @@ def search_catalog(
         out["text_note"] = (
             f"None of the catalog's {fetched} closest results contains all the "
             f"words of {search!r} literally (in its id, name, description, "
-            "tags or variable names), so they are listed by id and name only. "
-            "The catalog also matches word stems and other fields, so some may "
-            "still be relevant: check one with get_datasource_info, or rephrase "
-            "the search."
+            "tags or variable names)"
+            + (", so they are listed by id and name only" if compacted else "")
+            + ". The catalog also matches word stems and other fields, so some "
+            "may still be relevant: check one with get_datasource_info, or "
+            "rephrase the search."
         )
     elif text_matches and text_matches < fetched:
         out["text_note"] = (
@@ -1473,7 +1488,7 @@ def search_catalog(
     # Empty or short: the page looks exhaustive, so state its scope. Not on
     # a page that withheld anything (omitted results, or results listed by
     # id and name only): its scope note would read as "nothing else exists".
-    if not results or (not omitted and len(results) < limit and text_matches != 0):
+    if not results or (not omitted and len(results) < limit and not compacted):
         out["scope"] = _ACCESS_SCOPE
     if not results:
         out["message"] = "No datasources found matching the search criteria."

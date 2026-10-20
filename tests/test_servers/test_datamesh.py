@@ -229,6 +229,51 @@ class TestSearchCatalogTextMatches:
 
         assert len(out) < 4_000
 
+    def test_zero_matches_full_detail_not_compacted(self, mock_conn):
+        mock_conn.get_catalog.return_value = _mock_catalog(FUZZY_PAGE[:3])
+
+        parsed = json.loads(server.search_catalog(search="qzxvbn", detail="full"))
+
+        assert parsed["text_matches"] == 0
+        assert parsed["results"][0]["description"] == "A test dataset"
+        assert "id and name only" not in parsed["text_note"]
+
+    @pytest.mark.parametrize(
+        ("search", "matches"),
+        [("sea", 0), ("search", 0), ("research", 1), ("vessel", 1), ("vessels", 1)],
+    )
+    def test_whole_words_only(self, mock_conn, search, matches):
+        ds = _mock_datasource(id="ds", name="Research vessel tracks")
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        parsed = json.loads(server.search_catalog(search=search))
+
+        assert parsed["text_matches"] == matches
+
+    @pytest.mark.parametrize(
+        "search", ['wave -"era5 grid"', 'wave not "era5 grid"', 'wave -"grid"']
+    )
+    def test_negated_phrase_is_not_required(self, mock_conn, search):
+        ds = _mock_datasource(id="gfs-wave", name="GFS wave forecast")
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        parsed = json.loads(server.search_catalog(search=search))
+
+        assert parsed["text_matches"] == 1
+
+    def test_quoted_phrase_words_are_required(self, mock_conn):
+        ds = _mock_datasource(id="gfs-wave", name="GFS wave forecast")
+        mock_conn.get_catalog.return_value = _mock_catalog([ds])
+
+        assert (
+            json.loads(server.search_catalog(search='"wave forecast"'))["text_matches"]
+            == 1
+        )
+        assert (
+            json.loads(server.search_catalog(search='"wave hindcast"'))["text_matches"]
+            == 0
+        )
+
     def test_zero_matches_on_empty_catalog(self, mock_conn):
         mock_conn.get_catalog.return_value = _mock_catalog([])
 

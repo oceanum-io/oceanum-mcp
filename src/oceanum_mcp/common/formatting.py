@@ -435,16 +435,29 @@ def _summary_entries(entries: dict[str, Any]) -> dict[str, Any]:
     return {str(n): _summary_entry(e) for n, e in entries.items()}
 
 
-def _round_out(value: float, up: bool) -> float | None:
-    """value rounded to SUMMARY_BOUNDS_DECIMALS, away from the box's inside;
-    None (JSON null) if it is not finite."""
-    if not math.isfinite(value):
-        return None
+def _round_out(value: float, up: bool) -> float:
+    """value rounded to SUMMARY_BOUNDS_DECIMALS, away from the box's inside.
+    Raises on a non-finite or overflowing value."""
     scale = 10**SUMMARY_BOUNDS_DECIMALS
     # round() first: a float product such as 1650000.0000000002 must not
     # step to the next unit.
     step = math.ceil if up else math.floor
     return step(round(value * scale, 6)) / scale + 0.0  # + 0.0: no -0.0
+
+
+def _summary_bounds(ds: Any) -> list[float] | None:
+    """ds's bounds rounded outward, or None if they cannot be (empty or
+    non-finite bounds, overflow): one odd record must not fail a search."""
+    try:
+        xmin, ymin, xmax, ymax = ds.bounds
+        return [
+            _round_out(xmin, up=False),
+            _round_out(ymin, up=False),
+            _round_out(xmax, up=True),
+            _round_out(ymax, up=True),
+        ]
+    except Exception:  # noqa: BLE001 - any failure means "no usable bounds"
+        return None
 
 
 def format_datasource_summary(ds: Any) -> dict[str, Any]:
@@ -458,13 +471,7 @@ def format_datasource_summary(ds: Any) -> dict[str, Any]:
         description = _clip(" ".join(description.split()), SUMMARY_DESCRIPTION_CHARS)
     result: dict[str, Any] = {"id": ds.id, "name": ds.name, "description": description}
     if ds.geom is not None:
-        xmin, ymin, xmax, ymax = ds.bounds
-        result["bounds"] = [
-            _round_out(xmin, up=False),
-            _round_out(ymin, up=False),
-            _round_out(xmax, up=True),
-            _round_out(ymax, up=True),
-        ]
+        result["bounds"] = _summary_bounds(ds)
     if ds.tstart is not None:
         result["tstart"] = ds.tstart.isoformat()
     if ds.tend is not None:
@@ -544,11 +551,10 @@ def _shed_global_attrs(out: dict[str, Any]) -> None:
     for parent, key, count_key in (
         (out, "attributes", "attributes_omitted"),
         (out, "info", "info_omitted"),
-        (out.get("schema") or {}, "attrs", None),
+        (out.get("schema") or {}, "attrs", "attributes_omitted"),
     ):
         if isinstance(parent.get(key), dict) and parent[key]:
-            if count_key:
-                out[count_key] = out.get(count_key, 0) + len(parent[key])
+            out[count_key] = out.get(count_key, 0) + len(parent[key])
             parent[key] = {}
 
 
@@ -582,7 +588,7 @@ _FIT_STAGES: tuple[tuple[str, Callable[[dict[str, Any]], None]], ...] = (
     ("variable attributes other than units", _shed_variable_attrs),
     (
         "variable shapes and dtypes",
-        lambda out: _shed_variable_fields(out, ("dims", "attrs")),
+        lambda out: _shed_variable_fields(out, ("dims", "attrs", "attrs_omitted")),
     ),
     ("variable details", lambda out: _shed_variable_fields(out, ())),
 )
@@ -590,16 +596,23 @@ _FIT_STAGES: tuple[tuple[str, Callable[[dict[str, Any]], None]], ...] = (
 
 def _fit_budget(out: dict[str, Any]) -> None:
     """Shed _FIT_STAGES from out, in order, until it serializes within
-    INFO_BUDGET_CHARS, naming the stages applied in its note."""
+    INFO_BUDGET_CHARS, naming in its note the stages that removed anything.
+    Sets budget_exceeded if every variable name alone does not fit."""
     base_note = out["note"]
     shed: list[str] = []
+    size = len(to_compact_json(out))
     for label, stage in _FIT_STAGES:
-        if len(to_compact_json(out)) <= INFO_BUDGET_CHARS:
+        if size <= INFO_BUDGET_CHARS:
             return
         stage(out)
-        shed.append(label)
-        out["note"] = (
-            f"{base_note} This record is large, so its {', '.join(shed)} are "
-            "also left out (see the *_omitted counts); every variable is "
-            'still listed. Pass detail="full" for them.'
-        )
+        smaller = len(to_compact_json(out))
+        if smaller < size:
+            shed.append(label)
+            out["note"] = (
+                f"{base_note} This record is large, so its {', '.join(shed)} "
+                "are also left out (see the *_omitted counts); every variable "
+                'is still listed. Pass detail="full" for them.'
+            )
+        size = len(to_compact_json(out))
+    if size > INFO_BUDGET_CHARS:
+        out["budget_exceeded"] = True
