@@ -308,6 +308,31 @@ The Auth0 tenant must allow client registration for Claude (Dynamic Client
 Registration, or a pre-registered application) and issue JWT access tokens
 for the configured audience. Header/bearer clients are unaffected either way.
 
+### Post-deploy smoke test
+
+`scripts/smoke_hosted.py` opens real gridded datasources over zarr through a
+deployed server (`load_datasource`, and a whole-grid `query_data`), which
+catches a broken data stack in the image that `tools/list` does not. There is
+no deploy pipeline (the hosted service is deployed by hand with the local
+`deploy_cloudrun*.sh` scripts), so run it manually after each deploy:
+
+```bash
+DATAMESH_TOKEN=<token> uv run python scripts/smoke_hosted.py https://mcp.oceanum.io/datamesh
+```
+
+The token must be valid for the gateway the server uses. `--load-datasource`,
+`--query-datasource` and `--query-variable` override the default datasets.
+The URL must be https unless the host is local, since the token is sent with
+every request. Exit status: `0` all checks passed; `1` a check failed, or the
+server was unreachable or rejected the token; `2` usage error
+(`DATAMESH_TOKEN` unset, or a non-https remote URL); `3` inconclusive (a
+datasource was not found, not shared or empty, the query was refused, or it
+was small enough to be downloaded instead of opened over zarr).
+
+The hosted image installs this package from the source checkout
+(`pip install .`), not from PyPI, so dependency fixes take effect on the next
+deploy from `main` without a release.
+
 ## Datamesh Tools
 
 The intended workflow is: `search_catalog` → `get_datasource_info` → `stage_query`
