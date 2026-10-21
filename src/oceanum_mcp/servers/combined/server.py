@@ -5,11 +5,13 @@ Mounts all domain servers under a single FastMCP instance.
 
 from fastmcp import FastMCP
 
+from oceanum_mcp import __version__
 from oceanum_mcp.servers.datamesh.server import mcp as datamesh
 from oceanum_mcp.servers.storage.server import mcp as storage
 
 mcp = FastMCP(
     "Oceanum",
+    version=__version__,
     instructions=(
         "Access the Oceanum platform for ocean/environmental data and cloud storage. "
         "Datamesh tools search, query, and manage datasets. "

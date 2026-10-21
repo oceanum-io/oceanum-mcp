@@ -21,7 +21,13 @@ dependencies = [
     "httpx2>=2.5,<3",
     # <2 pin guards the private Connector._stage_request/Session usage in the
     # datamesh server's staging helper (no public staging API in oceanum 1.x).
-    "oceanum>=1.1,<2",
+    # >=1.2.1: the first release to pin xarray<2026.9. Later xarray drops
+    # zarr 2 support (passes zarr_format= to zarr.open_group, which the
+    # zarr<3 oceanum requires rejects), so every gridded load failed on
+    # images that resolved oceanum<1.2.1 with xarray>=2026.9 (OCE-354).
+    "oceanum>=1.2.1,<2",
+    # zarr<3 via oceanum; xarray>=2026.9 always passes zarr_format= (OCE-354).
+    "xarray<2026.9",
     # oceanum requires zarr<3, and zarr 2.x breaks at runtime with
     # numcodecs>=0.16 (blosc.cbuffer_sizes removed); oceanum does not pin this.
     # Remove once oceanum pins numcodecs itself or moves to zarr>=3.
@@ -29,9 +35,14 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+# OS credential-store token lookup (DATAMESH_TOKEN_KEYRING), imported lazily.
+keyring = ["keyring>=25"]
 dev = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    # The keyring tests import it; declared so they never rely on it arriving
+    # transitively.
+    "keyring>=25",
 ]
 
 [project.scripts]
