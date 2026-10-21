@@ -235,7 +235,8 @@ Notes:
   Gateways with scoped download links (OCE-317) also limit its lifetime and
   number of fetches; the response then reports them as `expires_at` and
   `max_uses`.
-  Hosted exports are capped at 10 GB to bound what one link can pull.
+  Hosted exports are capped at 10 GB to bound what one link can pull, and
+  exports above 1 GB need `confirm_size_bytes` (see `export_query`).
 - A rejected Datamesh token (in `X-DATAMESH-TOKEN`, or a non-JWT
   `Authorization: Bearer`) gets a 401 saying the token was not accepted,
   without the OAuth `resource_metadata` challenge (which would send clients
@@ -392,15 +393,21 @@ complete record.
 Dry-run a query on the Datamesh gateway: reports the result size, container
 type, and domain length **without downloading any data**, echoes the canonical
 query, and recommends the next step (inline query vs export vs narrowing).
-Accepts the same query parameters as `query_data`.
+The inline recommendation counts records as well as bytes: a result with more
+records than `OCEANUM_MCP_MAX_INLINE_ROWS` would come back from `query_data` as
+a preview, so it is steered to resampling, aggregation or `export_query`
+instead. Accepts the same query parameters as `query_data`.
 
 ### `query_data`
 
 Query a datasource with filters and return small results inline as
 coordinate-attributed JSON records with explicit `truncated`/`lazy` flags.
 The query is staged first: gridded results above the inline limit are
-summarized lazily (structure only); tabular results above the limit are
-refused with the staged size and alternatives. Library warnings (e.g. the
+summarized lazily (structure only); tabular results above the limit, and any
+result above 1 GB, are refused with the staged size and alternatives (the
+1 GB refusal also lists each variable's dims). The exception is `limit`
+combined with `time_resolution` or `aggregate_operations`: the limited slice
+may be small, so it is still opened lazily. Library warnings (e.g. the
 2,000,000-row cap on tabular queries) are included in the response.
 
 | Parameter              | Type         | Description                                                        |
@@ -452,6 +459,19 @@ large to return inline. Behaviour depends on transport:
   size) are refused (narrow the query); above 2 GB the link is returned with
   a large-download warning.
 
+`export_query` sizes the result itself, whether or not `stage_query` was
+called, and refuses before anything is exported. Results above the export cap
+are refused outright: the cap limits the transfer, so splitting the request
+into parts is not a way round it. An export that writes more than 1 GB in the
+chosen format (CSV text is estimated at about 3x the staged size; locally, a
+dataset written as CSV/Parquet is sized as the flattened table, and a limited
+one on its limited slice) is refused unless `confirm_size_bytes` equals that
+size. On hosted servers a value within 5% is accepted, because the download
+stage is sized separately from `stage_query`'s stage. The refusal reports the
+exact value as `export_size_bytes`. The agent should pass it only after the
+user has agreed. The server cannot see whether the user was asked, so the check
+is advisory: it forces an explicit, size-aware step for each large export.
+
 Accepts the same query parameters as `query_data` plus:
 
 | Parameter   | Type   | Description                                                              |
@@ -459,6 +479,7 @@ Accepts the same query parameters as `query_data` plus:
 | `path`      | string | Destination file path (parent directories are created)                   |
 | `format`    | string | `netcdf` (datasets), `parquet` or `csv` (tabular); sensible default      |
 | `overwrite` | bool   | Overwrite an existing file (default false)                               |
+| `confirm_size_bytes` | int | Bytes (in the chosen format) the user agreed to export; required above 1 GB; exact match (within 5% on hosted) |
 
 ### `load_datasource`
 
