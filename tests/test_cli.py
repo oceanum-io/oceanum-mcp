@@ -1,9 +1,12 @@
 """Tests for the CLI dispatcher."""
 
 import json
+import os
 import subprocess
 import sys
 from pathlib import Path
+
+import pytest
 
 
 def test_cli_list():
@@ -38,6 +41,25 @@ def test_server_registry_keys():
     assert "datamesh" in SERVER_REGISTRY
     assert "storage" in SERVER_REGISTRY
     assert "combined" in SERVER_REGISTRY
+
+
+@pytest.mark.parametrize("server", ["combined", "datamesh", "storage"])
+async def test_server_info_reports_package_version(server):
+    """serverInfo.version is oceanum-mcp's, not FastMCP's (OCE-366), so a
+    deployment can be identified from the client."""
+    import importlib
+
+    from fastmcp import Client
+
+    from oceanum_mcp import __version__
+    from oceanum_mcp.cli import SERVER_REGISTRY
+
+    module = importlib.import_module(SERVER_REGISTRY[server])
+    async with Client(module.mcp) as client:
+        # Era-neutral: set by the legacy handshake and 2026-era discovery.
+        info = client.server_info
+    assert info.version == __version__
+    assert __version__ != "0+unknown"  # the test env has the package installed
 
 
 def test_cli_help_lists_transports():
@@ -102,7 +124,8 @@ _JSONRPC_SESSION = [
 
 
 def test_stdio_runs_without_banner(monkeypatch):
-    """The stdio branch of main() disables the FastMCP banner."""
+    """The stdio branch of main() disables the FastMCP banner and its INFO
+    logging (OCE-366)."""
     import importlib
     from unittest.mock import patch
 
@@ -111,11 +134,28 @@ def test_stdio_runs_without_banner(monkeypatch):
 
     module = importlib.import_module(cli.SERVER_REGISTRY["datamesh"])
     monkeypatch.setattr(sys, "argv", ["oceanum-mcp", "datamesh"])
+    monkeypatch.delenv("FASTMCP_LOG_LEVEL", raising=False)
     # main() records the transport globally; restore it afterwards.
     monkeypatch.setattr(config, "_transport", config._transport)
     with patch.object(module.mcp, "run") as run:
         cli.main()
-    run.assert_called_once_with(transport="stdio", show_banner=False)
+    run.assert_called_once_with(
+        transport="stdio", show_banner=False, log_level="WARNING"
+    )
+
+
+def test_stdio_respects_explicit_fastmcp_log_level(monkeypatch):
+    """A user-chosen FASTMCP_LOG_LEVEL (e.g. DEBUG) is not overridden."""
+    from unittest.mock import MagicMock
+
+    from oceanum_mcp import cli
+
+    monkeypatch.setenv("FASTMCP_LOG_LEVEL", "DEBUG")
+    server = MagicMock()
+    cli._run_stdio(server)
+    server.run.assert_called_once_with(
+        transport="stdio", show_banner=False, log_level=None
+    )
 
 
 def test_stdio_stdout_guard_routes_text_to_stderr(capsys):
@@ -148,12 +188,14 @@ def test_stdio_stdout_is_pure_jsonrpc(tmp_path):
 
     # stderr goes to a file, not an undrained pipe the server could block on.
     stderr_file = (tmp_path / "stderr.txt").open("w+")
+    env = {k: v for k, v in os.environ.items() if k != "FASTMCP_LOG_LEVEL"}
     proc = subprocess.Popen(
         [sys.executable, "-c", _STDIO_SERVER_SCRIPT],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=stderr_file,
         text=True,
+        env=env,
     )
     watchdog = threading.Timer(60, proc.kill)
     watchdog.start()
@@ -181,3 +223,5 @@ def test_stdio_stdout_is_pure_jsonrpc(tmp_path):
     assert call["result"]["content"][0]["text"] == "ok"
     assert "library noise" in stderr
     assert "gofastmcp.com" not in stderr  # banner
+    # FastMCP's INFO startup line, which VS Code shows as a warning (OCE-366).
+    assert "Starting MCP server" not in stderr

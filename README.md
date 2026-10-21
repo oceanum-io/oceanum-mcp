@@ -14,7 +14,9 @@ This package contains multiple MCP servers, selectable at runtime:
 
 ## Prerequisites
 
-Get an API token from [oceanum.io](https://oceanum.io). Set it as the `DATAMESH_TOKEN` environment variable.
+Get an API token from [oceanum.io](https://oceanum.io). Set it as the `DATAMESH_TOKEN` environment variable
+(or keep it out of the client config: see [Supplying the token without
+putting it in the client config](#supplying-the-token-without-putting-it-in-the-client-config)).
 
 ## Installation
 
@@ -107,15 +109,70 @@ Use stdio transport with the same command:
 }
 ```
 
+If the server reports that the token "looks like an unresolved client
+variable", your client passed a config variable such as
+`${input:datamesh-token}` through literally instead of substituting it.
+Restart the server from the client so it prompts for the input again, or use
+one of the options below.
+
+### Supplying the token without putting it in the client config
+
+For the stdio transport the server takes its token from the first of these
+that is set:
+
+1. `DATAMESH_TOKEN` — the token itself.
+2. `DATAMESH_TOKEN_FILE` — path to a file containing the token (`~` is
+   expanded). On macOS/Linux the file must be accessible only by you; the
+   server refuses it otherwise:
+
+   ```bash
+   install -m 600 /dev/null ~/.config/oceanum/token
+   echo "your-token-here" > ~/.config/oceanum/token
+   ```
+
+   ```json
+   "env": { "DATAMESH_TOKEN_FILE": "~/.config/oceanum/token" }
+   ```
+
+   The file is read on every call, so a replaced token takes effect without
+   restarting the server.
+3. `DATAMESH_TOKEN_KEYRING=1` — read the token from the OS credential store
+   (macOS Keychain, Secret Service/libsecret on Linux, Windows Credential
+   Manager) via the [`keyring`](https://pypi.org/project/keyring/) package,
+   under service `oceanum-mcp`, user `datamesh-token`. Store it once with:
+
+   ```bash
+   uvx keyring set oceanum-mcp datamesh-token
+   ```
+
+   The token is looked up once per server process, so restart the server
+   after changing it. `keyring` currently arrives as an indirect dependency
+   of `fastmcp`, which is not guaranteed to last: to be sure, install the
+   `oceanum-mcp[keyring]` extra (with uvx:
+   `uvx --python 3.13 --from "oceanum-mcp[keyring]" oceanum-mcp`).
+
+### Troubleshooting: `-32022` on the first `initialize`
+
+A client may log "connection is serving the 2026-07-28 protocol; the
+initialize handshake is not accepted" (error `-32022`) once on connect. This
+comes from the MCP Python SDK, not from this server's code: in SDK 2.3.0
+(`mcp/server/runner.py`, `serve_dual_era_loop`) a connection's first request
+fixes its protocol era. A client that opens with a 2026-07-28 request and
+then sends the older `initialize` handshake on the same connection is
+refused, with the supported versions in the error. Clients are expected to
+retry with a supported version; GitHub Copilot did so and connected.
+
 ## Environment Variables
 
 | Variable                      | Required | Description                                                                     |
 | ----------------------------- | -------- | ------------------------------------------------------------------------------- |
-| `DATAMESH_TOKEN`              | Yes      | Oceanum API token (shared by all servers)                                       |
+| `DATAMESH_TOKEN`              | Yes*     | Oceanum API token (shared by all servers)                                       |
+| `DATAMESH_TOKEN_FILE`         | Yes*     | Path to a file holding the token, readable only by its owner; used when `DATAMESH_TOKEN` is unset |
+| `DATAMESH_TOKEN_KEYRING`      | Yes*     | `1`/`true`/`yes`/`on` to read the token from the OS credential store (once per process); used when neither of the above is set |
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
-| `OCEANUM_MCP_READ_ONLY`       | No       | Set to `1`/`true` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`) |
+| `OCEANUM_MCP_READ_ONLY`       | No       | `1`/`true`/`yes`/`on` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`); any value other than these or `0`/`false`/`no`/`off` stops the server at startup |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_MAX_INLINE_ROWS` | No       | Max rows/records previewed inline before truncation (default 100)               |
 | `OCEANUM_MCP_EXPORT_DIR`      | No       | If set, `export_query` may only write inside this directory                     |
@@ -126,9 +183,10 @@ Use stdio transport with the same command:
 | `OCEANUM_MCP_PUBLIC_URL`      | No       | Externally visible base URL (e.g. `https://mcp.oceanum.io`); enables OAuth discovery metadata for claude.ai connectors |
 | `OCEANUM_MCP_CORS_ORIGINS`    | No       | Comma-separated browser origins allowed by CORS on http (default: `https://*.oceanum.io,https://*.oceanum.tech,https://vscode.dev`; empty string disables) |
 
-`DATAMESH_TOKEN` is required for the stdio transport (and for `--transport http`
-with `OCEANUM_MCP_AUTH=none`); in authenticated http mode each request carries
-its own credential and no server-side token is needed.
+\* One token source (`DATAMESH_TOKEN`, `DATAMESH_TOKEN_FILE` or
+`DATAMESH_TOKEN_KEYRING`) is required for the stdio transport (and for
+`--transport http` with `OCEANUM_MCP_AUTH=none`); in authenticated http mode
+each request carries its own credential and no server-side token is needed.
 
 ## Hosted mode (HTTP transport)
 
@@ -178,6 +236,17 @@ Notes:
   number of fetches; the response then reports them as `expires_at` and
   `max_uses`.
   Hosted exports are capped at 10 GB to bound what one link can pull.
+- A rejected Datamesh token (in `X-DATAMESH-TOKEN`, or a non-JWT
+  `Authorization: Bearer`) gets a 401 saying the token was not accepted,
+  without the OAuth `resource_metadata` challenge (which would send clients
+  such as VS Code into a sign-in flow that cannot fix a Datamesh token).
+  Requests with no credential, and failed JWT (OAuth) bearers, still get the
+  challenge, so OAuth discovery and re-authorization are unaffected. If the
+  token could not be verified because the Datamesh service was unreachable,
+  the response is a 503 asking to retry instead. A credential that is an
+  unsubstituted client variable (`${input:...}`) gets a 401 saying so
+  (except with `OCEANUM_MCP_AUTH=none`, where client credentials are
+  ignored).
 - Combine with `OCEANUM_MCP_READ_ONLY=1` to run a read-only public service.
 - Pass `--stateless` when running behind a load balancer or on autoscaled
   platforms (Cloud Run, etc.): sessions are otherwise held in instance
