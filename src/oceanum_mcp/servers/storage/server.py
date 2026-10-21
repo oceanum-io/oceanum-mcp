@@ -7,11 +7,13 @@ from __future__ import annotations
 
 from fastmcp import FastMCP
 
+from oceanum_mcp import __version__
 from oceanum_mcp.common.client import get_storage_filesystem
 from oceanum_mcp.common.config import is_read_only
 
 mcp = FastMCP(
     "Oceanum Storage",
+    version=__version__,
     instructions=(
         "Access the Oceanum cloud storage platform. "
         "Use list_files to browse, read_file/write_file for content, "

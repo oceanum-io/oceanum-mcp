@@ -66,6 +66,7 @@ from oceanum.datamesh.utils import (
     DATAMESH_STAGE_READ_TIMEOUT,
 )
 
+from oceanum_mcp import __version__
 from oceanum_mcp.common.client import get_datamesh_connector
 from oceanum_mcp.common.config import (
     DEFAULT_MAX_INLINE_ROWS,
@@ -183,6 +184,7 @@ _ACCESS_SCOPE = (
 # transport-specific string at import.
 mcp = FastMCP(
     "Oceanum Datamesh",
+    version=__version__,
     instructions=(
         "Access the Oceanum Datamesh platform for ocean and environmental data.\n"
         "Workflow: search_catalog to discover datasets -> get_datasource_info for "
@@ -203,6 +205,14 @@ mcp = FastMCP(
 
 _WARNINGS_LOCK = threading.Lock()
 
+# pandas' frequency-alias deprecation, e.g. "'d' is deprecated and will be
+# removed in a future version, please use 'D' instead." (the Timedelta
+# variant ends ". Please use 'D' instead of 'd'.").
+_PANDAS_ALIAS_DEPRECATION = re.compile(
+    r"'[^']+' is deprecated and will be removed in a future version[.,] "
+    r"[Pp]lease use '[^']+' instead"
+)
+
 
 @contextmanager
 def _captured_warnings(collected: list[str]) -> Iterator[None]:
@@ -212,12 +222,25 @@ def _captured_warnings(collected: list[str]) -> Iterator[None]:
     via warnings.warn, which would otherwise be lost to stderr.
     catch_warnings mutates process-global state and FastMCP runs sync tools
     in worker threads, so captures are serialized with a lock.
+
+    Being process-global, a capture also records warnings other threads
+    raise meanwhile. pandas' alias deprecations are dropped: their known source
+    here is a concurrent call's time_resolution parsing, which runs
+    unquieted while this capture holds the lock (_quiet_pandas_aliases), and
+    one surfaced in a query_data result (OCE-366).
     """
     with _WARNINGS_LOCK:
         with _warnings.catch_warnings(record=True) as caught:
             _warnings.simplefilter("always")
             yield
-        collected.extend(str(w.message) for w in caught)
+        collected.extend(
+            str(w.message)
+            for w in caught
+            if not (
+                issubclass(w.category, (DeprecationWarning, FutureWarning))
+                and _PANDAS_ALIAS_DEPRECATION.search(str(w.message))
+            )
+        )
 
 
 class GatewayTimeout(DatameshConnectError):
