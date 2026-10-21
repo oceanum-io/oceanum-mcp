@@ -118,12 +118,12 @@ class TestGetDatasourceInfoNotFound:
             assert token in kwargs["search"]
 
     def test_suggestions_capped(self, mock_conn):
-        mock_conn.get_datasource.side_effect = _not_found("wave")
+        mock_conn.get_datasource.side_effect = _not_found("wave_glob")
         mock_conn.get_catalog.return_value = _catalog(
-            *(_summary(f"wave_{i}", f"Wave {i}") for i in range(12))
+            *(_summary(f"wave_glob_{i}", f"Wave {i}") for i in range(12))
         )
 
-        parsed = json.loads(server.get_datasource_info("wave"))
+        parsed = json.loads(server.get_datasource_info("wave_glob"))
 
         assert len(parsed["suggestions"]) == server.MAX_SUGGESTIONS
 
@@ -167,6 +167,117 @@ class TestGetDatasourceInfoNotFound:
         assert parsed["error"] == "Datamesh server error: 502 Bad Gateway"
         assert "suggestions" not in parsed
         mock_conn.get_catalog.assert_not_called()
+
+
+# Live catalog ids the OR-ed word search for an oceanum_wave_* id returns
+# (OCE-356): most share the generic words, none is the requested datasource.
+WAVE_IDS = (
+    ("oceanum_wave_auckl_era5_spec", "Oceanum Auckland ERA5 wave hindcast spectra"),
+    ("oceanum_wave_auckl_era5_grid", "Oceanum Auckland ERA5 wave hindcast parameters"),
+    ("oceanum_wave_gfs_akl1km_spec", "Oceanum Auckland 1km GFS wave forecast spectra"),
+    ("oceanum_wave_gfs_eakl_grid", "Oceanum Eastern Auckland GFS wave forecast"),
+    ("oceanum_wave_ec_eakl_spec", "Oceanum Eastern Auckland ECMWF wave forecast"),
+    ("oceanum_wave_cnz_era5_grid", "Oceanum Central New Zealand ERA5 wave hindcast"),
+    ("oceanum_wave_nga_era5_grid", "Oceanum Northland ERA5 wave hindcast"),
+    ("oceanum_wave_waika_era5_grid", "Oceanum Waikato ERA5 wave hindcast parameters"),
+    ("oceanum_wave_nzpar_era5_spec", "Oceanum New Zealand 5km ERA5 wave spectra"),
+    ("oceanum_wave_nzpar_era5_grid", "Oceanum New Zealand 5km ERA5 wave parameters"),
+    ("oceanum_wave_glob05_era5_v1_grid", "Oceanum global ERA5 wave hindcast"),
+    ("oceanum_wave_nz", "Oceanum NZ wave"),
+    ("oceanum_wave_pac", "Oceanum Pacific wave"),
+)
+
+
+def _suggested(mock_conn, wanted: str, pool) -> list[str]:
+    mock_conn.get_datasource.side_effect = _not_found(wanted)
+    mock_conn.get_catalog.return_value = _catalog(*(_summary(*e) for e in pool))
+    parsed = json.loads(server.get_datasource_info(wanted))
+    return [s["id"] for s in parsed["suggestions"]]
+
+
+class TestDatasourceSuggestionThreshold:
+    """OCE-356: only near misses are suggested, never an unrelated id, and
+    the answer does not depend on which other ids the catalog search
+    returned (it varies with credentials and catalog ranking)."""
+
+    def test_near_miss_suggests_the_id(self, mock_conn):
+        ids = _suggested(mock_conn, "oceanum_wave_nzpar_era5_grd", WAVE_IDS)
+        assert ids == ["oceanum_wave_nzpar_era5_grid"]
+
+    @pytest.mark.parametrize(
+        "wanted",
+        [
+            "oceanum_wave_fake_v9",
+            "oceanum_wave_fake_v1",
+            "oceanum_wave_fake_era5_grid",
+            "oceanum_wave_ec_fake_spec",
+        ],
+    )
+    def test_far_miss_suggests_nothing(self, mock_conn, wanted):
+        mock_conn.get_datasource.side_effect = _not_found(wanted)
+        mock_conn.get_catalog.return_value = _catalog(*(_summary(*e) for e in WAVE_IDS))
+
+        parsed = json.loads(server.get_datasource_info(wanted))
+
+        assert parsed["suggestions"] == []
+        assert "no similar ids found" in parsed["error"]
+
+    @pytest.mark.parametrize("start", range(0, len(WAVE_IDS), 3))
+    def test_answer_independent_of_the_rest_of_the_pool(self, mock_conn, start):
+        # Any window of the pool that contains the near miss, in any order.
+        target = ("oceanum_wave_nzpar_era5_grid", "Oceanum NZ 5km ERA5 wave")
+        pool = list(WAVE_IDS[start : start + 4]) + [target]
+        for p in (pool, pool[::-1]):
+            assert _suggested(mock_conn, "oceanum_wave_nzpar_era5_grd", p) == [
+                target[0]
+            ]
+            assert _suggested(mock_conn, "oceanum_wave_fake_v9", p) == []
+
+    @pytest.mark.parametrize(
+        ("wanted", "expected"),
+        [
+            ("oceanum_wave_nzpra_era5_grid", "oceanum_wave_nzpar_era5_grid"),  # swap
+            ("oceanum_wave_nzpar_era5_gri", "oceanum_wave_nzpar_era5_grid"),  # drop
+            ("oceanum_wave_auckl_era5_spek", "oceanum_wave_auckl_era5_spec"),  # sub
+            ("ocenaum_wave_auckl_era5_grid", "oceanum_wave_auckl_era5_grid"),
+        ],
+    )
+    def test_typos_suggest_the_id_first(self, mock_conn, wanted, expected):
+        assert _suggested(mock_conn, wanted, WAVE_IDS)[0] == expected
+
+    @pytest.mark.parametrize("wanted", ["era5", "wave", "glob05"])
+    def test_generic_words_suggest_nothing(self, mock_conn, wanted):
+        # Every id below contains them; none is what was asked for.
+        assert _suggested(mock_conn, wanted, WAVE_IDS) == []
+
+    def test_id_extending_the_request_is_suggested(self, mock_conn):
+        ids = _suggested(mock_conn, "oceanum_wave_nzpar", WAVE_IDS)
+        assert set(ids) == {
+            "oceanum_wave_nzpar_era5_spec",
+            "oceanum_wave_nzpar_era5_grid",
+        }
+
+    @pytest.mark.parametrize(
+        "wanted",
+        [
+            "Oceanum New Zealand 5km ERA5 wave parameters",
+            "Oceanum New Zealand 5km ERA5 wave paramters",
+        ],
+    )
+    def test_display_name_or_near_miss_of_one_suggests_its_id(self, mock_conn, wanted):
+        ids = _suggested(mock_conn, wanted, WAVE_IDS)
+        assert ids[0] == "oceanum_wave_nzpar_era5_grid"
+        assert "oceanum_wave_waika_era5_grid" not in ids
+
+    def test_far_miss_of_a_name_suggests_nothing(self, mock_conn):
+        assert (
+            _suggested(mock_conn, "Oceanum Fake ERA5 wave parameters", WAVE_IDS) == []
+        )
+
+    def test_edit_distance_counts_adjacent_swap_as_one(self):
+        assert server._edit_distance("nzpar", "nzpra") == 1
+        assert server._edit_distance("grd", "grid") == 1
+        assert server._edit_distance("fake_v9", "auckl_era5_spec") > 3
 
 
 class TestQueryToolsUnknownDatasource:
