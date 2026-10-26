@@ -6,7 +6,6 @@ up at runtime (OCE-354: xarray>=2026.9 with oceanum's zarr<3). Opening a zarr
 store here fails CI on the same resolution instead.
 """
 
-import asyncio
 import importlib.util
 import json
 from datetime import date
@@ -17,9 +16,6 @@ import numpy as np
 import pytest
 import xarray as xr
 from fastmcp.exceptions import MCPError
-
-from oceanum_mcp.common.config import DEFAULT_MAX_INLINE_BYTES
-from oceanum_mcp.servers.datamesh.server import LARGE_EXPORT_BYTES
 
 SMOKE_SCRIPT = Path(__file__).parent.parent / "scripts" / "smoke_hosted.py"
 
@@ -103,6 +99,7 @@ def test_smoke_not_lazy_wording_is_per_tool(smoke):
 
     assert "not opened lazily" in load
     assert "did not reach the zarr path" in query
+    assert "range may be too small" in query
 
 
 class _StubClient:
@@ -156,8 +153,8 @@ async def test_smoke_run_exit_codes(
             load_datasource="grid_a",
             query_datasource="grid_b",
             query_variable="hs",
-            query_start="2020-01-01",
-            query_end="2020-03-31",
+            query_start=date(2020, 1, 1),
+            query_end=date(2020, 3, 31),
         )
     )
 
@@ -167,9 +164,29 @@ async def test_smoke_run_exit_codes(
     assert len(lines) == (1 if connect_error else len(checks))
 
 
-# hs on oceanum_wave_auckl_era5_grid staged at 1_743_896_420 bytes for all of
-# 2020 (366 days) via hosted stage_query on 2026-10-27; Q1 staged at 430_153_220.
+# Calibration from a live hosted stage_query on 2026-10-26: hs on
+# oceanum_wave_auckl_era5_grid staged at 1_743_896_420 bytes for all of 2020
+# (366 days) and 430_153_220 for 2020-01-01..2020-03-31. This only pins the
+# default against the server's thresholds; the live smoke run is the real check.
 AUCKL_HS_BYTES_PER_DAY = 1_743_896_420 / 366
+
+
+def test_smoke_default_query_fits_lazy_window(smoke):
+    # Imported here so a broken server import does not mask the data-stack
+    # guards above.
+    from oceanum_mcp.common.config import DEFAULT_MAX_INLINE_BYTES
+    from oceanum_mcp.servers.datamesh.server import LARGE_EXPORT_BYTES
+
+    start = date.fromisoformat(smoke.DEFAULT_QUERY_START)
+    end = date.fromisoformat(smoke.DEFAULT_QUERY_END)
+    # Counts time_end's whole day, though the server stages up to its midnight,
+    # so this overestimates by a day (~1%); the window has ~2x headroom.
+    size = ((end - start).days + 1) * AUCKL_HS_BYTES_PER_DAY
+
+    # Below the inline limit query_data downloads the result whole (passes on a
+    # broken image); above LARGE_EXPORT_BYTES it refuses it (OCE-355), as it
+    # did the old full-year default.
+    assert DEFAULT_MAX_INLINE_BYTES < size <= LARGE_EXPORT_BYTES
 
 
 def _sent_checks(smoke, monkeypatch, argv):
@@ -181,49 +198,20 @@ def _sent_checks(smoke, monkeypatch, argv):
         sent.extend(checks)
         return 0
 
-    with monkeypatch.context() as patch:
-        patch.setattr(smoke, "run", fake_run)
-        assert smoke.main(argv) == 0
+    monkeypatch.setattr(smoke, "run", fake_run)
+    assert smoke.main(argv) == 0
     return dict(sent)
 
 
-def _query_reply(query):
-    """query_data's reply for the default grid's estimated staged size:
-    downloaded inline, opened lazily over zarr, or refused. Approximate: it
-    counts time_end's whole day, which the server stages only from midnight,
-    so it runs ~1% high (Q1 estimates 433 MB against 430 MB staged)."""
-    start = date.fromisoformat(query["time_start"])
-    end = date.fromisoformat(query["time_end"])
-    size = ((end - start).days + 1) * AUCKL_HS_BYTES_PER_DAY
-    if size > LARGE_EXPORT_BYTES:
-        return (False, REFUSED)
-    if size > DEFAULT_MAX_INLINE_BYTES:
-        return (False, LAZY)
-    return (False, INLINE)
+def test_smoke_default_query_range(smoke, monkeypatch):
+    query = _sent_checks(smoke, monkeypatch, [])["query_data"]
 
-
-def test_smoke_default_query_fits_lazy_window(smoke, monkeypatch, capsys):
-    # A full year of this grid is above LARGE_EXPORT_BYTES, so query_data
-    # refused the old default and the check could never pass on a healthy
-    # server. The default range must open lazily instead.
-    checks = _sent_checks(smoke, monkeypatch, [])
-    query = checks["query_data"]
     assert query["datasource_id"] == "oceanum_wave_auckl_era5_grid"
     assert query["variables"] == ["hs"]
-    replies = [(False, LAZY), _query_reply(query)]
-    monkeypatch.setattr(smoke, "Client", _StubClient(replies))
-
-    run = smoke.run("http://test/datamesh", "tok", list(checks.items()))
-
-    assert asyncio.run(run) == 0
-    assert "PASS query_data" in capsys.readouterr().out
-
-
-def test_smoke_full_year_query_is_refused():
-    # The pre-fix default: the size model reproduces the refusal.
-    query = {"time_start": "2020-01-01", "time_end": "2020-12-31"}
-
-    assert _query_reply(query) == (False, REFUSED)
+    assert (query["time_start"], query["time_end"]) == (
+        smoke.DEFAULT_QUERY_START,
+        smoke.DEFAULT_QUERY_END,
+    )
 
 
 def test_smoke_query_range_overrides(smoke, monkeypatch):
@@ -232,6 +220,31 @@ def test_smoke_query_range_overrides(smoke, monkeypatch):
     query = _sent_checks(smoke, monkeypatch, argv)["query_data"]
 
     assert (query["time_start"], query["time_end"]) == ("2021-06-01", "2021-06-30")
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["--query-start", "2020-13-01"],
+        ["--query-end", "not-a-date"],
+    ],
+)
+def test_smoke_query_range_rejects_bad_dates(smoke, monkeypatch, argv):
+    monkeypatch.setenv("DATAMESH_TOKEN", "tok")
+
+    with pytest.raises(SystemExit) as exc:
+        smoke.main(argv)
+
+    assert exc.value.code == 2
+
+
+def test_smoke_query_range_rejects_reversed(smoke, monkeypatch, capsys):
+    monkeypatch.setenv("DATAMESH_TOKEN", "tok")
+    monkeypatch.setattr(smoke, "run", None)  # never reached
+    argv = ["--query-start", "2020-03-31", "--query-end", "2020-01-01"]
+
+    assert smoke.main(argv) == 2
+    assert "is after --query-end" in capsys.readouterr().err
 
 
 def test_smoke_main_requires_token(smoke, monkeypatch):

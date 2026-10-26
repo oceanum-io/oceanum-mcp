@@ -18,7 +18,8 @@ to override them.
 Exit status:
     0  every check passed
     1  a check failed, or the server could not be reached or rejected the token
-    2  usage error (e.g. DATAMESH_TOKEN unset, or a non-https remote URL)
+    2  usage error (e.g. DATAMESH_TOKEN unset, a non-https remote URL, or a
+       query range that is not two ISO dates in order)
     3  inconclusive: no failure, but a check could not exercise the zarr path
        (datasource not found, not shared or empty, the query was refused, or
        the result was not opened lazily)
@@ -29,6 +30,7 @@ import asyncio
 import json
 import os
 import sys
+from datetime import date
 from typing import Any
 from urllib.parse import urlparse
 
@@ -43,8 +45,8 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 
 # query_data opens a dataset lazily over zarr only when its staged size is
-# above the server's 50 MB inline limit (smaller results are downloaded whole)
-# and at most 1 GB (LARGE_EXPORT_BYTES; larger ones are refused, OCE-355).
+# above the server's inline limit (default 50 MB, OCEANUM_MCP_MAX_INLINE_BYTES;
+# smaller results are downloaded whole) and at most 1 GB (LARGE_EXPORT_BYTES; larger ones are refused, OCE-355).
 # Q1 2020 of the default grid stages at about 0.43 GB; the whole of 2020 is
 # about 1.7 GB and is refused. Keep an overridden range inside that window.
 DEFAULT_QUERY_START = "2020-01-01"
@@ -57,7 +59,10 @@ _CLIENT_ERRORS = (MCPError, RuntimeError, OSError, httpx2.HTTPError)
 # What each check proves when its dataset comes back opened lazily (over zarr).
 _NOT_LAZY = {
     "load_datasource": "datasource was not opened lazily over zarr",
-    "query_data": "query did not reach the zarr path (result was downloaded)",
+    "query_data": (
+        "query did not reach the zarr path (result was downloaded; the range "
+        "may be too small to stage above the server's inline limit)"
+    ),
 }
 
 
@@ -74,11 +79,20 @@ def build_checks(args: argparse.Namespace) -> list[tuple[str, dict[str, Any]]]:
             {
                 "datasource_id": args.query_datasource,
                 "variables": [args.query_variable],
-                "time_start": args.query_start,
-                "time_end": args.query_end,
+                "time_start": args.query_start.isoformat(),
+                "time_end": args.query_end.isoformat(),
             },
         ),
     ]
+
+
+def _iso_date(text: str) -> date:
+    try:
+        return date.fromisoformat(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"not an ISO date (YYYY-MM-DD): {text!r}"
+        ) from None
 
 
 def _unavailable(error: str, datasource_id: str) -> bool:
@@ -174,16 +188,24 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--query-start",
         default=DEFAULT_QUERY_START,
+        type=_iso_date,
         help="query_data time_start (default: %(default)s)",
     )
     parser.add_argument(
         "--query-end",
         default=DEFAULT_QUERY_END,
+        type=_iso_date,
         help="query_data time_end; the range must stage above the server's "
-        "inline limit (50 MB by default) and at most 1 GB to be opened over "
+        "inline limit (default 50 MB) and at most 1 GB to be opened over "
         "zarr (default: %(default)s)",
     )
     args = parser.parse_args(argv)
+    if args.query_start > args.query_end:
+        print(
+            f"--query-start {args.query_start} is after --query-end {args.query_end}.",
+            file=sys.stderr,
+        )
+        return 2
     parsed = urlparse(args.url)
     if parsed.scheme != "https" and parsed.hostname not in LOCAL_HOSTS:
         print(
