@@ -11,7 +11,8 @@ every deploy_cloudrun*.sh:
 URL defaults to https://mcp.oceanum.io/datamesh; pass the service's run.app
 URL + /datamesh for dev. It must be https unless the host is local. The token
 is sent as X-DATAMESH-TOKEN and must be a token for the gateway the server is
-deployed against. Datasources default to the OCE-354 repro calls; see --help
+deployed against. Datasources default to the OCE-354 repro calls, with the
+query_data range narrowed to Q1 2020 to fit under the 1 GB refusal; see --help
 to override them.
 
 Exit status:
@@ -41,6 +42,14 @@ LOCAL_HOSTS = {"localhost", "127.0.0.1", "::1"}
 
 PASS, FAIL, INCONCLUSIVE = "PASS", "FAIL", "INCONCLUSIVE"
 
+# query_data opens a dataset lazily over zarr only when its staged size is
+# above the server's 50 MB inline limit (smaller results are downloaded whole)
+# and at most 1 GB (LARGE_EXPORT_BYTES; larger ones are refused, OCE-355).
+# Q1 2020 of the default grid stages at about 0.43 GB; the whole of 2020 is
+# about 1.7 GB and is refused. Keep an overridden range inside that window.
+DEFAULT_QUERY_START = "2020-01-01"
+DEFAULT_QUERY_END = "2020-03-31"
+
 # Errors the client raises for an unreachable server, a rejected token, a
 # failed MCP handshake, or a call that times out.
 _CLIENT_ERRORS = (MCPError, RuntimeError, OSError, httpx2.HTTPError)
@@ -55,8 +64,9 @@ _NOT_LAZY = {
 def build_checks(args: argparse.Namespace) -> list[tuple[str, dict[str, Any]]]:
     """The tool calls to make. Both must open their dataset lazily over zarr:
     query_data only does so when the staged result is above the server's
-    inline limit (a full year of a regional grid is), otherwise it downloads
-    the result whole and would pass even on a broken image."""
+    inline limit and below its 1 GB refusal (see DEFAULT_QUERY_START);
+    otherwise it downloads the result whole, which would pass even on a broken
+    image, or refuses it."""
     return [
         ("load_datasource", {"datasource_id": args.load_datasource}),
         (
@@ -64,8 +74,8 @@ def build_checks(args: argparse.Namespace) -> list[tuple[str, dict[str, Any]]]:
             {
                 "datasource_id": args.query_datasource,
                 "variables": [args.query_variable],
-                "time_start": "2020-01-01",
-                "time_end": "2020-12-31",
+                "time_start": args.query_start,
+                "time_end": args.query_end,
             },
         ),
     ]
@@ -154,12 +164,23 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--query-datasource",
         default="oceanum_wave_auckl_era5_grid",
-        help="gridded datasource for query_data over 2020 (default: %(default)s)",
+        help="gridded datasource for query_data (default: %(default)s)",
     )
     parser.add_argument(
         "--query-variable",
         default="hs",
         help="variable for query_data (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--query-start",
+        default=DEFAULT_QUERY_START,
+        help="query_data time_start (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--query-end",
+        default=DEFAULT_QUERY_END,
+        help="query_data time_end; the range must stage between 50 MB and "
+        "1 GB to be opened over zarr (default: %(default)s)",
     )
     args = parser.parse_args(argv)
     parsed = urlparse(args.url)

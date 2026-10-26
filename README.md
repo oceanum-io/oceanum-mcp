@@ -312,17 +312,21 @@ for the configured audience. Header/bearer clients are unaffected either way.
 ### Post-deploy smoke test
 
 `scripts/smoke_hosted.py` opens real gridded datasources over zarr through a
-deployed server (`load_datasource`, and a whole-grid `query_data`), which
-catches a broken data stack in the image that `tools/list` does not. There is
-no deploy pipeline (the hosted service is deployed by hand with the local
-`deploy_cloudrun*.sh` scripts), so run it manually after each deploy:
+deployed server (`load_datasource`, and a whole-grid `query_data` over Q1
+2020), which catches a broken data stack in the image that `tools/list` does
+not. There is no deploy pipeline (the hosted service is deployed by hand with
+the local `deploy_cloudrun*.sh` scripts), so run it manually after each
+deploy:
 
 ```bash
 DATAMESH_TOKEN=<token> uv run python scripts/smoke_hosted.py https://mcp.oceanum.io/datamesh
 ```
 
 The token must be valid for the gateway the server uses. `--load-datasource`,
-`--query-datasource` and `--query-variable` override the default datasets.
+`--query-datasource` and `--query-variable` override the default datasets, and
+`--query-start`/`--query-end` the query range. `query_data` only opens a result
+over zarr when it stages between the 50 MB inline limit and 1 GB (above that
+it is refused), so an overridden range must stay inside that window.
 The URL must be https unless the host is local, since the token is sent with
 every request. Exit status: `0` all checks passed; `1` a check failed, or the
 server was unreachable or rejected the token; `2` usage error
