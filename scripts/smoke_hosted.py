@@ -179,8 +179,9 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--query-end",
         default=DEFAULT_QUERY_END,
-        help="query_data time_end; the range must stage between 50 MB and "
-        "1 GB to be opened over zarr (default: %(default)s)",
+        help="query_data time_end; the range must stage above the server's "
+        "inline limit (50 MB by default) and at most 1 GB to be opened over "
+        "zarr (default: %(default)s)",
     )
     args = parser.parse_args(argv)
     parsed = urlparse(args.url)

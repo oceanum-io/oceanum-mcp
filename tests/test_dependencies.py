@@ -189,7 +189,9 @@ def _sent_checks(smoke, monkeypatch, argv):
 
 def _query_reply(query):
     """query_data's reply for the default grid's estimated staged size:
-    downloaded inline, opened lazily over zarr, or refused."""
+    downloaded inline, opened lazily over zarr, or refused. Approximate: it
+    counts time_end's whole day, which the server stages only from midnight,
+    so it runs ~1% high (Q1 estimates 433 MB against 430 MB staged)."""
     start = date.fromisoformat(query["time_start"])
     end = date.fromisoformat(query["time_end"])
     size = ((end - start).days + 1) * AUCKL_HS_BYTES_PER_DAY
