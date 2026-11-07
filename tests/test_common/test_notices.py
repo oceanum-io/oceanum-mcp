@@ -210,7 +210,7 @@ class TestAuthHeaders:
 class TestFetch:
     def test_returns_notice_fields(self, admin):
         fake = admin()
-        assert notices.fetch_active_notices("era5", TOKEN) == ([_ok()], False)
+        assert notices.fetch_active_notices("era5", TOKEN) == ([_ok()], False, False)
         (request,) = fake.requests
         assert request.url.path == "/notices/active"
         assert dict(request.url.params) == {"datasource": "era5"}
@@ -237,7 +237,7 @@ class TestFetch:
 
     def test_404_means_no_notices(self, admin):
         admin(handler=lambda r: httpx2.Response(404, json={"detail": "No notices"}))
-        assert notices.fetch_active_notices("era5", TOKEN) == ([], True)
+        assert notices.fetch_active_notices("era5", TOKEN) == ([], True, False)
 
     @pytest.mark.parametrize("status", [401, 422, 500, 502, 504])
     def test_error_status_raises(self, admin, status: int):
@@ -371,7 +371,9 @@ class TestCache:
         fake = admin(handler=lambda r: httpx2.Response(502))
         assert isinstance(_lookup(), notices.NoticesError)
         assert info() == {}
-        assert _lookup() == []  # held off: no notices, no request
+        held = _lookup()  # held off: an error, not "no notices"; no request
+        assert isinstance(held, notices.NoticesError)
+        assert held.retry_after == notices.FAILURE_TTL_S
         assert len(fake.requests) == 1
         clock[0] += notices.FAILURE_TTL_S + 1
         fake._handler = None
@@ -885,3 +887,161 @@ def test_publish_times_parsed(stamp: str):
     parsed = notices._parse_time(stamp)
     assert parsed is not None
     assert parsed.utcoffset() is not None
+
+
+class TestServiceHoldOff:
+    """A failure of the admin service itself holds off requests to it for
+    every datasource."""
+
+    def test_hung_service_costs_one_timeout(self, admin, info, monkeypatch):
+        monkeypatch.setattr(notices, "DEADLINE_S", 1.0)
+
+        def hung(request: httpx2.Request) -> httpx2.Response:
+            time.sleep(0.2)  # the client's read timeout, shortened
+            raise httpx2.ReadTimeout("timed out", request=request)
+
+        fake = admin(handler=hung)
+        start = time.perf_counter()
+        for i in range(10):
+            assert info(f"ds{i}") == {}
+        assert time.perf_counter() - start < 0.5
+        assert len(fake.requests) == 1
+        held = _lookup("ds-other")
+        assert isinstance(held, notices.NoticesError)
+        assert held.retry_after == notices.FAILURE_TTL_S
+        assert len(fake.requests) == 1
+
+    @pytest.mark.parametrize(
+        "failure",
+        [
+            lambda r: httpx2.Response(500),
+            lambda r: httpx2.Response(502),
+            lambda r: httpx2.Response(429),
+            lambda r: (_ for _ in ()).throw(httpx2.ConnectError("refused")),
+            lambda r: (_ for _ in ()).throw(httpx2.ReadTimeout("slow")),
+        ],
+        ids=["500", "502", "429", "unreachable", "timeout"],
+    )
+    def test_service_failures_trip_it(self, admin, failure):
+        fake = admin(handler=failure)
+        _lookup("a")
+        assert isinstance(_lookup("b"), notices.NoticesError)
+        assert len(fake.requests) == 1
+
+    @pytest.mark.parametrize("status", [401, 403, 404, 422])
+    def test_per_request_answers_do_not_trip_it(self, admin, status: int):
+        fake = admin(handler=lambda r: httpx2.Response(status))
+        _lookup("a")
+        _lookup("b")
+        assert len(fake.requests) == 2
+
+    def test_good_answers_still_used_while_held_off(self, admin, info):
+        fake = admin()
+        assert _lookup("a") == [_ok()]
+        fake._handler = lambda r: httpx2.Response(503)
+        _lookup("b")
+        assert _lookup("a") == [_ok()]
+        assert info("a")["notices"]
+        assert len(fake.requests) == 2
+
+    def test_retry_after_and_success_clear(self, admin, clock):
+        fake = admin(
+            handler=lambda r: httpx2.Response(503, headers={"Retry-After": "120"})
+        )
+        _lookup("a")
+        clock[0] += notices.FAILURE_TTL_S + 1
+        assert isinstance(_lookup("b"), notices.NoticesError)
+        assert len(fake.requests) == 1
+        clock[0] += 60
+        fake._handler = None
+        assert _lookup("b") == [_ok()]
+        assert notices._service.remaining("https://admin.oceanum.io") == 0
+        assert len(fake.requests) == 2
+
+    def test_local_timeout_does_not_trip_it(self, admin):
+        def no_connection(request: httpx2.Request) -> httpx2.Response:
+            raise httpx2.PoolTimeout("no connection free")
+
+        fake = admin(handler=no_connection)
+        _lookup("a")
+        _lookup("b")
+        assert len(fake.requests) == 2
+
+    def test_no_admin_service_said_directly(self, admin, monkeypatch):
+        fake = admin()
+        monkeypatch.setenv("DATAMESH_SERVICE", "http://localhost:8000")
+        error = _lookup()
+        assert "OCEANUM_ADMIN_SERVICE" in str(error)
+        assert notices._cache.read(notices._cache_key("era5", TOKEN)) is None
+        assert fake.requests == []
+
+
+class TestSeverityOrder:
+    def test_older_outage_survives_newer_info_notices(self, admin, info):
+        newer = [_notice(i + 1, severity="info") for i in range(25)]
+        outage = _notice(0, severity="outage", title="Old outage")
+        admin(items=[*newer, outage])
+        found = _lookup()
+        assert len(found) == notices.MAX_NOTICES
+        assert found[0]["title"] == "Old outage"
+        fields = info()
+        assert [n["title"] for n in fields["notices"]] == ["Old outage"]
+        assert fields["notices_hint"].startswith("at least 19 more")
+
+    def test_most_severe_then_newest(self, admin):
+        admin(
+            items=[
+                _notice(1, severity="info"),
+                _notice(2, severity="action_required"),
+                _notice(3, severity="outage"),
+                _notice(4, severity="change"),
+                _notice(5, severity="action_required"),
+            ]
+        )
+        assert [n["title"] for n in _lookup()] == [
+            "Notice 3",
+            "Notice 5",
+            "Notice 2",
+            "Notice 4",
+            "Notice 1",
+        ]
+
+    def test_hint_exact_when_not_capped(self, admin, info):
+        admin(items=[_notice(1, severity="outage"), _notice(2, severity="info")])
+        assert info()["notices_hint"].startswith("1 more")
+
+
+class TestJoinedCallerDeadline:
+    def test_joining_caller_waits_its_own_deadline(self, monkeypatch):
+        """A caller that joins a fetch late waits until its own deadline,
+        not just what the first caller had left."""
+        monkeypatch.setattr(notices, "DEADLINE_S", 0.6)
+        calls = []
+
+        def slow_fetch(datasource_id, credential, deadline):
+            calls.append(datasource_id)
+            time.sleep(0.75)  # past the first caller's deadline
+            return notices.Answer([_ok()])
+
+        monkeypatch.setattr(notices, "_notices_for", slow_fetch)
+        with ThreadPoolExecutor(max_workers=2) as callers:
+            first = callers.submit(_lookup)
+            time.sleep(0.3)  # the first caller has 0.3 s left; the join 0.6 s
+            second = callers.submit(_lookup)
+            assert isinstance(first.result(), notices.NoticesError)
+            assert second.result() == [_ok()]
+        assert calls == ["era5"]
+
+
+class TestLinkText:
+    def test_nested_brackets_in_link_text(self, admin, info):
+        body = "Read [the [v2] guide](https://evil.example) and ![a [b]](i.png)."
+        admin(items=[{**NOTICE, "body": body}])
+        assert info()["notices"][0]["body"] == "Read the [v2] guide and a [b]."
+
+    def test_pathological_text_is_quick(self):
+        text = "[" * 5000 + "a](" * 2000 + "]" * 3000
+        start = time.perf_counter()
+        notices._without_links(text)
+        notices._without_links("[a [b " * 3000)
+        assert time.perf_counter() - start < 0.5

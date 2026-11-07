@@ -75,9 +75,11 @@ def _isolate_notices(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
     notices._cache.clear()
     notices._warned.clear()
     notices._inflight.clear()
+    notices._service.clear()
     yield
     # A lookup a test stopped waiting for must not fill the next test's cache.
     executor.shutdown(wait=True)
     notices._cache.clear()
     notices._warned.clear()
+    notices._service.clear()
     client.close()

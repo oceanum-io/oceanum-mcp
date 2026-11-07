@@ -411,11 +411,13 @@ suggested.
 
 Active notices about the datasource (see `get_datasource_notices`) come
 first in both views: `notices` lists the `outage` and `action_required` ones
-(e.g. a deprecation), newest first, at most 5, as `severity`, `title`, `body`
+(e.g. a deprecation), outages first, then newest first, at most 5, as
+`severity`, `title`, `body`
 (markdown links and images reduced to their text, clipped to 500
 characters) and `expires_at`, under a fixed `notices_note` that labels them
 as announcements rather than instructions; `notices_hint`
-counts any others. These keys are absent when there are none, and the
+counts any others ("at least N more" when the service sent its maximum of
+20). These keys are absent when there are none, and the
 record cannot supply them: a record field with one of their names is
 renamed `record_<name>`. The summary view's size budget includes them.
 
@@ -428,11 +430,15 @@ Answers are cached per process, per credential and datasource, and shared
 with `get_datasource_notices`; concurrent lookups for the same pair share
 one request. A list of notices is reused for 10 minutes; no notices (an
 empty list, or a 404: none visible) for 2 minutes, so a newly published
-notice shows soon. A failure holds off further lookups for 1 minute (or the
-service's `Retry-After`, up to 10 minutes): meanwhile the last good answer
-is used, however old, or no notices if there is none. It never replaces
-the last good answer, and running out of time before the request is sent
-is not remembered. Notices that have expired, or are not yet published, are
+notice shows soon. A failure holds off further lookups of that datasource
+for 1 minute (or the service's `Retry-After`, up to 10 minutes); a failure
+of the service itself (a timeout, a connection error, a 5xx or 429) holds
+off requests to it for every datasource, so a hung service costs one
+timeout, not one per datasource. A refused credential or a 404 does not.
+Meanwhile the last good answer is used, however old; with none,
+`get_datasource_info` shows no notices. A failure never replaces the last
+good answer, any success ends the hold-off, and running out of time before
+the request is sent is not remembered. Notices that have expired, or are not yet published, are
 dropped from every answer, cached or not. In the summary, a notice whose
 title is only a link or image is left out (and counted in `notices_hint`).
 
@@ -444,8 +450,9 @@ title is only a link or image is left out (and counted in `notices_hint`).
 ### `get_datasource_notices`
 
 Get the active notices about a datasource — deprecations, outages, changes
-and other announcements published by Oceanum — in full, newest first (at
-most 20). Returns `{"datasource_id", "notices_note", "notices": [{severity,
+and other announcements published by Oceanum — in full, most severe first
+(`outage`, `action_required`, then the rest), newest first within each, at
+most 20. Returns `{"datasource_id", "notices_note", "notices": [{severity,
 title, body, publish_at, expires_at}]}`; `severity` is one of `info`,
 `change`, `action_required` or `outage`, and `body` is markdown. `notices` is
 empty when there are none, or when the datasource does not exist or is not
@@ -453,8 +460,9 @@ visible with your credentials. Any failure (no known admin service, no
 credential, the service unreachable, slow, busy or rejecting the
 credential) returns JSON with an `error`, plus `retry_after_s` when the
 service asked to back off. While a recent failure holds off lookups (see
-`get_datasource_info`), the tool answers from the last good answer, or
-with no notices, without asking the service.
+`get_datasource_info`), the tool answers from the last good answer without
+asking the service, or, with none, with an `error` and `retry_after_s`: it
+never reports "no notices" for a lookup that did not happen.
 
 Notices come from the admin service (`OCEANUM_ADMIN_SERVICE`), called with
 the same credential as the other tools: a Datamesh token as

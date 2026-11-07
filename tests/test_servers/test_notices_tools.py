@@ -106,7 +106,9 @@ class TestGetDatasourceNotices:
         fake = admin(handler=lambda r: httpx2.Response(502))
         assert "HTTP 502" in json.loads(server.get_datasource_notices("era5"))["error"]
         parsed = json.loads(server.get_datasource_notices("era5"))
-        assert parsed["notices"] == []  # held off: no notices, no request
+        assert "notices" not in parsed  # held off: an error, not "no notices"
+        assert "failed recently" in parsed["error"]
+        assert parsed["retry_after_s"] > 0
         assert len(fake.requests) == 1
 
 
