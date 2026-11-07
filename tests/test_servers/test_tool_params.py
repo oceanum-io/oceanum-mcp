@@ -27,6 +27,7 @@ EXPECTED_REQUIRED: dict[str, dict[str, set[str]]] = {
         "stage_query": {"datasource_id"},
         "query_data": {"datasource_id"},
         "export_query": {"datasource_id"},
+        "get_datasource_notices": {"datasource_id"},
         "load_datasource": {"datasource_id"},
         "update_metadata": {"datasource_id"},
     },

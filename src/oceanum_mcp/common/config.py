@@ -3,6 +3,7 @@
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Default ceiling on bytes downloaded into the server process for inline
 # results (query_data / load_datasource). Larger results must go through
@@ -155,6 +156,37 @@ def storage_service() -> str:
     """Storage service URL from the environment (no token required)."""
     domain = os.environ.get("OCEANUM_DOMAIN", "oceanum.io")
     return os.environ.get("STORAGE_SERVICE", f"https://storage.{domain}")
+
+
+def admin_service() -> str:
+    """Admin service URL, which serves datasource notices (no token required).
+
+    From OCEANUM_ADMIN_SERVICE; else the Datamesh service URL with its leading
+    "datamesh." host label swapped for "admin." (datamesh.oceanum.io ->
+    admin.oceanum.io, datamesh.oceanum.tech -> admin.oceanum.tech); else, for
+    a Datamesh host not named datamesh.*, https://admin.{OCEANUM_DOMAIN}.
+    """
+    raw = os.environ.get("OCEANUM_ADMIN_SERVICE", "").strip().rstrip("/")
+    if raw:
+        return raw
+    parts = urlsplit(datamesh_service())
+    host = parts.hostname or ""
+    if host.startswith("datamesh."):
+        port = f":{parts.port}" if parts.port else ""
+        return f"{parts.scheme}://admin.{host[len('datamesh.') :]}{port}"
+    domain = os.environ.get("OCEANUM_DOMAIN", "oceanum.io")
+    return f"https://admin.{domain}"
+
+
+def notices_in_info() -> bool:
+    """Whether get_datasource_info looks up the datasource's active notices.
+
+    On unless OCEANUM_MCP_DISABLE_NOTICES is set to anything other than
+    0/false/no/off: an opt-out mistyped as e.g. "ture" still opts out, which
+    is the harmless direction. The get_datasource_notices tool is not
+    affected: calling it is an explicit request.
+    """
+    return env_flag("OCEANUM_MCP_DISABLE_NOTICES") is False
 
 
 def auth_mode() -> str:

@@ -7,11 +7,13 @@ boundary (Connector / FileSystem / staging) is mocked.
 from typing import Iterator
 from unittest.mock import MagicMock, patch
 
+import httpx2
 import pytest
 
 from oceanum.datamesh.query import Container, Query, Stage
 
 import oceanum_mcp.servers.datamesh.server as datamesh_server
+from oceanum_mcp.common import notices
 
 
 def make_stage(
@@ -45,3 +47,29 @@ def mock_stage() -> Iterator[MagicMock]:
     with patch.object(datamesh_server, "_stage") as stager:
         stager.return_value = make_stage()
         yield stager
+
+
+def _no_admin_service(request: httpx2.Request) -> httpx2.Response:
+    raise AssertionError(f"unexpected notices request to {request.url}")
+
+
+@pytest.fixture(autouse=True)
+def _isolate_notices(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
+    """Keep every test off the real admin service.
+
+    get_datasource_info looks up notices with whatever credential resolves
+    (CI sets DATAMESH_TOKEN), so the lookup is disabled by default, which
+    subprocess servers inherit through the environment, and the in-process
+    HTTP client refuses any request. Notice tests re-enable the lookup and
+    patch the client with their own transport. Service URL overrides from
+    the developer's environment are dropped so the admin host is the default.
+    """
+    monkeypatch.setenv("OCEANUM_MCP_DISABLE_NOTICES", "1")
+    for name in ("OCEANUM_ADMIN_SERVICE", "DATAMESH_SERVICE", "OCEANUM_DOMAIN"):
+        monkeypatch.delenv(name, raising=False)
+    client = notices.new_client(httpx2.MockTransport(_no_admin_service))
+    monkeypatch.setattr(notices, "_http_client", lambda: client)
+    notices._cache.clear()
+    yield
+    notices._cache.clear()
+    client.close()
