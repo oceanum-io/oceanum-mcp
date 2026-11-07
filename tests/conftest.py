@@ -4,6 +4,7 @@ Tests run against the real fastmcp and oceanum packages; only the network
 boundary (Connector / FileSystem / staging) is mocked.
 """
 
+from concurrent.futures import ThreadPoolExecutor
 from typing import Iterator
 from unittest.mock import MagicMock, patch
 
@@ -69,7 +70,13 @@ def _isolate_notices(monkeypatch: pytest.MonkeyPatch) -> Iterator[None]:
         monkeypatch.delenv(name, raising=False)
     client = notices.new_client(httpx2.MockTransport(_no_admin_service))
     monkeypatch.setattr(notices, "_http_client", lambda: client)
+    executor = ThreadPoolExecutor(max_workers=8)
+    monkeypatch.setattr(notices, "_executor", executor)
     notices._cache.clear()
+    notices._warned.clear()
     yield
+    # A lookup a test stopped waiting for must not fill the next test's cache.
+    executor.shutdown(wait=True)
     notices._cache.clear()
+    notices._warned.clear()
     client.close()

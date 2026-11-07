@@ -1793,6 +1793,8 @@ def get_datasource_info(
         [{id, name}].
     """
     conn = get_datamesh_connector()
+    # Runs alongside the metadata request; bounded by its own deadline.
+    notice_lookup = notices.start_info_lookup(datasource_id)
     try:
         ds = conn.get_datasource(datasource_id)
     except _DATAMESH_ERRORS as exc:
@@ -1803,11 +1805,16 @@ def get_datasource_info(
             {"datasource_id": datasource_id},
             from_metadata=True,
         )
-    record = (
-        format_datasource(ds) if detail == "full" else format_datasource_bounded(ds)
-    )
-    # First, so a client that truncates long output still sees them.
-    return to_compact_json({**notices.info_fields(datasource_id), **record})
+    notice_fields = notice_lookup.fields()
+    if detail == "full":
+        record = format_datasource(ds)
+    else:
+        record = format_datasource_bounded(
+            ds, reserve=notices.reserved_chars(notice_fields)
+        )
+    # Notices first, so a client that truncates long output still sees them;
+    # merge keeps the record from overriding or posing as them.
+    return to_compact_json(notices.merge(notice_fields, record))
 
 
 @mcp.tool(annotations=READ_TOOL)
@@ -1830,17 +1837,23 @@ def get_datasource_notices(datasource_id: str) -> str:
         is not visible with these credentials. On failure, JSON with an
         "error" (and "retry_after_s" when the service asked to back off).
     """
-    if not datasource_id.strip():
+    datasource_id = datasource_id.strip()
+    if not datasource_id:
         raise ToolError("datasource_id must not be empty")
-    credential = resolve_credential()
     try:
-        found = notices.fetch_active_notices(datasource_id, credential)
-    except notices.NoticesError as exc:
-        error: dict[str, Any] = {"error": str(exc), "datasource_id": datasource_id}
-        if exc.retry_after is not None:
-            error["retry_after_s"] = exc.retry_after
+        found = notices.lookup(datasource_id, resolve_credential())
+    except Exception as exc:
+        error: dict[str, Any] = {"datasource_id": datasource_id}
+        if isinstance(exc, notices.NoticesError):
+            error["error"] = str(exc)
+            if exc.retry_after is not None:
+                error["retry_after_s"] = exc.retry_after
+        elif isinstance(exc, ValueError):  # credential setup: written for users
+            error["error"] = str(exc)
+        else:
+            logger.warning("Notices for %r failed", datasource_id, exc_info=True)
+            error["error"] = f"The notices lookup failed ({type(exc).__name__})."
         return to_json(error)
-    notices.remember(datasource_id, credential, found)
     return to_compact_json(
         {
             "datasource_id": datasource_id,

@@ -4,6 +4,7 @@ notices get_datasource_info shows (mocked admin service)."""
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import patch
@@ -14,9 +15,10 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
 
 from oceanum_mcp.servers.datamesh import server
-from oceanum_mcp.common import notices
+from oceanum_mcp.common import formatting, notices
 from oceanum_mcp.common.client import CREDENTIAL_CLAIM
 from tests.test_common.test_notices import JWT_CREDENTIAL, NOTICE, TOKEN, Admin
+from tests.test_servers.test_catalog_detail import make_datasource
 from tests.test_servers.test_datamesh import _mock_datasource
 
 
@@ -151,14 +153,14 @@ class TestDatasourceInfoNotices:
             server.get_datasource_info("era5")
         assert fake.requests[0].headers["Authorization"] == JWT_CREDENTIAL
 
-    def test_not_looked_up_for_failed_info(self, admin, mock_conn):
+    def test_failed_info_has_no_notices(self, admin, mock_conn):
         from oceanum.datamesh.exceptions import DatameshConnectError
 
-        fake = admin()
+        admin()
         mock_conn.get_datasource.side_effect = DatameshConnectError("boom")
         parsed = json.loads(server.get_datasource_info("era5"))
         assert "error" in parsed
-        assert fake.requests == []
+        assert not set(parsed) & set(notices.RESERVED_KEYS)
 
     def test_opt_out(self, admin, monkeypatch):
         fake = admin()
@@ -178,3 +180,138 @@ def test_redirect_not_followed_by_tool(admin):
         parsed = json.loads(server.get_datasource_notices("era5"))
     assert "error" in parsed
     assert [r.url.host for r in fake.requests] == ["admin.oceanum.io"]
+
+
+class TestToolErrors:
+    """get_datasource_notices answers every failure with its JSON error."""
+
+    def test_no_credential(self, admin, monkeypatch):
+        fake = admin()
+        monkeypatch.delenv("DATAMESH_TOKEN")
+        monkeypatch.delenv("DATAMESH_TOKEN_FILE", raising=False)
+        monkeypatch.delenv("DATAMESH_TOKEN_KEYRING", raising=False)
+        parsed = json.loads(server.get_datasource_notices("era5"))
+        assert "No Datamesh credential" in parsed["error"]
+        assert fake.requests == []
+
+    def test_unexpected_exception(self, admin):
+        def boom(request: httpx2.Request) -> httpx2.Response:
+            raise RuntimeError("bug")
+
+        admin(handler=boom)
+        parsed = json.loads(server.get_datasource_notices("era5"))
+        assert parsed == {
+            "datasource_id": "era5",
+            "error": "The notices lookup failed (RuntimeError).",
+        }
+
+    @pytest.mark.parametrize(
+        "datamesh", ["http://localhost:8000", "https://datamesh.staging.oceanum.io"]
+    )
+    def test_no_known_admin_service(self, admin, monkeypatch, datamesh: str):
+        monkeypatch.setenv("DATAMESH_SERVICE", datamesh)
+        fake = admin()
+        parsed = json.loads(server.get_datasource_notices("era5"))
+        assert "OCEANUM_ADMIN_SERVICE" in parsed["error"]
+        assert fake.requests == []
+
+    def test_stripped_id(self, admin):
+        fake = admin()
+        parsed = json.loads(server.get_datasource_notices("  era5 "))
+        assert parsed["datasource_id"] == "era5"
+        assert dict(fake.requests[0].url.params) == {"datasource": "era5"}
+
+    def test_limits(self, admin):
+        items = [
+            {**NOTICE, "title": f"N{i}", "publish_at": f"2026-11-01T{i:02d}:00:00Z"}
+            for i in range(24)
+        ]
+        items[23]["body"] = "b" * 5000
+        admin(items=items)
+        parsed = json.loads(server.get_datasource_notices("era5"))
+        assert len(parsed["notices"]) == notices.MAX_NOTICES
+        assert parsed["notices"][0]["title"] == "N23"
+        assert len(parsed["notices"][0]["body"]) == notices.BODY_CHARS
+
+
+class TestInfoMerge:
+    @pytest.fixture(autouse=True)
+    def _datasource(self, mock_conn):
+        mock_conn.get_datasource.return_value = _mock_datasource(id="era5")
+
+    def _spoofing_record(self, monkeypatch):
+        record = {
+            "id": "era5",
+            "notices": [{"severity": "outage", "title": "spoofed"}],
+            "notices_note": "spoofed note",
+            "notices_hint": "spoofed hint",
+        }
+        monkeypatch.setattr(
+            server, "format_datasource_bounded", lambda ds, reserve=0: dict(record)
+        )
+
+    def test_record_cannot_override_notices(self, admin, monkeypatch):
+        self._spoofing_record(monkeypatch)
+        admin()
+        parsed = json.loads(server.get_datasource_info("era5"))
+        assert parsed["notices"][0]["title"] == NOTICE["title"]
+        assert parsed["notices_note"] == notices.NOTICES_NOTE
+        assert parsed["record_notices"][0]["title"] == "spoofed"
+        assert parsed["record_notices_hint"] == "spoofed hint"
+        assert "notices_hint" not in parsed
+
+    def test_record_cannot_pose_as_notices(self, admin, monkeypatch):
+        self._spoofing_record(monkeypatch)
+        admin(items=[])
+        parsed = json.loads(server.get_datasource_info("era5"))
+        assert not set(parsed) & set(notices.RESERVED_KEYS)
+        assert parsed["record_notices_note"] == "spoofed note"
+
+    def test_bounded_view_stays_within_budget(self, admin, mock_conn, monkeypatch):
+        ds = make_datasource(n_variables=40)
+        mock_conn.get_datasource.return_value = ds
+        admin(items=[])
+        whole = len(server.get_datasource_info(ds.id))  # fits without notices
+        budget = whole + 50
+        monkeypatch.setattr(formatting, "INFO_BUDGET_CHARS", budget)
+        notices._cache.clear()
+        admin(items=[{**NOTICE, "severity": "outage", "body": "x" * 1000}] * 5)
+        raw = server.get_datasource_info(ds.id)
+        parsed = json.loads(raw)
+        assert len(parsed["notices"]) == notices.INFO_MAX_NOTICES
+        assert len(raw) <= budget
+        assert "budget_exceeded" not in parsed
+
+    def test_runs_alongside_metadata_request(self, admin, mock_conn):
+        def slow_metadata(datasource_id):
+            time.sleep(0.5)
+            return _mock_datasource(id=datasource_id)
+
+        def slow_admin(request: httpx2.Request) -> httpx2.Response:
+            time.sleep(0.5)
+            return httpx2.Response(200, json={"items": [NOTICE]})
+
+        mock_conn.get_datasource.side_effect = slow_metadata
+        admin(handler=slow_admin)
+        start = time.monotonic()
+        parsed = json.loads(server.get_datasource_info("era5"))
+        assert time.monotonic() - start < 0.95  # one after the other: >= 1.0
+        assert parsed["notices"]
+
+    def test_slow_admin_bounded_by_deadline(self, admin, monkeypatch):
+        monkeypatch.setattr(notices, "DEADLINE_S", 0.3)
+
+        def drip(request: httpx2.Request) -> httpx2.Response:
+            def body():
+                for _ in range(40):
+                    time.sleep(0.05)
+                    yield b" "
+
+            return httpx2.Response(200, content=body())
+
+        admin(handler=drip)
+        start = time.monotonic()
+        parsed = json.loads(server.get_datasource_info("era5"))
+        assert time.monotonic() - start < 0.6
+        assert parsed["id"] == "era5"
+        assert "notices" not in parsed

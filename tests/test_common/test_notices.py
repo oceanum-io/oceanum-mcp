@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from collections.abc import Callable
 from typing import Any
 from unittest.mock import patch
@@ -66,39 +67,76 @@ def enabled(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 class TestAdminServiceUrl:
-    def test_default_is_derived_from_datamesh(self):
-        with patch.dict(os.environ, {}, clear=True):
-            assert admin_service() == "https://admin.oceanum.io"
+    """Only a known admin service gets the credential (fail closed)."""
 
     @pytest.mark.parametrize(
-        ("datamesh", "admin"),
+        ("env", "admin"),
         [
-            ("https://datamesh.oceanum.io", "https://admin.oceanum.io"),
-            ("https://datamesh.oceanum.tech", "https://admin.oceanum.tech"),
-            ("https://datamesh.oceanum.tech/", "https://admin.oceanum.tech"),
-            ("http://datamesh.local.test:8080", "http://admin.local.test:8080"),
+            ({}, "https://admin.oceanum.io"),
+            (
+                {"DATAMESH_SERVICE": "https://datamesh.oceanum.io"},
+                "https://admin.oceanum.io",
+            ),
+            (
+                {"DATAMESH_SERVICE": "https://datamesh.oceanum.io/"},
+                "https://admin.oceanum.io",
+            ),
+            (
+                {"DATAMESH_SERVICE": "https://datamesh.oceanum.tech"},
+                "https://admin.oceanum.tech",
+            ),
+            ({"OCEANUM_DOMAIN": "oceanum.tech"}, "https://admin.oceanum.tech"),
         ],
     )
-    def test_swaps_datamesh_host_label(self, datamesh: str, admin: str):
-        with patch.dict(os.environ, {"DATAMESH_SERVICE": datamesh}, clear=True):
+    def test_known_deployments(self, env: dict[str, str], admin: str):
+        with patch.dict(os.environ, env, clear=True):
             assert admin_service() == admin
 
-    def test_follows_oceanum_domain(self):
-        with patch.dict(os.environ, {"OCEANUM_DOMAIN": "oceanum.tech"}, clear=True):
-            assert admin_service() == "https://admin.oceanum.tech"
-
-    def test_non_datamesh_host_falls_back_to_domain(self):
-        env = {"DATAMESH_SERVICE": "http://localhost:8000", "OCEANUM_DOMAIN": "x.io"}
+    @pytest.mark.parametrize(
+        "env",
+        [
+            {"DATAMESH_SERVICE": "http://localhost:8000"},
+            {"DATAMESH_SERVICE": "https://127.0.0.1"},
+            {"DATAMESH_SERVICE": "https://10.1.2.3"},
+            {"DATAMESH_SERVICE": "https://datamesh.staging.oceanum.io"},
+            {"DATAMESH_SERVICE": "https://datamesh.example.com"},
+            {"DATAMESH_SERVICE": "http://datamesh.oceanum.io"},
+            {"DATAMESH_SERVICE": "https://datamesh.oceanum.io:8443"},
+            {"OCEANUM_DOMAIN": "staging.oceanum.io"},
+            {"OCEANUM_DOMAIN": "example.com"},
+        ],
+    )
+    def test_other_datamesh_hosts_have_none(self, env: dict[str, str]):
         with patch.dict(os.environ, env, clear=True):
-            assert admin_service() == "https://admin.x.io"
+            assert admin_service() is None
 
-    def test_explicit_env_wins(self):
-        env = {
-            "OCEANUM_ADMIN_SERVICE": "https://admin.example.com/",
-            "DATAMESH_SERVICE": "https://datamesh.oceanum.tech",
-        }
+    @pytest.mark.parametrize(
+        ("value", "admin"),
+        [
+            ("https://admin.example.com/", "https://admin.example.com"),
+            ("http://localhost:9000", "http://localhost:9000"),
+            ("http://127.0.0.1:9000/", "http://127.0.0.1:9000"),
+        ],
+    )
+    def test_explicit_env_wins(self, value: str, admin: str):
+        env = {"OCEANUM_ADMIN_SERVICE": value, "DATAMESH_SERVICE": "http://localhost"}
         with patch.dict(os.environ, env, clear=True):
-            assert admin_service() == "https://admin.example.com"
+            assert admin_service() == admin
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            "http://admin.example.com",
+            "ftp://admin.oceanum.io",
+            "admin.oceanum.io",
+            "https://",
+            "https://admin.oceanum.io/?x=1",
+            "https://admin.oceanum.io:99999",
+        ],
+    )
+    def test_explicit_env_must_be_secure(self, value: str):
+        with patch.dict(os.environ, {"OCEANUM_ADMIN_SERVICE": value}, clear=True):
+            assert admin_service() is None
 
 
 class TestOptOut:
@@ -413,3 +451,196 @@ class TestCacheIsolation:
         now[0] += notices.CACHE_TTL_S
         notices.cached_active_notices("era5", TOKEN)
         assert len(fake.requests) == 2
+
+
+def _notice(i: int, **change: Any) -> dict[str, Any]:
+    """NOTICE published i hours after midnight on 2026-11-01."""
+    return {
+        **NOTICE,
+        "title": f"Notice {i}",
+        "publish_at": f"2026-11-01T{i:02d}:00:00Z",
+        **change,
+    }
+
+
+class TestLimits:
+    """Counts and lengths are capped here, whatever the server sends."""
+
+    def test_sorted_newest_first_and_capped(self, admin):
+        items = [_notice(i) for i in range(24)]
+        admin(items=items)
+        found = notices.fetch_active_notices("era5", TOKEN)
+        assert len(found) == notices.MAX_NOTICES
+        assert [n["title"] for n in found] == [f"Notice {i}" for i in range(23, 3, -1)]
+
+    def test_sort_uses_time_not_text(self, admin):
+        # 01:00+02:00 is 23:00Z the day before: older than 00:30Z.
+        early = _notice(0, title="later", publish_at="2026-11-01T00:30:00Z")
+        offset = _notice(0, title="earlier", publish_at="2026-11-01T01:00:00+02:00")
+        admin(items=[offset, early])
+        found = notices.fetch_active_notices("era5", TOKEN)
+        assert [n["title"] for n in found] == ["later", "earlier"]
+
+    def test_title_and_body_clipped(self, admin):
+        admin(items=[_notice(1, title="t" * 500, body="b" * 5000)])
+        (found,) = notices.fetch_active_notices("era5", TOKEN)
+        assert len(found["title"]) == notices.TITLE_CHARS
+        assert len(found["body"]) == notices.BODY_CHARS
+        assert found["body"].endswith("…")
+
+    def test_info_shows_five_newest_urgent(self, admin, enabled, monkeypatch):
+        monkeypatch.setattr(notices, "resolve_credential", lambda: TOKEN)
+        items = [_notice(i, severity="outage", body="x" * 900) for i in range(8)]
+        items += [_notice(9, severity="info")]
+        admin(items=items)
+        fields = notices.info_fields("era5")
+        assert [n["title"] for n in fields["notices"]] == [
+            f"Notice {i}" for i in range(7, 2, -1)
+        ]
+        assert all(len(n["body"]) == notices.INFO_BODY_CHARS for n in fields["notices"])
+        assert fields["notices_hint"].startswith("4 more")
+
+    def test_oversized_answer_refused(self, admin, monkeypatch):
+        monkeypatch.setattr(notices, "MAX_RESPONSE_BYTES", 100)
+        admin(items=[_notice(1, body="b" * 500)])
+        with pytest.raises(notices.NoticesError, match="too large"):
+            notices.fetch_active_notices("era5", TOKEN)
+
+
+class TestNoKnownAdminService:
+    @pytest.mark.parametrize(
+        "datamesh",
+        [
+            "http://localhost:8000",
+            "https://127.0.0.1",
+            "https://10.1.2.3",
+            "https://datamesh.staging.oceanum.io",
+        ],
+    )
+    def test_no_request(self, admin, enabled, monkeypatch, datamesh: str):
+        monkeypatch.setenv("DATAMESH_SERVICE", datamesh)
+        monkeypatch.setattr(notices, "resolve_credential", lambda: TOKEN)
+        fake = admin()
+        assert notices.info_fields("era5") == {}
+        with pytest.raises(notices.NoticesError, match="OCEANUM_ADMIN_SERVICE"):
+            notices.fetch_active_notices("era5", TOKEN)
+        assert fake.requests == []
+
+    @pytest.mark.parametrize(
+        ("datamesh", "host"),
+        [
+            ("https://datamesh.oceanum.io", "admin.oceanum.io"),
+            ("https://datamesh.oceanum.tech", "admin.oceanum.tech"),
+        ],
+    )
+    def test_known_deployments_requested(self, admin, monkeypatch, datamesh, host):
+        monkeypatch.setenv("DATAMESH_SERVICE", datamesh)
+        fake = admin()
+        notices.fetch_active_notices("era5", TOKEN)
+        assert fake.requests[0].url.host == host
+        assert fake.requests[0].url.scheme == "https"
+
+
+def _drip(chunks: int, every_s: float):
+    """A response body that arrives one byte per every_s seconds."""
+
+    def body():
+        for _ in range(chunks):
+            time.sleep(every_s)
+            yield b" "
+
+    return lambda request: httpx2.Response(200, content=body())
+
+
+class TestDeadline:
+    @pytest.fixture(autouse=True)
+    def _short_deadline(self, monkeypatch):
+        monkeypatch.setattr(notices, "DEADLINE_S", 0.3)
+
+    def test_slow_drip_cut_off(self, admin):
+        admin(handler=_drip(chunks=50, every_s=0.05))
+        start = time.monotonic()
+        with pytest.raises(notices.NoticesError, match="in time"):
+            notices.fetch_active_notices("era5", TOKEN)
+        assert time.monotonic() - start < 1.0
+
+    def test_info_waits_at_most_the_deadline(self, admin, enabled, monkeypatch):
+        monkeypatch.setattr(notices, "resolve_credential", lambda: TOKEN)
+        admin(handler=_drip(chunks=50, every_s=0.05))
+        start = time.monotonic()
+        assert notices.info_fields("era5") == {}
+        assert time.monotonic() - start < 0.6
+
+    def test_slow_headers(self, admin, enabled, monkeypatch):
+        def slow(request: httpx2.Request) -> httpx2.Response:
+            time.sleep(1.0)
+            return httpx2.Response(200, json={"items": [NOTICE]})
+
+        monkeypatch.setattr(notices, "resolve_credential", lambda: TOKEN)
+        admin(handler=slow)
+        start = time.monotonic()
+        assert notices.info_fields("era5") == {}
+        with pytest.raises(notices.NoticesError, match="in time"):
+            notices.lookup("era5", TOKEN)
+        assert time.monotonic() - start < 1.0
+
+    def test_late_answer_still_cached(self, admin, enabled, monkeypatch):
+        def slowish(request: httpx2.Request) -> httpx2.Response:
+            time.sleep(0.2)
+            return httpx2.Response(200, json={"items": [NOTICE]})
+
+        monkeypatch.setattr(notices, "DEADLINE_S", 1.0)
+        monkeypatch.setattr(notices, "resolve_credential", lambda: TOKEN)
+        fake = admin(handler=slowish)
+        lookup = notices.start_info_lookup("era5")
+        assert lookup.fields()["notices"]
+        assert notices.info_fields("era5")["notices"]
+        assert len(fake.requests) == 1
+
+
+class TestStrippedId:
+    def test_request_and_cache_use_stripped_id(self, admin):
+        fake = admin()
+        notices.cached_active_notices("  era5\n", TOKEN)
+        notices.cached_active_notices("era5", TOKEN)
+        assert len(fake.requests) == 1
+        assert dict(fake.requests[0].url.params) == {"datasource": "era5"}
+
+
+class TestMisconfigurationWarning:
+    @pytest.mark.parametrize("status", [302, 401, 403])
+    def test_rate_limited(self, admin, caplog, monkeypatch, status: int):
+        now = [1000.0]
+        monkeypatch.setattr(notices.time, "monotonic", lambda: now[0])
+        admin(handler=lambda r: httpx2.Response(status))
+        with caplog.at_level("WARNING", logger=notices.__name__):
+            for ds in ("a", "b", "c"):
+                notices.cached_active_notices(ds, TOKEN)
+            assert len(caplog.records) == 1
+            now[0] += notices.WARN_INTERVAL_S + 1
+            notices.cached_active_notices("d", TOKEN)
+            assert len(caplog.records) == 2
+        assert "admin.oceanum.io" in caplog.text
+        assert TOKEN not in caplog.text
+
+    def test_not_for_transient_errors(self, admin, caplog):
+        admin(handler=lambda r: httpx2.Response(502))
+        with caplog.at_level("WARNING", logger=notices.__name__):
+            notices.cached_active_notices("era5", TOKEN)
+        assert caplog.records == []
+
+
+@pytest.mark.parametrize(
+    "stamp",
+    [
+        "2026-11-01T00:00:00Z",
+        "2026-11-01T00:00:00.4Z",
+        "2026-11-01T00:00:00.123456789+00:00",
+        "2026-11-01T13:00:00+13:00",
+        "2026-11-01T00:00:00",
+    ],
+)
+def test_publish_times_parsed(stamp: str):
+    parsed = notices._parse_time(stamp)
+    assert parsed is not None
+    assert parsed.utcoffset() is not None

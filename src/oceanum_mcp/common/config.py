@@ -158,24 +158,51 @@ def storage_service() -> str:
     return os.environ.get("STORAGE_SERVICE", f"https://storage.{domain}")
 
 
-def admin_service() -> str:
-    """Admin service URL, which serves datasource notices (no token required).
+# The Oceanum deployments whose admin service serves notices, by Datamesh
+# host. Notices requests carry the caller's credential, so they only go to a
+# known admin service: any other Datamesh host gets no lookup unless
+# OCEANUM_ADMIN_SERVICE names one explicitly.
+ADMIN_SERVICES = {
+    "datamesh.oceanum.io": "https://admin.oceanum.io",
+    "datamesh.oceanum.tech": "https://admin.oceanum.tech",
+}
+_LOCAL_HOSTS = ("localhost", "127.0.0.1")
 
-    From OCEANUM_ADMIN_SERVICE; else the Datamesh service URL with its leading
-    "datamesh." host label swapped for "admin." (datamesh.oceanum.io ->
-    admin.oceanum.io, datamesh.oceanum.tech -> admin.oceanum.tech); else, for
-    a Datamesh host not named datamesh.*, https://admin.{OCEANUM_DOMAIN}.
+
+def admin_service() -> str | None:
+    """Admin service URL, which serves datasource notices; None if there is
+    none to use (no token required).
+
+    From OCEANUM_ADMIN_SERVICE, which must be an https URL (or http on
+    localhost/127.0.0.1) with no query or fragment; anything else is None,
+    not a guess. Unset, the Datamesh service's host must be one of
+    ADMIN_SERVICES (datamesh.oceanum.io -> admin.oceanum.io,
+    datamesh.oceanum.tech -> admin.oceanum.tech, OCEANUM_DOMAIN included,
+    since it sets the Datamesh URL); any other host, e.g. a staging or local
+    Datamesh, is None.
     """
-    raw = os.environ.get("OCEANUM_ADMIN_SERVICE", "").strip().rstrip("/")
+    raw = os.environ.get("OCEANUM_ADMIN_SERVICE", "").strip()
     if raw:
-        return raw
-    parts = urlsplit(datamesh_service())
-    host = parts.hostname or ""
-    if host.startswith("datamesh."):
-        port = f":{parts.port}" if parts.port else ""
-        return f"{parts.scheme}://admin.{host[len('datamesh.') :]}{port}"
-    domain = os.environ.get("OCEANUM_DOMAIN", "oceanum.io")
-    return f"https://admin.{domain}"
+        try:
+            parts = urlsplit(raw)
+            host = parts.hostname
+            parts.port  # noqa: B018 - raises ValueError on a malformed port
+        except ValueError:
+            return None
+        secure = parts.scheme == "https" or (
+            parts.scheme == "http" and host in _LOCAL_HOSTS
+        )
+        if not host or not secure or parts.query or parts.fragment:
+            return None
+        return raw.rstrip("/")
+    try:
+        parts = urlsplit(datamesh_service().strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or port not in (None, 443):
+        return None
+    return ADMIN_SERVICES.get(parts.hostname or "")
 
 
 def notices_in_info() -> bool:

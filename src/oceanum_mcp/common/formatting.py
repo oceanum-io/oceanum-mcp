@@ -492,7 +492,7 @@ def format_datasource_summary(ds: Any) -> dict[str, Any]:
     return result
 
 
-def format_datasource_bounded(ds: Any) -> dict[str, Any]:
+def format_datasource_bounded(ds: Any, reserve: int = 0) -> dict[str, Any]:
     """The full record's fields, with every large section reduced.
 
     Every variable and coordinate keeps its dims, shape, dtype and
@@ -500,7 +500,8 @@ def format_datasource_bounded(ds: Any) -> dict[str, Any]:
     values are clipped and global attribute lists capped. schema.data_vars
     and schema.attrs are dropped when they duplicate variables/attributes.
     Past INFO_BUDGET_CHARS, attributes and then per-variable details are
-    shed (see _fit_budget); every variable name stays.
+    shed (see _fit_budget); every variable name stays. reserve chars of the
+    budget are left for fields the caller adds (datasource notices).
     """
     full = format_datasource(ds)
     out = dict(full)
@@ -527,7 +528,7 @@ def format_datasource_bounded(ds: Any) -> dict[str, Any]:
             bounded["attrs"], _ = _bounded_attrs(schema["attrs"], INFO_MAX_GLOBAL_ATTRS)
         out["schema"] = bounded
     out["note"] = _SUMMARY_NOTE
-    _fit_budget(out)
+    _fit_budget(out, INFO_BUDGET_CHARS - reserve)
     return out
 
 
@@ -594,15 +595,15 @@ _FIT_STAGES: tuple[tuple[str, Callable[[dict[str, Any]], None]], ...] = (
 )
 
 
-def _fit_budget(out: dict[str, Any]) -> None:
+def _fit_budget(out: dict[str, Any], budget: int) -> None:
     """Shed _FIT_STAGES from out, in order, until it serializes within
-    INFO_BUDGET_CHARS, naming in its note the stages that removed anything.
+    budget chars, naming in its note the stages that removed anything.
     Sets budget_exceeded if every variable name alone does not fit."""
     base_note = out["note"]
     shed: list[str] = []
     size = len(to_compact_json(out))
     for label, stage in _FIT_STAGES:
-        if size <= INFO_BUDGET_CHARS:
+        if size <= budget:
             return
         stage(out)
         smaller = len(to_compact_json(out))
@@ -614,5 +615,5 @@ def _fit_budget(out: dict[str, Any]) -> None:
                 'is still listed. Pass detail="full" for them.'
             )
         size = len(to_compact_json(out))
-    if size > INFO_BUDGET_CHARS:
+    if size > budget:
         out["budget_exceeded"] = True
