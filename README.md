@@ -172,6 +172,8 @@ retry with a supported version; GitHub Copilot did so and connected.
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
+| `OCEANUM_ADMIN_SERVICE`       | No       | Admin service URL, which serves datasource notices (default: the Datamesh URL with `datamesh.` swapped for `admin.`, e.g. `https://admin.oceanum.io`; else `https://admin.<OCEANUM_DOMAIN>`) |
+| `OCEANUM_MCP_DISABLE_NOTICES` | No       | `1`/`true`/`yes`/`on` to stop `get_datasource_info` looking up datasource notices (`get_datasource_notices` still works) |
 | `OCEANUM_MCP_READ_ONLY`       | No       | `1`/`true`/`yes`/`on` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`); any value other than these or `0`/`false`/`no`/`off` stops the server at startup |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
 | `OCEANUM_MCP_MAX_INLINE_ROWS` | No       | Max rows/records previewed inline before truncation (default 100)               |
@@ -407,10 +409,44 @@ or more words. An id that merely shares generic words such as
 `oceanum_wave_..._era5`, or a single word such as `wave`, is never
 suggested.
 
+Active notices about the datasource (see `get_datasource_notices`) come
+first in both views: `notices` lists the `outage` and `action_required` ones
+(e.g. a deprecation), at most 5, as `severity`, `title`, `body` (clipped to
+500 characters) and `expires_at`, under a fixed `notices_note` that labels
+them as announcements rather than instructions; `notices_hint` counts any
+others. Both keys are absent when there are none. The lookup never fails or
+holds up the tool: it times out within about 3 s, errors are treated as "no
+notices", and answers are cached per process for 10 minutes per credential
+and datasource (a failure for 1 minute, or the service's `Retry-After`, up
+to 10 minutes). Set `OCEANUM_MCP_DISABLE_NOTICES=1` to turn it off.
+
 | Parameter       | Type   | Description                   |
 | --------------- | ------ | ----------------------------- |
 | `datasource_id` | string | Datasource ID                 |
 | `detail`        | string | `summary` (default) or `full` |
+
+### `get_datasource_notices`
+
+Get the active notices about a datasource — deprecations, outages, changes
+and other announcements published by Oceanum — in full, newest first (at
+most 20). Returns `{"datasource_id", "notices_note", "notices": [{severity,
+title, body, publish_at, expires_at}]}`; `severity` is one of `info`,
+`change`, `action_required` or `outage`, and `body` is markdown. `notices` is
+empty when there are none, or when the datasource does not exist or is not
+visible with your credentials. A failure (the admin service unreachable,
+busy or rejecting the credential) returns JSON with an `error`, plus
+`retry_after_s` when the service asked to back off.
+
+Notices come from the admin service (`OCEANUM_ADMIN_SERVICE`), called with
+the same credential as the other tools: a Datamesh token as
+`X-DATAMESH-TOKEN`, or in hosted mode an Auth0 JWT as `Authorization:
+Bearer`. Redirects are never followed, so the credential cannot be passed
+to another host. Notice text is treated as untrusted: control and
+formatting characters are stripped and malformed notices dropped.
+
+| Parameter       | Type   | Description   |
+| --------------- | ------ | ------------- |
+| `datasource_id` | string | Datasource ID |
 
 ### `stage_query`
 
