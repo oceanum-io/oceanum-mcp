@@ -173,9 +173,9 @@ def admin_service() -> str | None:
     """Admin service URL, which serves datasource notices; None if there is
     none to use (no token required).
 
-    From OCEANUM_ADMIN_SERVICE, which must be an https URL (or http on
-    localhost/127.0.0.1) with no query or fragment; anything else is None,
-    not a guess. Unset, the Datamesh service's host must be one of
+    From OCEANUM_ADMIN_SERVICE, which must be an https origin (or http on
+    localhost/127.0.0.1): no userinfo, path, query or fragment; anything else
+    is None, not a guess. Unset, the Datamesh service's host must be one of
     ADMIN_SERVICES (datamesh.oceanum.io -> admin.oceanum.io,
     datamesh.oceanum.tech -> admin.oceanum.tech, OCEANUM_DOMAIN included,
     since it sets the Datamesh URL); any other host, e.g. a staging or local
@@ -192,9 +192,18 @@ def admin_service() -> str | None:
         secure = parts.scheme == "https" or (
             parts.scheme == "http" and host in _LOCAL_HOSTS
         )
-        if not host or not secure or parts.query or parts.fragment:
+        if (
+            not host
+            or not secure
+            or "@" in parts.netloc  # userinfo: https://admin.oceanum.io@evil
+            or parts.path not in ("", "/")
+            or parts.query
+            or parts.fragment
+            or "?" in raw
+            or "#" in raw
+        ):
             return None
-        return raw.rstrip("/")
+        return f"{parts.scheme}://{parts.netloc}"
     try:
         parts = urlsplit(datamesh_service().strip())
         port = parts.port

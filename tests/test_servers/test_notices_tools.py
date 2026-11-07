@@ -94,15 +94,21 @@ class TestGetDatasourceNotices:
             server.get_datasource_notices(" ")
         assert fake.requests == []
 
-    def test_fresh_answer_refreshes_info_cache(self, admin, mock_conn):
+    def test_shares_cache_with_info(self, admin, mock_conn):
         mock_conn.get_datasource.return_value = _mock_datasource(id="era5")
-        fake = admin(items=[])
-        assert "notices" not in json.loads(server.get_datasource_info("era5"))
-        fake._items = [NOTICE]
-        server.get_datasource_notices("era5")
-        parsed = json.loads(server.get_datasource_info("era5"))
+        fake = admin()
+        assert json.loads(server.get_datasource_info("era5"))["notices"]
+        parsed = json.loads(server.get_datasource_notices("era5"))
         assert parsed["notices"][0]["title"] == NOTICE["title"]
-        assert len(fake.requests) == 2
+        assert len(fake.requests) == 1
+
+    def test_recent_failure_reported_without_request(self, admin):
+        fake = admin(handler=lambda r: httpx2.Response(502))
+        assert "HTTP 502" in json.loads(server.get_datasource_notices("era5"))["error"]
+        parsed = json.loads(server.get_datasource_notices("era5"))
+        assert "moments ago" in parsed["error"]
+        assert parsed["retry_after_s"] > 0
+        assert len(fake.requests) == 1
 
 
 class TestDatasourceInfoNotices:
@@ -118,6 +124,12 @@ class TestDatasourceInfoNotices:
         assert list(parsed)[:2] == ["notices_note", "notices"]
         assert parsed["notices"][0]["severity"] == "action_required"
         assert parsed["id"] == "era5"
+
+    @pytest.mark.parametrize("datasource_id", ["", "  "])
+    def test_no_lookup_for_empty_id(self, admin, datasource_id: str):
+        fake = admin()
+        server.get_datasource_info(datasource_id)
+        assert fake.requests == []
 
     def test_no_notices_leaves_record_unchanged(self, admin):
         admin(items=[])

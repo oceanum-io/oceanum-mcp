@@ -172,7 +172,7 @@ retry with a supported version; GitHub Copilot did so and connected.
 | `DATAMESH_SERVICE`            | No       | Custom datamesh service URL (default: `https://datamesh.oceanum.io`)            |
 | `STORAGE_SERVICE`             | No       | Custom storage service URL (default: `https://storage.oceanum.io`)              |
 | `OCEANUM_DOMAIN`              | No       | Override the base domain for all services (default: `oceanum.io`)               |
-| `OCEANUM_ADMIN_SERVICE`       | No       | Admin service URL, which serves datasource notices; must be `https://` (or `http://localhost`/`127.0.0.1`). Unset, it is `https://admin.oceanum.io` or `https://admin.oceanum.tech` for those Datamesh services, and there are no notices with any other Datamesh service |
+| `OCEANUM_ADMIN_SERVICE`       | No       | Admin service URL, which serves datasource notices; must be an `https://` origin (or `http://localhost`/`127.0.0.1`) with no user info, path, query or fragment, else notices are off. Unset, it is `https://admin.oceanum.io` or `https://admin.oceanum.tech` for those Datamesh services, and there are no notices with any other Datamesh service |
 | `OCEANUM_MCP_DISABLE_NOTICES` | No       | `1`/`true`/`yes`/`on` to stop `get_datasource_info` looking up datasource notices (`get_datasource_notices` still works) |
 | `OCEANUM_MCP_READ_ONLY`       | No       | `1`/`true`/`yes`/`on` to disable write tools (`update_metadata`, storage `write_file`/`delete_file`); any value other than these or `0`/`false`/`no`/`off` stops the server at startup |
 | `OCEANUM_MCP_MAX_INLINE_BYTES`| No       | Max staged result size returned inline by `query_data` (default 50,000,000)     |
@@ -412,17 +412,27 @@ suggested.
 Active notices about the datasource (see `get_datasource_notices`) come
 first in both views: `notices` lists the `outage` and `action_required` ones
 (e.g. a deprecation), newest first, at most 5, as `severity`, `title`, `body`
-(clipped to 500 characters) and `expires_at`, under a fixed `notices_note`
-that labels them as announcements rather than instructions; `notices_hint`
+(markdown links and images reduced to their text, clipped to 500
+characters) and `expires_at`, under a fixed `notices_note` that labels them
+as announcements rather than instructions; `notices_hint`
 counts any others. These keys are absent when there are none, and the
 record cannot supply them: a record field with one of their names is
 renamed `record_<name>`. The summary view's size budget includes them.
 
 The lookup never fails or holds up the tool: it runs alongside the metadata
-request and is given at most 3 s in all; errors count as "no notices".
-Answers are cached per process for 10 minutes per credential and datasource
-(a failure for 1 minute, or the service's `Retry-After`, up to 10 minutes).
-Set `OCEANUM_MCP_DISABLE_NOTICES=1` to turn it off.
+request and is given at most 3 s in all; errors count as "no notices". There
+is no lookup for an empty id. Set `OCEANUM_MCP_DISABLE_NOTICES=1` to turn it
+off.
+
+Answers are cached per process, per credential and datasource, and shared
+with `get_datasource_notices`. A list of notices, or a 404 (none visible),
+is reused for 10 minutes; an empty list for 2 minutes, so a newly published
+notice shows soon. A failure never replaces the last good answer, which is
+used instead; with no good answer, a failure holds off further lookups for 1
+minute (or the service's `Retry-After`, up to 10 minutes). Running out of
+time before the request is sent is not remembered. Notices that have
+expired, or are not yet published, are dropped from every answer, cached or
+not.
 
 | Parameter       | Type   | Description                   |
 | --------------- | ------ | ----------------------------- |
@@ -454,6 +464,14 @@ never followed; a redirect or refused credential is logged as a warning
 the service sends: malformed notices are dropped, control and formatting
 characters stripped, titles clipped to 200 characters and bodies to 2,000.
 The lookup is given at most 3 s.
+
+The notice text is still text an Oceanum administrator wrote, and it
+reaches the model: the fixed `notices_note` labels it as announcements to
+pass on, not instructions, and the summary in `get_datasource_info` drops
+links, but nothing can stop a model from following instruction-like text it
+reads. Notices are only as trustworthy as the admin service and the people
+who publish them; `OCEANUM_MCP_DISABLE_NOTICES=1` keeps them out of
+`get_datasource_info`.
 
 | Parameter       | Type   | Description   |
 | --------------- | ------ | ------------- |
