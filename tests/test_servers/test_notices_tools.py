@@ -102,12 +102,11 @@ class TestGetDatasourceNotices:
         assert parsed["notices"][0]["title"] == NOTICE["title"]
         assert len(fake.requests) == 1
 
-    def test_recent_failure_reported_without_request(self, admin):
+    def test_recent_failure_holds_off(self, admin):
         fake = admin(handler=lambda r: httpx2.Response(502))
         assert "HTTP 502" in json.loads(server.get_datasource_notices("era5"))["error"]
         parsed = json.loads(server.get_datasource_notices("era5"))
-        assert "moments ago" in parsed["error"]
-        assert parsed["retry_after_s"] > 0
+        assert parsed["notices"] == []  # held off: no notices, no request
         assert len(fake.requests) == 1
 
 
@@ -216,6 +215,14 @@ class TestToolErrors:
             "datasource_id": "era5",
             "error": "The notices lookup failed (RuntimeError).",
         }
+
+    def test_other_value_error_gets_generic_message(self, admin, monkeypatch):
+        def broken(datasource_id: str, credential: str):
+            raise ValueError("internal detail")
+
+        monkeypatch.setattr(notices, "lookup", broken)
+        parsed = json.loads(server.get_datasource_notices("era5"))
+        assert parsed["error"] == "The notices lookup failed (ValueError)."
 
     @pytest.mark.parametrize(
         "datamesh", ["http://localhost:8000", "https://datamesh.staging.oceanum.io"]

@@ -1840,19 +1840,22 @@ def get_datasource_notices(datasource_id: str) -> str:
     datasource_id = datasource_id.strip()
     if not datasource_id:
         raise ToolError("datasource_id must not be empty")
+    error: dict[str, Any] = {"datasource_id": datasource_id}
     try:
-        found = notices.lookup(datasource_id, resolve_credential())
+        try:
+            credential = resolve_credential()
+        except ValueError as exc:  # credential setup: its messages are for users
+            error["error"] = str(exc)
+            return to_json(error)
+        found = notices.lookup(datasource_id, credential)
+    except notices.NoticesError as exc:
+        error["error"] = str(exc)
+        if exc.retry_after is not None:
+            error["retry_after_s"] = exc.retry_after
+        return to_json(error)
     except Exception as exc:
-        error: dict[str, Any] = {"datasource_id": datasource_id}
-        if isinstance(exc, notices.NoticesError):
-            error["error"] = str(exc)
-            if exc.retry_after is not None:
-                error["retry_after_s"] = exc.retry_after
-        elif isinstance(exc, ValueError):  # credential setup: written for users
-            error["error"] = str(exc)
-        else:
-            logger.warning("Notices for %r failed", datasource_id, exc_info=True)
-            error["error"] = f"The notices lookup failed ({type(exc).__name__})."
+        logger.warning("Notices for %r failed", datasource_id, exc_info=True)
+        error["error"] = f"The notices lookup failed ({type(exc).__name__})."
         return to_json(error)
     return to_compact_json(
         {

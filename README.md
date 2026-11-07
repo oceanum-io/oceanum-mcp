@@ -425,14 +425,16 @@ is no lookup for an empty id. Set `OCEANUM_MCP_DISABLE_NOTICES=1` to turn it
 off.
 
 Answers are cached per process, per credential and datasource, and shared
-with `get_datasource_notices`. A list of notices, or a 404 (none visible),
-is reused for 10 minutes; an empty list for 2 minutes, so a newly published
-notice shows soon. A failure never replaces the last good answer, which is
-used instead; with no good answer, a failure holds off further lookups for 1
-minute (or the service's `Retry-After`, up to 10 minutes). Running out of
-time before the request is sent is not remembered. Notices that have
-expired, or are not yet published, are dropped from every answer, cached or
-not.
+with `get_datasource_notices`; concurrent lookups for the same pair share
+one request. A list of notices is reused for 10 minutes; no notices (an
+empty list, or a 404: none visible) for 2 minutes, so a newly published
+notice shows soon. A failure holds off further lookups for 1 minute (or the
+service's `Retry-After`, up to 10 minutes): meanwhile the last good answer
+is used, however old, or no notices if there is none. It never replaces
+the last good answer, and running out of time before the request is sent
+is not remembered. Notices that have expired, or are not yet published, are
+dropped from every answer, cached or not. In the summary, a notice whose
+title is only a link or image is left out (and counted in `notices_hint`).
 
 | Parameter       | Type   | Description                   |
 | --------------- | ------ | ----------------------------- |
@@ -450,7 +452,9 @@ empty when there are none, or when the datasource does not exist or is not
 visible with your credentials. Any failure (no known admin service, no
 credential, the service unreachable, slow, busy or rejecting the
 credential) returns JSON with an `error`, plus `retry_after_s` when the
-service asked to back off.
+service asked to back off. While a recent failure holds off lookups (see
+`get_datasource_info`), the tool answers from the last good answer, or
+with no notices, without asking the service.
 
 Notices come from the admin service (`OCEANUM_ADMIN_SERVICE`), called with
 the same credential as the other tools: a Datamesh token as

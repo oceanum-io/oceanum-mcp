@@ -64,9 +64,13 @@ NOTICES_NOTE = (
 RESERVED_KEYS = ("notices_note", "notices", "notices_hint")
 
 # Limits applied to every answer, newest first, whatever the server sends.
+# Text is kept (and cached) up to the STORED_ lengths, and clipped when shown,
+# so the info view can drop links before clipping.
 MAX_NOTICES = 20
 TITLE_CHARS = 200
 BODY_CHARS = 2_000
+STORED_TITLE_CHARS = 1_000
+STORED_BODY_CHARS = 10_000
 MAX_RESPONSE_BYTES = 1_000_000
 
 # get_datasource_info shows these severities, fewer and shorter; it counts
@@ -82,15 +86,17 @@ DEADLINE_S = 3.0
 TIMEOUT = httpx2.Timeout(connect=1.0, read=2.0, write=1.0, pool=1.0)
 
 # Seconds a good answer is fresh, per (credential, datasource): a list of
-# notices, or a 404 (no access or unknown). An empty list is fresh for less,
-# so a notice published since shows soon.
+# notices. No notices (an empty list, or a 404: no access or unknown) is
+# fresh for less, so a notice published since, or a briefly missing route,
+# does not hide notices for long.
 CACHE_TTL_S = 600.0
 EMPTY_TTL_S = 120.0
-# Seconds a failure stops further lookups, when there is no good answer to
-# fall back on, so an unreachable admin service costs one timeout per
-# datasource per minute, not one per call. A 429/503 Retry-After longer than
-# this is honoured, up to CACHE_TTL_S. A failure never replaces a good answer,
-# and running out of time before the request is sent is not remembered.
+# Seconds a failure stops further lookups, so an unreachable admin service
+# costs one timeout per datasource per minute, not one per call; meanwhile
+# the last good answer, if any, is used. A 429/503 Retry-After longer than
+# this is honoured, up to CACHE_TTL_S. A failure never replaces a good
+# answer, and running out of time before the request is sent is not
+# remembered.
 FAILURE_TTL_S = 60.0
 CACHE_MAX = 512
 
@@ -128,7 +134,7 @@ def _copy(notices: list[dict[str, Any]]) -> list[dict[str, Any]]:
 class _Entry:
     good: list[dict[str, Any]] | None = None  # the last good answer
     good_until: float = 0.0
-    failed_until: float = 0.0  # only while there is no good answer
+    failed_until: float = 0.0  # no lookups until then; cleared by a success
 
 
 class _NoticeCache:
@@ -162,13 +168,9 @@ class _NoticeCache:
             self._put(key, _Entry(_copy(notices), time.monotonic() + ttl_s))
 
     def mark_failed(self, key: tuple[str, str], ttl_s: float) -> None:
-        """A failure: remembered only while there is no good answer."""
+        """A failure: holds off lookups for ttl_s; keeps any good answer."""
         with self._lock:
-            entry = self._entries.get(key)
-            if entry is None:
-                entry = _Entry()
-            elif entry.good is not None:
-                return
+            entry = self._entries.get(key) or _Entry()
             entry.failed_until = time.monotonic() + ttl_s
             self._put(key, entry)
 
@@ -398,8 +400,8 @@ def _valid_notice(item: Any) -> tuple[datetime, dict[str, Any]] | None:
         return None
     return published, {
         "severity": severity,
-        "title": _clip(title, TITLE_CHARS),
-        "body": _clip(_clean(body, multiline=True), BODY_CHARS),
+        "title": _clip(title, STORED_TITLE_CHARS),
+        "body": _clip(_clean(body, multiline=True), STORED_BODY_CHARS),
         "publish_at": item["publish_at"].strip(),
         "expires_at": None if expires_at is None else expires_at.strip(),
     }
@@ -430,20 +432,23 @@ def _current(notices: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def _from_cache(key: tuple[str, str]) -> list[dict[str, Any]] | None:
-    """The fresh good answer for key, or None if there is none. Raises
-    NoticesError while a recent failure (with no good answer) holds off
-    lookups."""
+    """The cached answer for key, or None if it must be fetched:
+
+    (a) a fresh good answer;
+    (b) while a recent failure holds off lookups, the last good answer
+        however old, or no notices if there is none;
+    (c) otherwise None.
+
+    Either way filtered to the current notices (see _current).
+    """
     entry = _cache.read(key)
     if entry is None:
         return None
     now = time.monotonic()
-    if entry.good is not None:
-        return _current(entry.good) if now < entry.good_until else None
+    if entry.good is not None and now < entry.good_until:
+        return _current(entry.good)
     if now < entry.failed_until:
-        raise NoticesError(
-            "The notices service failed moments ago; try again shortly.",
-            retry_after=round(entry.failed_until - now, 1),
-        )
+        return _current(entry.good or [])
     return None
 
 
@@ -452,15 +457,15 @@ def _notices_for(
 ) -> list[dict[str, Any]]:
     """datasource_id's current notices for credential, through the cache:
 
-    - a fresh good answer is used as is;
+    - a cached answer is used when _from_cache has one;
     - otherwise the admin service is asked, and a good answer (200, or 404
-      meaning none) replaces the cached one, fresh for CACHE_TTL_S
-      (EMPTY_TTL_S for an empty 200);
-    - a failure falls back on the last good answer, however old, and is only
-      remembered (FAILURE_TTL_S, or Retry-After) when there is none;
+      meaning none) replaces the cached one and clears any failure, fresh
+      for CACHE_TTL_S (EMPTY_TTL_S for no notices);
+    - a failure holds off lookups for FAILURE_TTL_S (or Retry-After), and
+      falls back on the last good answer, however old;
     - running out of time before the request is sent is not remembered.
 
-    Raises NoticesError when there is no answer to give.
+    Raises NoticesError when a failure leaves no answer to give.
     """
     key = _cache_key(datasource_id, credential)
     cached = _from_cache(key)  # again: another lookup may have just answered
@@ -477,30 +482,64 @@ def _notices_for(
             else NoticesError(f"The notices lookup failed ({type(exc).__name__}).")
         )
         logger.debug("Notices for %r unavailable: %s", datasource_id, error)
+        retry_after = error.retry_after or 0.0
+        _cache.mark_failed(key, max(FAILURE_TTL_S, min(retry_after, CACHE_TTL_S)))
         entry = _cache.read(key)
         if entry is not None and entry.good is not None:
             return _current(entry.good)
-        retry_after = error.retry_after or 0.0
-        _cache.mark_failed(key, max(FAILURE_TTL_S, min(retry_after, CACHE_TTL_S)))
         raise error from None
     found = fetched.notices
-    ttl = CACHE_TTL_S if found or fetched.not_found else EMPTY_TTL_S
-    _cache.store(key, found, ttl)
+    _cache.store(key, found, CACHE_TTL_S if found else EMPTY_TTL_S)
     return _current(found)
+
+
+_inflight: dict[tuple[str, str], tuple[Future[list[dict[str, Any]]], float]] = {}
+_inflight_lock = threading.Lock()
+
+
+def _fetch_shared(
+    datasource_id: str, credential: str
+) -> tuple[Future[list[dict[str, Any]]], float]:
+    """(a future for _notices_for, its deadline): concurrent lookups for one
+    (credential, datasource) share one fetch and its deadline."""
+    key = _cache_key(datasource_id, credential)
+    with _inflight_lock:
+        shared = _inflight.get(key)
+        if shared is not None:
+            return shared
+        deadline = time.monotonic() + DEADLINE_S
+        future = _executor.submit(_notices_for, datasource_id, credential, deadline)
+        _inflight[key] = (future, deadline)
+
+    def forget(done: Future[list[dict[str, Any]]]) -> None:
+        with _inflight_lock:
+            if key in _inflight and _inflight[key][0] is done:
+                del _inflight[key]
+
+    future.add_done_callback(forget)
+    return future, deadline
+
+
+def _shown(notice: dict[str, Any]) -> dict[str, Any]:
+    """notice as get_datasource_notices shows it: text clipped."""
+    return {
+        **notice,
+        "title": _clip(notice["title"], TITLE_CHARS),
+        "body": _clip(notice["body"], BODY_CHARS),
+    }
 
 
 def lookup(datasource_id: str, credential: str) -> list[dict[str, Any]]:
     """datasource_id's current notices for the get_datasource_notices tool,
     through the cache (see _notices_for), within DEADLINE_S in all. Raises
     NoticesError."""
-    key = _cache_key(datasource_id, credential)
-    cached = _from_cache(key)
+    cached = _from_cache(_cache_key(datasource_id, credential))
     if cached is not None:
-        return cached
-    deadline = time.monotonic() + DEADLINE_S
-    future = _executor.submit(_notices_for, datasource_id, credential, deadline)
+        return [_shown(n) for n in cached]
+    future, deadline = _fetch_shared(datasource_id, credential)
     try:
-        return future.result(timeout=DEADLINE_S)
+        found = future.result(timeout=max(0.0, deadline - time.monotonic()))
+        return [_shown(n) for n in found]
     except NoticesError:
         raise
     except Exception as exc:  # noqa: BLE001 - worker failure or timeout
@@ -565,17 +604,18 @@ def start_info_lookup(datasource_id: str) -> InfoLookup:
         cached = _from_cache(_cache_key(datasource_id, credential))
         if cached is not None:
             return InfoLookup(datasource_id, notices=cached)
-        deadline = time.monotonic() + DEADLINE_S
-        future = _executor.submit(_notices_for, datasource_id, credential, deadline)
+        future, deadline = _fetch_shared(datasource_id, credential)
         return InfoLookup(datasource_id, future=future, deadline=deadline)
     except Exception:  # notices must never break the info tool
         logger.debug("Notices for %r skipped", datasource_id, exc_info=True)
         return InfoLookup(datasource_id)
 
 
-# Markdown links and images, reduced to their text in the info view.
-_IMAGE_RE = re.compile(r"!\[([^\]]*)\]\([^)]*\)")
-_LINK_RE = re.compile(r"\[([^\]]*)\]\([^)]*\)")
+# Markdown links and images, reduced to their text in the info view. A
+# destination may hold one level of balanced parentheses: (a_(b)).
+_DESTINATION = r"\((?:[^()]|\([^()]*\))*\)"
+_IMAGE_RE = re.compile(r"!\[([^\]]*)\]" + _DESTINATION)
+_LINK_RE = re.compile(r"\[([^\]]*)\]" + _DESTINATION)
 _REF_LINK_RE = re.compile(r"\[([^\]]+)\]\[[^\]]*\]")
 _REF_DEFINITION_RE = re.compile(r"^ {0,3}\[[^\]]+\]:[^\n]*\n?", re.MULTILINE)
 _AUTOLINK_RE = re.compile(r"<([a-zA-Z][a-zA-Z0-9+.-]*:[^<>\s]*)>")
@@ -592,16 +632,26 @@ def _without_links(text: str) -> str:
 
 
 def _info_fields(notices: list[dict[str, Any]]) -> dict[str, Any]:
-    urgent = [n for n in notices if n.get("severity") in INFO_SEVERITIES]
-    shown = [
-        {
-            "severity": n["severity"],
-            "title": _without_links(n["title"]),
-            "body": _clip(_without_links(n["body"]), INFO_BODY_CHARS),
-            "expires_at": n["expires_at"],
-        }
-        for n in urgent[:INFO_MAX_NOTICES]
-    ]
+    """The info view: urgent notices with links reduced to their text, then
+    clipped; one whose title is only a link or image is left out (and
+    counted in the hint)."""
+    shown = []
+    for n in notices:
+        if n["severity"] not in INFO_SEVERITIES:
+            continue
+        title = _without_links(n["title"])
+        if not title:
+            continue
+        shown.append(
+            {
+                "severity": n["severity"],
+                "title": _clip(title, TITLE_CHARS),
+                "body": _clip(_without_links(n["body"]), INFO_BODY_CHARS),
+                "expires_at": n["expires_at"],
+            }
+        )
+        if len(shown) == INFO_MAX_NOTICES:
+            break
     fields: dict[str, Any] = {}
     if shown:
         fields["notices_note"] = NOTICES_NOTE

@@ -308,34 +308,97 @@ class TestCache:
         assert _lookup() == [_ok()]
         assert len(fake.requests) == 2
 
-    def test_404_fresh_for_full_ttl(self, admin, clock):
+    def test_404_expires_after_empty_ttl(self, admin, clock):
         fake = admin(handler=lambda r: httpx2.Response(404))
         assert _lookup() == []
-        clock[0] += notices.EMPTY_TTL_S + 1
+        clock[0] += notices.EMPTY_TTL_S - 1
         assert _lookup() == []
         assert len(fake.requests) == 1
+        clock[0] += 2
+        fake._handler = None
+        assert _lookup() == [_ok()]
+        assert len(fake.requests) == 2
 
-    def test_failure_never_replaces_good_answer(self, admin, clock, info):
+    def test_failure_falls_back_on_good_answer_and_holds_off(self, admin, clock, info):
         fake = admin()
         assert _lookup() == [_ok()]
         clock[0] += notices.CACHE_TTL_S + 1
         fake._handler = lambda r: httpx2.Response(502)
         assert _lookup() == [_ok()]  # the last good answer
+        assert len(fake.requests) == 2
+        # Held off: the good answer again, no request.
+        assert _lookup() == [_ok()]
         assert info()["notices"][0]["title"] == NOTICE["title"]
-        assert len(fake.requests) == 3  # no failure marker: each call retries
+        assert len(fake.requests) == 2
+        clock[0] += notices.FAILURE_TTL_S + 1
+        fake._handler = None
+        fake._items = [{**NOTICE, "title": "Updated"}]
+        assert _lookup()[0]["title"] == "Updated"
+        assert len(fake.requests) == 3
+
+    def test_success_clears_failure(self, admin, clock):
+        fake = admin(handler=lambda r: httpx2.Response(502))
+        _lookup()
+        clock[0] += notices.FAILURE_TTL_S + 1
+        fake._handler = None
+        assert _lookup() == [_ok()]
+        clock[0] += notices.CACHE_TTL_S + 1  # stale, and no failure pending
+        _lookup()
+        assert len(fake.requests) == 3
+
+    def test_stale_answer_and_slow_service_answer_quickly(
+        self, admin, clock, monkeypatch
+    ):
+        """Only the first call after the answer goes stale waits on a slow,
+        failing service; the next ones answer from the cache at once."""
+        fake = admin()
+        _lookup()
+        clock[0] += notices.CACHE_TTL_S + 1
+
+        def slow_failure(request: httpx2.Request) -> httpx2.Response:
+            time.sleep(0.2)
+            raise httpx2.ConnectTimeout("timed out", request=request)
+
+        fake._handler = slow_failure
+        assert _lookup() == [_ok()]
+        start = time.perf_counter()
+        for _ in range(5):
+            assert _lookup() == [_ok()]
+        assert time.perf_counter() - start < 0.1
+        assert len(fake.requests) == 2
 
     def test_failure_without_good_answer_holds_off(self, admin, clock, info):
         fake = admin(handler=lambda r: httpx2.Response(502))
         assert isinstance(_lookup(), notices.NoticesError)
         assert info() == {}
-        error = _lookup()
-        assert isinstance(error, notices.NoticesError)
-        assert error.retry_after == notices.FAILURE_TTL_S
+        assert _lookup() == []  # held off: no notices, no request
         assert len(fake.requests) == 1
         clock[0] += notices.FAILURE_TTL_S + 1
         fake._handler = None
         assert _lookup() == [_ok()]
         assert len(fake.requests) == 2
+
+    def test_concurrent_lookups_share_one_request(self, admin, info):
+        started = threading.Event()
+        release = threading.Event()
+
+        def slow(request: httpx2.Request) -> httpx2.Response:
+            started.set()
+            release.wait(2)
+            return httpx2.Response(200, json={"items": [NOTICE]})
+
+        fake = admin(handler=slow)
+        with ThreadPoolExecutor(max_workers=3) as callers:
+            first = callers.submit(_lookup)
+            assert started.wait(2)
+            second = callers.submit(_lookup)
+            third = callers.submit(_lookup, "era5", TOKEN)
+            time.sleep(0.05)
+            release.set()
+            results = [first.result(), second.result(), third.result()]
+        assert results == [[_ok()]] * 3
+        assert info()["notices"]
+        assert len(fake.requests) == 1
 
     def test_retry_after_honoured(self, admin, clock):
         fake = admin(
@@ -543,6 +606,25 @@ class TestInfoFields:
         admin(items=[{**NOTICE, "body": body}])
         assert _lookup()[0]["body"] == body
 
+    def test_nested_parentheses_in_destination(self, admin, info):
+        body = "See [A](https://en.wikipedia.org/wiki/A_(b)) and ![i](x_(1).png)."
+        admin(items=[{**NOTICE, "body": body}])
+        assert info()["notices"][0]["body"] == "See A and i."
+
+    def test_links_stripped_before_clipping(self, admin, info):
+        body = "[" + "x" * 10 + "](https://evil.example/" + "p" * 600 + ") end"
+        admin(items=[{**NOTICE, "body": body}])
+        assert info()["notices"][0]["body"] == "x" * 10 + " end"
+
+    @pytest.mark.parametrize(
+        "title", ["[](https://evil.example)", "![](https://evil.example/i.png)"]
+    )
+    def test_link_only_title_dropped(self, admin, info, title: str):
+        admin(items=[{**NOTICE, "title": title}, {**NOTICE, "severity": "outage"}])
+        fields = info()
+        assert [n["severity"] for n in fields["notices"]] == ["outage"]
+        assert fields["notices_hint"].startswith("1 more")
+
 
 class TestRedirects:
     """The request carries the caller's credential: a redirect, which could
@@ -645,11 +727,14 @@ class TestLimits:
         assert [n["title"] for n in _fetch()] == ["later", "earlier"]
 
     def test_title_and_body_clipped(self, admin):
-        admin(items=[_notice(1, title="t" * 500, body="b" * 5000)])
-        (found,) = _fetch()
-        assert len(found["title"]) == notices.TITLE_CHARS
-        assert len(found["body"]) == notices.BODY_CHARS
-        assert found["body"].endswith("…")
+        admin(items=[_notice(1, title="t" * 5000, body="b" * 50000)])
+        (stored,) = _fetch()
+        assert len(stored["title"]) == notices.STORED_TITLE_CHARS
+        assert len(stored["body"]) == notices.STORED_BODY_CHARS
+        (shown,) = _lookup()
+        assert len(shown["title"]) == notices.TITLE_CHARS
+        assert len(shown["body"]) == notices.BODY_CHARS
+        assert shown["body"].endswith("…")
 
     def test_info_shows_five_newest_urgent(self, admin, info):
         items = [_notice(i, severity="outage", body="x" * 900) for i in range(8)]
