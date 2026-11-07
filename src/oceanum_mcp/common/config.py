@@ -3,6 +3,7 @@
 import os
 import re
 from pathlib import Path
+from urllib.parse import urlsplit
 
 # Default ceiling on bytes downloaded into the server process for inline
 # results (query_data / load_datasource). Larger results must go through
@@ -155,6 +156,73 @@ def storage_service() -> str:
     """Storage service URL from the environment (no token required)."""
     domain = os.environ.get("OCEANUM_DOMAIN", "oceanum.io")
     return os.environ.get("STORAGE_SERVICE", f"https://storage.{domain}")
+
+
+# The Oceanum deployments whose admin service serves notices, by Datamesh
+# host. Notices requests carry the caller's credential, so they only go to a
+# known admin service: any other Datamesh host gets no lookup unless
+# OCEANUM_ADMIN_SERVICE names one explicitly.
+ADMIN_SERVICES = {
+    "datamesh.oceanum.io": "https://admin.oceanum.io",
+    "datamesh.oceanum.tech": "https://admin.oceanum.tech",
+}
+_LOCAL_HOSTS = ("localhost", "127.0.0.1")
+
+
+def admin_service() -> str | None:
+    """Admin service URL, which serves datasource notices; None if there is
+    none to use (no token required).
+
+    From OCEANUM_ADMIN_SERVICE, which must be an https origin (or http on
+    localhost/127.0.0.1): no userinfo, path, query or fragment; anything else
+    is None, not a guess. Unset, the Datamesh service's host must be one of
+    ADMIN_SERVICES (datamesh.oceanum.io -> admin.oceanum.io,
+    datamesh.oceanum.tech -> admin.oceanum.tech, OCEANUM_DOMAIN included,
+    since it sets the Datamesh URL); any other host, e.g. a staging or local
+    Datamesh, is None.
+    """
+    raw = os.environ.get("OCEANUM_ADMIN_SERVICE", "").strip()
+    if raw:
+        try:
+            parts = urlsplit(raw)
+            host = parts.hostname
+            parts.port  # noqa: B018 - raises ValueError on a malformed port
+        except ValueError:
+            return None
+        secure = parts.scheme == "https" or (
+            parts.scheme == "http" and host in _LOCAL_HOSTS
+        )
+        if (
+            not host
+            or not secure
+            or "@" in parts.netloc  # userinfo: https://admin.oceanum.io@evil
+            or parts.path not in ("", "/")
+            or parts.query
+            or parts.fragment
+            or "?" in raw
+            or "#" in raw
+        ):
+            return None
+        return f"{parts.scheme}://{parts.netloc}"
+    try:
+        parts = urlsplit(datamesh_service().strip())
+        port = parts.port
+    except ValueError:
+        return None
+    if parts.scheme != "https" or port not in (None, 443):
+        return None
+    return ADMIN_SERVICES.get(parts.hostname or "")
+
+
+def notices_in_info() -> bool:
+    """Whether get_datasource_info looks up the datasource's active notices.
+
+    On unless OCEANUM_MCP_DISABLE_NOTICES is set to anything other than
+    0/false/no/off: an opt-out mistyped as e.g. "ture" still opts out, which
+    is the harmless direction. The get_datasource_notices tool is not
+    affected: calling it is an explicit request.
+    """
+    return env_flag("OCEANUM_MCP_DISABLE_NOTICES") is False
 
 
 def auth_mode() -> str:
