@@ -14,9 +14,9 @@ import pytest
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken
 
-from oceanum_mcp.servers.datamesh import server
 from oceanum_mcp.common import formatting, notices
 from oceanum_mcp.common.client import CREDENTIAL_CLAIM
+from oceanum_mcp.servers.datamesh import server
 from tests.test_common.test_notices import JWT_CREDENTIAL, NOTICE, TOKEN, Admin
 from tests.test_servers.test_catalog_detail import make_datasource
 from tests.test_servers.test_datamesh import _mock_datasource
